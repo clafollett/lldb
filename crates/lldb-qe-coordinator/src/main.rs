@@ -11,13 +11,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    StorageArgs, apply_manifest, build_session, fetch, init_tracing, register_tpch_parquet,
+    StorageArgs, StorageConfig, apply_manifest, build_session, fetch, init_tracing,
+    register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -53,7 +54,19 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
 
-    let (ctx, storage) = build_session(cli.storage.to_config()?).await?;
+    let config = cli.storage.to_config()?;
+    // The coordinator always ships plans to a separate worker process. The in-memory object
+    // store lives in *this* process, so a remote worker can never see data written to it —
+    // reject the combination up front instead of failing deep in a scan with an empty result.
+    if matches!(config, StorageConfig::InMemory) {
+        bail!(
+            "--storage memory can't be used with remote workers: the in-memory object store is \
+             per-process, so workers can't see the coordinator's data. Use `--storage local` \
+             (a shared filesystem) or `--storage s3`."
+        );
+    }
+
+    let (ctx, storage) = build_session(config).await?;
 
     // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
     match &cli.manifest {

@@ -110,9 +110,10 @@ pub async fn apply_manifest(
                 let src = source_name(&catalog.name, ns_name, &table.name);
                 let sql = format!(
                     "INSERT INTO {cat}.{ns}.{tbl} SELECT * FROM {src}",
-                    cat = catalog.name,
-                    ns = ns_name,
-                    tbl = table.name,
+                    cat = quote_ident(&catalog.name),
+                    ns = quote_ident(ns_name),
+                    tbl = quote_ident(&table.name),
+                    src = quote_ident(&src),
                 );
                 ctx.sql(&sql).await?.collect().await.with_context(|| {
                     format!("loading {}.{}.{}", catalog.name, ns_name, table.name)
@@ -124,6 +125,13 @@ pub async fn apply_manifest(
     }
 
     Ok(lakehouses)
+}
+
+/// Quote a SQL identifier so names needing escaping (mixed case, `-`, reserved words) survive
+/// interpolation, and a manifest can't inject SQL through a table name. Embedded `"` is doubled
+/// per the SQL standard.
+fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
 /// The parquet source path for a table, if it has one.
@@ -176,6 +184,14 @@ mod tests {
             source_name("b", "n", "t"),
             "different catalogs must not collide"
         );
+    }
+
+    #[test]
+    fn quote_ident_wraps_and_escapes() {
+        assert_eq!(quote_ident("orders"), "\"orders\"");
+        assert_eq!(quote_ident("odd-name"), "\"odd-name\"");
+        // an embedded quote is doubled, so a name can't break out of the identifier
+        assert_eq!(quote_ident("a\"b"), "\"a\"\"b\"");
     }
 
     #[test]

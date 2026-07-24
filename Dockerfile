@@ -5,7 +5,7 @@
 # select the role via the container `command`.
 
 # ---- Builder ---------------------------------------------------------------
-FROM rust:1.97-bookworm AS builder
+FROM rust:1.97.1-bookworm AS builder
 
 # object_store's S3 backend + TLS need these at build time.
 RUN apt-get update \

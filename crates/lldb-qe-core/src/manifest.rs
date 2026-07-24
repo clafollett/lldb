@@ -146,6 +146,10 @@ impl Manifest {
     /// duplicate names, missing warehouse for Iceberg tables, or un-inferable empty tables.
     pub fn validate(&self) -> Result<()> {
         let mut catalog_names = HashSet::new();
+        // Listing tables are registered into DataFusion's default catalog under their bare
+        // names, so their namespace is flat across the *entire* manifest — two listing tables
+        // named `orders` in different namespaces/catalogs would silently clobber each other.
+        let mut listing_names = HashSet::new();
         for catalog in &self.catalogs {
             if !catalog_names.insert(catalog.name.as_str()) {
                 bail!("duplicate catalog name: {}", catalog.name);
@@ -188,6 +192,24 @@ impl Manifest {
                             ns.name,
                             table.name
                         );
+                    }
+                    if table.format == TableFormat::Listing {
+                        if matches!(table.source, TableSource::Empty) {
+                            bail!(
+                                "listing table `{}.{}.{}` needs a parquet source",
+                                catalog.name,
+                                ns.name,
+                                table.name
+                            );
+                        }
+                        if !listing_names.insert(table.name.as_str()) {
+                            bail!(
+                                "duplicate listing table `{}` — listing tables share one flat \
+                                 namespace (registered under bare names), so their names must be \
+                                 unique across the whole manifest",
+                                table.name
+                            );
+                        }
                     }
                 }
             }
@@ -311,6 +333,44 @@ mod tests {
             [[catalogs.namespaces.tables]]
             name = "t"
             source = { type = "parquet", path = "b.parquet" }
+        "#;
+        assert!(Manifest::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_listing_name_collision_across_namespaces() {
+        // Two listing tables named `orders` in different namespaces would both register under
+        // the bare name `orders` in the default catalog and clobber each other.
+        let toml = r#"
+            [[catalogs]]
+            name = "c"
+            [[catalogs.namespaces]]
+            name = "a"
+            [[catalogs.namespaces.tables]]
+            name = "orders"
+            format = "listing"
+            source = { type = "parquet", path = "a.parquet" }
+            [[catalogs.namespaces]]
+            name = "b"
+            [[catalogs.namespaces.tables]]
+            name = "orders"
+            format = "listing"
+            source = { type = "parquet", path = "b.parquet" }
+        "#;
+        assert!(Manifest::from_toml_str(toml).is_err());
+    }
+
+    #[test]
+    fn rejects_listing_table_without_source() {
+        let toml = r#"
+            [[catalogs]]
+            name = "c"
+            [[catalogs.namespaces]]
+            name = "n"
+            [[catalogs.namespaces.tables]]
+            name = "t"
+            format = "listing"
+            schema = [{ name = "id", data_type = "int64" }]
         "#;
         assert!(Manifest::from_toml_str(toml).is_err());
     }
