@@ -8,7 +8,8 @@ use std::path::PathBuf;
 
 use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use lldb_qe_core::{Lakehouse, StorageConfig, build_session};
+use lldb_qe_core::manifest::{CatalogDef, Manifest, NamespaceDef, TableDef, TableSource};
+use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -16,6 +17,32 @@ fn data_dir() -> PathBuf {
 
 fn sf1(table: &str) -> PathBuf {
     data_dir().join(format!("sf1/{table}.parquet"))
+}
+
+/// Build a manifest with a single `lldb.tpch.<table>` Iceberg table sourced from `parquet`.
+fn single_iceberg_table(
+    warehouse: &std::path::Path,
+    table: &str,
+    parquet: &std::path::Path,
+) -> Manifest {
+    Manifest {
+        catalogs: vec![CatalogDef {
+            name: "lldb".to_string(),
+            backend: Default::default(),
+            warehouse: Some(format!("file://{}", warehouse.display())),
+            namespaces: vec![NamespaceDef {
+                name: "tpch".to_string(),
+                tables: vec![TableDef {
+                    name: table.to_string(),
+                    format: Default::default(), // Iceberg
+                    source: TableSource::Parquet {
+                        path: parquet.to_string_lossy().into_owned(),
+                    },
+                    schema: None,
+                }],
+            }],
+        }],
+    }
 }
 
 /// Scalar `i64` out of a single-row, single-column result (e.g. `SELECT count(*)`).
@@ -39,13 +66,14 @@ async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (ctx, _storage) = build_session(StorageConfig::Local(data_dir())).await?;
+    let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;
 
-    // A fresh Iceberg warehouse on disk, torn down when `warehouse` drops.
+    // A fresh Iceberg warehouse on disk, torn down when `warehouse` drops. Declare the same
+    // `lldb.tpch.nation` table as data through the generic manifest, then materialize it.
     let warehouse = tempfile::tempdir()?;
-    let lake = Lakehouse::open_memory(warehouse.path()).await?;
-    lake.load_tpch(&ctx, &[("nation", nation.to_string_lossy().into_owned())])
-        .await?;
+    let manifest = single_iceberg_table(warehouse.path(), "nation", &nation);
+    let lakes = apply_manifest(&ctx, &storage, &manifest).await?;
+    let lake = &lakes[0];
 
     // Query through the Iceberg catalog — three-part name: catalog.namespace.table.
     let batches = ctx
@@ -57,9 +85,9 @@ async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
     assert_eq!(scalar_i64(&batches), 25, "TPC-H nation has 25 rows");
 
     // The append created a snapshot; inspect it.
-    let snapshot = lake.current_snapshot_id("nation").await?;
+    let snapshot = lake.current_snapshot_id("tpch", "nation").await?;
     assert!(snapshot.is_some(), "a write must produce a snapshot");
-    let summary = lake.snapshot_summary("nation").await?;
+    let summary = lake.snapshot_summary("tpch", "nation").await?;
     println!("nation snapshot {snapshot:?}, summary: {summary:?}");
     assert_eq!(
         summary.get("total-records").map(String::as_str),
@@ -80,14 +108,10 @@ async fn lineitem_group_by_through_iceberg() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let (ctx, _storage) = build_session(StorageConfig::Local(data_dir())).await?;
+    let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;
     let warehouse = tempfile::tempdir()?;
-    let lake = Lakehouse::open_memory(warehouse.path()).await?;
-    lake.load_tpch(
-        &ctx,
-        &[("lineitem", lineitem.to_string_lossy().into_owned())],
-    )
-    .await?;
+    let manifest = single_iceberg_table(warehouse.path(), "lineitem", &lineitem);
+    apply_manifest(&ctx, &storage, &manifest).await?;
 
     let batches = ctx
         .sql(

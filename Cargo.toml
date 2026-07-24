@@ -38,7 +38,11 @@ arrow-flight = "58.4"
 parquet = "58.4"
 
 # --- Storage abstraction: MUST match datafusion 53.1's pin (object_store ^0.13.1) ---
-object_store = "0.13"
+# `aws` feature pulls in the S3 backend so `StorageConfig::S3` can address real buckets.
+object_store = { version = "0.13", features = ["aws"] }
+
+# --- CLI parsing (binaries + shared config args) ---
+clap = { version = "4", features = ["derive", "env"] }
 
 # --- Async runtime + gRPC transport ---
 tokio = { version = "1.48", features = ["full"] }
@@ -52,6 +56,10 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
+
+# --- Config-as-data: schemas/catalogs declared in a manifest, not in code ---
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
 
 # --- Benchmarking + test utilities (dev) ---
 criterion = { version = "0.8", features = ["async_tokio"] }

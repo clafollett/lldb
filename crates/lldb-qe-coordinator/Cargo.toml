@@ -13,3 +13,5 @@ lldb-qe-core = { path = "../lldb-qe-core" }
 datafusion.workspace = true
 tokio.workspace = true
 anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true

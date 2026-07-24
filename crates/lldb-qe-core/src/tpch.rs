@@ -15,6 +15,51 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::displayable;
 use datafusion::prelude::SessionContext;
 
+use crate::manifest::{CatalogDef, Manifest, NamespaceDef, TableDef, TableFormat, TableSource};
+
+/// The eight TPC-H tables, in a stable order. TPC-H is just one example schema now — nothing
+/// in the engine is tied to it; this list only seeds the demo/benchmarks.
+pub const TPCH_TABLES: [&str; 8] = [
+    "customer", "lineitem", "nation", "orders", "part", "partsupp", "region", "supplier",
+];
+
+/// Build a [`Manifest`] describing the eight TPC-H tables under `catalog.namespace`, each
+/// sourced from `<subdir>/<table>.parquet`. `format` picks Iceberg vs plain listing; an
+/// Iceberg manifest needs a `warehouse` (path or URI), ignored for listing.
+///
+/// This is the config-as-data replacement for the old hardcoded `load_tpch` — TPC-H expressed
+/// through the same generic machinery any other schema uses.
+pub fn tpch_manifest(
+    catalog: &str,
+    namespace: &str,
+    subdir: &str,
+    format: TableFormat,
+    warehouse: Option<&str>,
+) -> Manifest {
+    let tables = TPCH_TABLES
+        .iter()
+        .map(|t| TableDef {
+            name: (*t).to_string(),
+            format,
+            source: TableSource::Parquet {
+                path: format!("{subdir}/{t}.parquet"),
+            },
+            schema: None,
+        })
+        .collect();
+    Manifest {
+        catalogs: vec![CatalogDef {
+            name: catalog.to_string(),
+            backend: Default::default(),
+            warehouse: warehouse.map(str::to_string),
+            namespaces: vec![NamespaceDef {
+                name: namespace.to_string(),
+                tables,
+            }],
+        }],
+    }
+}
+
 /// TPC-H Q1 — Pricing Summary Report. Heavy grouped aggregation over the whole `lineitem`
 /// scan; returns 4 rows (the return-flag × line-status combinations).
 pub const Q1: &str = "\
@@ -75,5 +120,39 @@ mod tests {
         assert!(query(2).is_none());
         assert!(Q1.contains("lineitem"));
         assert!(Q6.contains("l_discount"));
+    }
+
+    #[test]
+    fn tpch_has_eight_tables_including_lineitem_and_orders() {
+        assert_eq!(TPCH_TABLES.len(), 8);
+        assert!(TPCH_TABLES.contains(&"lineitem"));
+        assert!(TPCH_TABLES.contains(&"orders"));
+    }
+
+    #[test]
+    fn tpch_manifest_lists_all_eight_and_validates() {
+        let m = tpch_manifest(
+            "lldb",
+            "tpch",
+            "sf1",
+            TableFormat::Iceberg,
+            Some("file:///wh"),
+        );
+        let tables = &m.catalogs[0].namespaces[0].tables;
+        assert_eq!(tables.len(), 8);
+        assert_eq!(
+            tables[1].source,
+            TableSource::Parquet {
+                path: "sf1/lineitem.parquet".to_string()
+            }
+        );
+        assert!(
+            m.validate().is_ok(),
+            "iceberg manifest with warehouse is valid"
+        );
+
+        // Listing form needs no warehouse.
+        let listing = tpch_manifest("lldb", "tpch", "sf1", TableFormat::Listing, None);
+        assert!(listing.validate().is_ok());
     }
 }

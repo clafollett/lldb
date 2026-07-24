@@ -24,15 +24,35 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 
+/// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The git commit this build was cut from — a 12-char short SHA, or `unknown`. Injected by
+/// `build.rs` from `$LLDB_GIT_SHA` (Docker) or `git` (local).
+pub const GIT_SHA: &str = env!("LLDB_GIT_SHA");
+/// Full build identifier `"<version>+<sha>"`. This is what a running coordinator/worker reports
+/// (via `--version` and a startup log line) so an operator can confirm the whole fleet is the
+/// identical build — the precondition for shipping serialized DataFusion plans between them.
+pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
+
+pub mod catalog;
+pub mod config;
 pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
+pub mod manifest;
 pub mod session;
 pub mod storage;
 pub mod tpch;
 
+pub use catalog::{apply_manifest, register_listing_tables};
+pub use config::{StorageArgs, init_tracing};
 pub use distributed::distributed_group_count;
 pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;
-pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
+pub use manifest::{
+    CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
+    TableSource,
+};
+pub use session::{build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};
+pub use tpch::{TPCH_TABLES, tpch_manifest};

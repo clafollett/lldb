@@ -1,0 +1,49 @@
+# Example: the eight TPC-H tables as Iceberg tables in an S3 warehouse, declared as data.
+#
+# This is the config-as-data equivalent of the old hardcoded loader. `source.path` values are
+# resolved against the coordinator's active storage backend, so with
+#   --storage s3 --s3-bucket lldb-warehouse
+# `sf1/lineitem.parquet` becomes `s3://lldb-warehouse/sf1/lineitem.parquet`. Upload SF1 parquet
+# to that prefix (e.g. with `mc cp`) before running a query against these tables.
+#
+# Swap this file for your own to serve an entirely different schema — nothing here is special.
+
+[[catalogs]]
+name = "lldb"
+warehouse = "s3://lldb-warehouse/iceberg"
+backend = { kind = "memory" }   # swap for { kind = "sql", uri = "postgres://…" } to share across coordinators
+
+[[catalogs.namespaces]]
+name = "tpch"
+
+[[catalogs.namespaces.tables]]
+name = "customer"
+source = { type = "parquet", path = "sf1/customer.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "lineitem"
+source = { type = "parquet", path = "sf1/lineitem.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "nation"
+source = { type = "parquet", path = "sf1/nation.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "orders"
+source = { type = "parquet", path = "sf1/orders.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "part"
+source = { type = "parquet", path = "sf1/part.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "partsupp"
+source = { type = "parquet", path = "sf1/partsupp.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "region"
+source = { type = "parquet", path = "sf1/region.parquet" }
+
+[[catalogs.namespaces.tables]]
+name = "supplier"
+source = { type = "parquet", path = "sf1/supplier.parquet" }

@@ -1,0 +1,10 @@
+# Build artifacts and generated data must not bloat the build context.
+target/
+data/
+**/*.parquet
+
+# VCS / editor / CI noise
+.git/
+.github/
+*.md
+!README.md
