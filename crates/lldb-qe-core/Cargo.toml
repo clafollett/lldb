@@ -1,0 +1,25 @@
+[package]
+name = "lldb-qe-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core library for lldb: storage abstraction, session/catalog setup, and execution nodes."
+
+[dependencies]
+datafusion.workspace = true
+object_store.workspace = true
+tokio.workspace = true
+futures.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+datafusion.workspace = true
+tracing-subscriber.workspace = true

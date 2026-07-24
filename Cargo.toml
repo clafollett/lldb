@@ -1,0 +1,57 @@
+# lldb — distributed analytical query engine (workspace root)
+#
+# Version discipline (verified against crates.io 2026-07-23):
+#   - iceberg-datafusion 0.10 caps datafusion at ^53.1  → datafusion = 53.1
+#   - datafusion 53.1 pins arrow ^58.0.0 + object_store ^0.13.1
+#   - arrow / arrow-flight / parquet MUST share ONE version across the tree (Flight boundary)
+# Bumping DataFusion to 54 becomes possible once iceberg-datafusion rebases forward.
+
+[workspace]
+resolver = "3"
+members = ["crates/lldb-qe-core"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "Apache-2.0"
+repository = "https://github.com/clafollett/lldb"
+authors = ["Cali LaFollett <cali.lafollett@gmail.com>"]
+description = "A distributed analytical query engine (DataFusion + Arrow Flight + Iceberg)."
+
+[workspace.dependencies]
+# --- DataFusion query engine (capped by iceberg-datafusion 0.10) ---
+datafusion = "53.1"
+datafusion-proto = "53.1"
+
+# --- Apache Iceberg table format ---
+iceberg = "0.10"
+iceberg-datafusion = "0.10"
+
+# --- Arrow family: ONE version everywhere; Flight (de)serialization requires it ---
+arrow = "58.4"
+arrow-flight = "58.4"
+parquet = "58.4"
+
+# --- Storage abstraction: MUST match datafusion 53.1's pin (object_store ^0.13.1) ---
+object_store = "0.13"
+
+# --- Async runtime + gRPC transport ---
+tokio = { version = "1.48", features = ["full"] }
+tonic = "0.14"
+futures = "0.3"
+
+# --- Errors, logging, small utils ---
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2"
+
+# --- Benchmarking (dev) ---
+criterion = { version = "0.8", features = ["async_tokio"] }
+
+[profile.release]
+# Analytical engines live and die on the optimizer; make release builds honest.
+lto = "thin"
+codegen-units = 1

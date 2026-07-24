@@ -1,0 +1,7 @@
+# Pin the toolchain so every contributor builds the exact same bytes.
+# Serialized DataFusion plans are NOT cross-version compatible — coordinator and
+# workers must agree, and a pinned toolchain is the first line of that discipline.
+[toolchain]
+channel = "1.97.1"
+components = ["rustfmt", "clippy"]
+profile = "default"
