@@ -67,7 +67,7 @@ cargo test
 - [x] **Phase 0** — Foundation: workspace, storage abstraction, first query over Parquet
 - [x] **Phase 1** — Iceberg: local catalog, tables, snapshots
 - [x] **Phase 2** — Physical plans + single-node TPC-H baseline
-- [ ] **Phase 3** — Arrow Flight coordinator/worker transport
+- [x] **Phase 3** — Arrow Flight coordinator/worker transport
 - [ ] **Phase 4** — Distributed hash-join (the shuffle)
 - [ ] **Phase 5** — Benchmark distributed vs single-node
 

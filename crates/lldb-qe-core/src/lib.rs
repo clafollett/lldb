@@ -24,11 +24,13 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 
+pub mod flight;
 pub mod lakehouse;
 pub mod session;
 pub mod storage;
 pub mod tpch;
 
+pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;
 pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};

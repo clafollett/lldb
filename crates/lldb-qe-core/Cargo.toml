@@ -10,10 +10,14 @@ description = "Core library for lldb: storage abstraction, session/catalog setup
 
 [dependencies]
 datafusion.workspace = true
+datafusion-proto.workspace = true
 iceberg.workspace = true
 iceberg-datafusion.workspace = true
+arrow-flight.workspace = true
 object_store.workspace = true
 tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true

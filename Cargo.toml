@@ -8,7 +8,11 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/lldb-qe-core"]
+members = [
+    "crates/lldb-qe-core",
+    "crates/lldb-qe-coordinator",
+    "crates/lldb-qe-worker",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,6 +42,7 @@ object_store = "0.13"
 
 # --- Async runtime + gRPC transport ---
 tokio = { version = "1.48", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 futures = "0.3"
 

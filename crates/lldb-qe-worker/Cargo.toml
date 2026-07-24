@@ -1,0 +1,15 @@
+[package]
+name = "lldb-qe-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "lldb worker: a stateless Arrow Flight server that executes shipped sub-plans."
+
+[dependencies]
+lldb-qe-core = { path = "../lldb-qe-core" }
+datafusion.workspace = true
+tokio.workspace = true
+anyhow.workspace = true
