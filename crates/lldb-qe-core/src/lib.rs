@@ -25,6 +25,7 @@
 //! lets stateless workers read the same data from anywhere.
 
 pub mod catalog;
+pub mod config;
 pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
@@ -34,6 +35,7 @@ pub mod storage;
 pub mod tpch;
 
 pub use catalog::{apply_manifest, register_listing_tables};
+pub use config::{StorageArgs, init_tracing};
 pub use distributed::distributed_group_count;
 pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;

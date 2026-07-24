@@ -41,6 +41,9 @@ parquet = "58.4"
 # `aws` feature pulls in the S3 backend so `StorageConfig::S3` can address real buckets.
 object_store = { version = "0.13", features = ["aws"] }
 
+# --- CLI parsing (binaries + shared config args) ---
+clap = { version = "4", features = ["derive", "env"] }
+
 # --- Async runtime + gRPC transport ---
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
