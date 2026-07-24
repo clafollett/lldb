@@ -24,6 +24,7 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 
+pub mod catalog;
 pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
@@ -32,6 +33,7 @@ pub mod session;
 pub mod storage;
 pub mod tpch;
 
+pub use catalog::{apply_manifest, register_listing_tables};
 pub use distributed::distributed_group_count;
 pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;

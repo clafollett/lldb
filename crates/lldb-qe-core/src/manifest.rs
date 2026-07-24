@@ -99,22 +99,17 @@ pub enum TableFormat {
 }
 
 /// The catalog metadata backend.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogBackend {
     /// In-process catalog; metadata lives in RAM (per-process, not shared). Dev default.
+    #[default]
     Memory,
     /// Persistent SQL catalog (SQLite/Postgres/…). Durable and shareable across processes.
     /// Requires the `sql-catalog` build feature.
     Sql { uri: String },
     /// Remote Iceberg REST catalog. Requires the `rest-catalog` build feature.
     Rest { uri: String },
-}
-
-impl Default for CatalogBackend {
-    fn default() -> Self {
-        CatalogBackend::Memory
-    }
 }
 
 /// A single column in an explicit table schema.
