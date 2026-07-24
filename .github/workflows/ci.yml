@@ -18,6 +18,7 @@ jobs:
   check:
     name: fmt • clippy • test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -40,9 +41,14 @@ jobs:
 
   # Proves the distributed communication path across real containers (MinIO + worker fleet +
   # coordinator over gRPC/Arrow Flight). Runs the LLDB_DOCKER-gated cluster test.
+  #
+  # The image is built once here with buildx + the GitHub Actions layer cache, so cargo-chef's
+  # dependency layer is reused across runs (first run ~15 min; cached runs a couple). The test
+  # then reuses that prebuilt image (LLDB_IMAGE) instead of building again.
   docker-cluster:
     name: cross-container cluster
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
 
@@ -51,7 +57,25 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Compute build version
+        id: ver
+        run: echo "sha=$(git rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (layer-cached)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: lldb:ci
+          build-args: |
+            GIT_SHA=${{ steps.ver.outputs.sha }}
+          cache-from: type=gha,scope=lldb-image
+          cache-to: type=gha,mode=max,scope=lldb-image
+
       - name: Cross-container distributed smoke test
         env:
           LLDB_DOCKER: "1"
+          LLDB_IMAGE: lldb:ci
         run: cargo test -p lldb-qe-core --test distributed_cluster -- --nocapture

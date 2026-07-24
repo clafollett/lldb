@@ -46,17 +46,19 @@ fn cluster_ships_a_query_across_containers() {
     }
     let _teardown = Teardown;
 
-    // Build images and bring MinIO + workers up (detached). The coordinator is one-shot, so we
-    // start the long-running services first, then run the coordinator to completion.
-    let (_o, e, ok) = compose(&[
-        "up",
-        "-d",
-        "--build",
-        "minio",
-        "minio-setup",
-        "worker-1",
-        "worker-2",
-    ]);
+    // Bring MinIO + workers up (detached). The coordinator is one-shot, so we start the
+    // long-running services first, then run the coordinator to completion.
+    //
+    // When `LLDB_IMAGE` is set the image was already built (CI prebuilds it once with layer
+    // caching and passes the tag), so we skip `--build` and reuse it. Locally, with no prebuilt
+    // image, we build here.
+    let prebuilt = std::env::var("LLDB_IMAGE").is_ok();
+    let mut up = vec!["up", "-d"];
+    if !prebuilt {
+        up.push("--build");
+    }
+    up.extend(["minio", "minio-setup", "worker-1", "worker-2"]);
+    let (_o, e, ok) = compose(&up);
     assert!(ok, "compose up failed:\n{e}");
 
     // Run the coordinator to completion and capture its printed result table.

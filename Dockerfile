@@ -3,26 +3,43 @@
 # One image, both binaries. The coordinator and worker MUST be the identical build — serialized
 # DataFusion physical plans are not cross-version compatible — so we build them together and
 # select the role via the container `command`.
+#
+# Build layout uses cargo-chef so the (huge) dependency compile lands in its own layer keyed only
+# by Cargo.toml/Cargo.lock. That layer is cache-hit on every build where dependencies are
+# unchanged — locally via Docker's layer cache, and in CI via the buildx GitHub Actions cache
+# (`cache-from/to type=gha`) — so only our own crates recompile when source changes.
 
-# ---- Builder ---------------------------------------------------------------
-FROM rust:1.97.1-bookworm AS builder
-
+# ---- Chef: pin the toolchain + install cargo-chef once (its own cached layer) --------------
+FROM rust:1.97.1-bookworm AS chef
 # object_store's S3 backend + TLS need these at build time.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends pkg-config libssl-dev \
     && rm -rf /var/lib/apt/lists/*
-
+RUN cargo install cargo-chef --locked
 WORKDIR /build
 
-# Copy the whole workspace (Cargo.lock is committed) and build release binaries. The
-# rust-toolchain.toml pins the exact toolchain; the base image already matches it.
+# ---- Planner: distill the dependency graph into a recipe (invalidated only by manifests) ---
+FROM chef AS planner
 COPY . .
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
-    cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
+RUN cargo chef prepare --recipe-path recipe.json
+
+# ---- Builder: cook dependencies from the recipe, THEN build our crates ---------------------
+FROM chef AS builder
+COPY --from=planner /build/recipe.json recipe.json
+# Compile every dependency. This layer is reused as long as recipe.json (i.e. the dependency
+# set) is unchanged, no matter how our own source churns.
+RUN cargo chef cook --release --recipe-path recipe.json
+
+# Now the real sources; only our crates compile past this point.
+COPY . .
+# Stamp the build with its commit so the binaries report `version+sha` (the .git dir is not in
+# the build context, so the SHA must be injected). Defaults keep local `docker build` working.
+ARG GIT_SHA=unknown
+ENV LLDB_GIT_SHA=$GIT_SHA
+RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
     && cp target/release/lldb-qe-coordinator target/release/lldb-qe-worker /usr/local/bin/
 
-# ---- Runtime ---------------------------------------------------------------
+# ---- Runtime -------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
 
 # ca-certificates for S3 TLS; libssl for the dynamically-linked TLS stack; netcat lets

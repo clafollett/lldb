@@ -22,7 +22,11 @@ use lldb_qe_core::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "lldb-qe-coordinator", about = "SQL entry point for lldb")]
+#[command(
+    name = "lldb-qe-coordinator",
+    about = "SQL entry point for lldb",
+    version = lldb_qe_core::BUILD_VERSION
+)]
 struct Cli {
     /// Comma-separated worker Flight URLs. The demo ships the plan to the first one.
     #[arg(
@@ -53,6 +57,10 @@ struct Cli {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    tracing::info!(
+        version = lldb_qe_core::BUILD_VERSION,
+        "starting lldb-qe-coordinator"
+    );
 
     let config = cli.storage.to_config()?;
     // The coordinator always ships plans to a separate worker process. The in-memory object

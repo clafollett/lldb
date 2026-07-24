@@ -9,6 +9,18 @@
 #
 # The default coordinator query is a constant, so the cluster proves cross-container transport
 # without needing seeded data; point --manifest at real S3 data to run real queries.
+#
+# Image/version knobs (both optional):
+#   LLDB_IMAGE  — tag every service runs (default lldb:latest). CI prebuilds a cached, versioned
+#                 image and sets this so `up`/`run` reuse it instead of rebuilding.
+#   LLDB_GIT_SHA — commit stamped into the binaries at build time (reported by `--version`).
+
+# Shared build config: one image, both roles. The SHA is injected because `.git` is not in the
+# build context (see .dockerignore).
+x-lldb-build: &lldb-build
+  context: .
+  args:
+    GIT_SHA: ${LLDB_GIT_SHA:-unknown}
 
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: minioadmin
@@ -50,8 +62,8 @@ services:
       "
 
   worker-1:
-    build: .
-    image: lldb:latest
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
     environment: *s3-env
     depends_on:
@@ -64,8 +76,8 @@ services:
       retries: 20
 
   worker-2:
-    build: .
-    image: lldb:latest
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
     environment: *s3-env
     depends_on:
@@ -79,8 +91,8 @@ services:
 
   # One-shot: ship a plan to a worker and print the result, then exit.
   coordinator:
-    build: .
-    image: lldb:latest
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
     command:
       - "lldb-qe-coordinator"
       - "--workers"

@@ -24,6 +24,16 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 
+/// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// The git commit this build was cut from — a 12-char short SHA, or `unknown`. Injected by
+/// `build.rs` from `$LLDB_GIT_SHA` (Docker) or `git` (local).
+pub const GIT_SHA: &str = env!("LLDB_GIT_SHA");
+/// Full build identifier `"<version>+<sha>"`. This is what a running coordinator/worker reports
+/// (via `--version` and a startup log line) so an operator can confirm the whole fleet is the
+/// identical build — the precondition for shipping serialized DataFusion plans between them.
+pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
+
 pub mod catalog;
 pub mod config;
 pub mod distributed;

@@ -17,6 +17,11 @@ Learning-grade POC. Trunk-based — commit working milestones straight to `main`
 Coordinator and workers must run the identical build — serialized DataFusion plans are not
 cross-version compatible. Bumping DataFusion to 54 waits on `iceberg-datafusion` 0.11.
 
+Every binary is stamped with `version+git-sha` (workspace version + the commit, injected by
+`lldb-qe-core/build.rs`): both binaries report it via `--version` and a startup log line, so an
+operator can confirm a whole fleet is the identical build. CI builds one image, tags it by that
+version, and the compose cluster runs that single tag for every role (`LLDB_IMAGE`).
+
 ## Layout
 
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog

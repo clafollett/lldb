@@ -18,7 +18,8 @@ use tokio::net::TcpListener;
 #[derive(Debug, Parser)]
 #[command(
     name = "lldb-qe-worker",
-    about = "Stateless Arrow Flight worker for lldb"
+    about = "Stateless Arrow Flight worker for lldb",
+    version = lldb_qe_core::BUILD_VERSION
 )]
 struct Cli {
     /// Address to bind the Flight server to.
@@ -33,6 +34,10 @@ struct Cli {
 async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
+    tracing::info!(
+        version = lldb_qe_core::BUILD_VERSION,
+        "starting lldb-qe-worker"
+    );
 
     let ctx = SessionContext::new();
     // Register non-local backends so `s3://` / `memory://` scans in shipped plans resolve.
