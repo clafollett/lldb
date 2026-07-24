@@ -1,0 +1,32 @@
+# Rust build artifacts
+/target
+**/target
+
+# Note: Cargo.lock IS committed — this workspace produces binaries (coordinator, worker),
+# and a locked dependency graph keeps every machine on the verified version set.
+
+# Generated TPC-H data and the local Iceberg warehouse (large, reproducible via tpchgen-cli)
+/data/
+*.parquet
+*.tbl
+
+# Local Iceberg SQL catalog (SQLite)
+*.db
+*.sqlite
+*.sqlite3
+
+# Profiling / benchmarking artifacts
+flamegraph.svg
+perf.data
+perf.data.old
+profile.json
+/target/criterion/
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/*
+!.vscode/extensions.json

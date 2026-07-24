@@ -1,0 +1,23 @@
+# Normalize line endings to LF across platforms; let Git detect text vs binary.
+* text=auto eol=lf
+
+# Explicit text types (LF)
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.sql     text eol=lf
+*.proto   text eol=lf
+*.sh      text eol=lf
+*.yml     text eol=lf
+*.yaml    text eol=lf
+
+# Binary assets — never touch line endings or diff as text
+*.parquet binary
+*.tbl     binary
+*.png     binary
+*.jpg     binary
+*.svg     binary
+
+# GitHub Linguist: surface SQL, don't let generated data skew language stats
+data/**   linguist-generated=true
+*.sql     linguist-detectable=true
