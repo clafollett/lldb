@@ -68,7 +68,7 @@ cargo test
 - [x] **Phase 1** — Iceberg: local catalog, tables, snapshots
 - [x] **Phase 2** — Physical plans + single-node TPC-H baseline
 - [x] **Phase 3** — Arrow Flight coordinator/worker transport
-- [ ] **Phase 4** — Distributed hash-join (the shuffle)
+- [x] **Phase 4** — Distributed hash aggregation (the shuffle)
 - [ ] **Phase 5** — Benchmark distributed vs single-node
 
 ## Versioning
