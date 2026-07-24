@@ -96,7 +96,8 @@ cargo test
 - [x] **Phase 6** — Generic config-as-data catalog (multi-schema), S3 storage backend
 - [x] **Phase 7** — Containerized cluster + cross-container test + CI
 - [ ] **Next** — Persistent shared catalog (SQL/REST); real network-shuffle exec node +
-  worker-to-worker `do_exchange`; scan-level slicing; AWS IaC
+  worker-to-worker `do_exchange`; scan-level slicing; AWS IaC (CDK) deploying the image to
+  an ECS Fargate worker fleet
 
 ## Versioning
 
