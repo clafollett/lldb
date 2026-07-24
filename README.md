@@ -69,7 +69,7 @@ cargo test
 - [x] **Phase 2** — Physical plans + single-node TPC-H baseline
 - [x] **Phase 3** — Arrow Flight coordinator/worker transport
 - [x] **Phase 4** — Distributed hash aggregation (the shuffle)
-- [ ] **Phase 5** — Benchmark distributed vs single-node
+- [x] **Phase 5** — Benchmark distributed vs single-node ([BENCHMARKS.md](BENCHMARKS.md))
 
 ## Versioning
 

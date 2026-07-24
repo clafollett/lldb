@@ -35,3 +35,7 @@ tracing-subscriber.workspace = true
 [[bench]]
 name = "tpch"
 harness = false
+
+[[bench]]
+name = "distributed"
+harness = false
