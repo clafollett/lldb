@@ -27,6 +27,7 @@
 pub mod lakehouse;
 pub mod session;
 pub mod storage;
+pub mod tpch;
 
 pub use lakehouse::Lakehouse;
 pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
