@@ -14,19 +14,33 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 use datafusion::prelude::SessionContext;
-use object_store::{ObjectStore, local::LocalFileSystem, memory::InMemory};
+use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
 /// Where table data physically lives.
 ///
-/// Add an `S3 { bucket, region, endpoint }` arm here when we reach the storage-evolution
-/// phase; nothing else in the engine has to change.
+/// The engine speaks `object_store::ObjectStore`, so adding a backend is adding an arm here —
+/// nothing else in the engine changes. Local + InMemory cover dev and tests; S3 covers real
+/// object-storage warehouses (and any S3-compatible service like MinIO via `endpoint`).
 #[derive(Debug, Clone)]
 pub enum StorageConfig {
     /// Local filesystem rooted at a directory. The default for development.
     Local(PathBuf),
     /// Ephemeral in-memory store. Fast and isolated — ideal for tests.
     InMemory,
+    /// S3 (or S3-compatible) bucket. Credentials come from the environment
+    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, or an instance
+    /// role) — never from config, so warehouse definitions carry no secrets.
+    S3 {
+        /// Bucket name; addresses resolve as `s3://{bucket}/...`.
+        bucket: String,
+        /// Region, e.g. `us-east-1`. `None` lets the SDK resolve it from the environment.
+        region: Option<String>,
+        /// Custom endpoint URL for S3-compatible stores (e.g. MinIO `http://minio:9000`).
+        endpoint: Option<String>,
+        /// Allow plaintext HTTP — needed for a local MinIO endpoint, off for real S3.
+        allow_http: bool,
+    },
 }
 
 impl Default for StorageConfig {
@@ -47,6 +61,8 @@ enum Kind {
     Local { root: PathBuf },
     /// In-memory; addressed via the `memory://` scheme.
     Memory,
+    /// S3 bucket; addressed via the `s3://{bucket}/...` scheme.
+    S3 { bucket: String },
 }
 
 impl StorageConfig {
@@ -73,6 +89,35 @@ impl StorageConfig {
                     kind: Kind::Memory,
                 })
             }
+            StorageConfig::S3 {
+                bucket,
+                region,
+                endpoint,
+                allow_http,
+            } => {
+                // Credentials are read from the environment/instance role by `from_env`;
+                // we only wire up addressing (bucket/region/endpoint) here.
+                let mut builder = AmazonS3Builder::from_env()
+                    .with_bucket_name(bucket)
+                    .with_allow_http(*allow_http);
+                if let Some(region) = region {
+                    builder = builder.with_region(region);
+                }
+                if let Some(endpoint) = endpoint {
+                    builder = builder.with_endpoint(endpoint);
+                }
+                let store = Arc::new(
+                    builder
+                        .build()
+                        .with_context(|| format!("building S3 store for bucket {bucket}"))?,
+                ) as Arc<dyn ObjectStore>;
+                Ok(Storage {
+                    store,
+                    kind: Kind::S3 {
+                        bucket: bucket.clone(),
+                    },
+                })
+            }
         }
     }
 }
@@ -86,12 +131,24 @@ impl Storage {
     /// Register this store on a session so table paths using its scheme resolve.
     ///
     /// Local storage rides DataFusion's built-in `file://` store, so this is a no-op there;
-    /// the memory backend must be registered under `memory://`.
+    /// the memory and S3 backends must be registered under `memory://` / `s3://{bucket}`.
     pub fn register_on(&self, ctx: &SessionContext) -> Result<()> {
-        if let Kind::Memory = self.kind {
-            let url = Url::parse("memory://").unwrap();
-            ctx.runtime_env()
-                .register_object_store(&url, self.store.clone());
+        match &self.kind {
+            Kind::Memory => {
+                let url = Url::parse("memory://").unwrap();
+                ctx.runtime_env()
+                    .register_object_store(&url, self.store.clone());
+            }
+            Kind::S3 { bucket } => {
+                // DataFusion resolves `s3://bucket/...` paths by looking up a store registered
+                // for that scheme+authority, so register under the bucket's URL.
+                let url = Url::parse(&format!("s3://{bucket}"))
+                    .with_context(|| format!("invalid s3 url for bucket {bucket}"))?;
+                ctx.runtime_env()
+                    .register_object_store(&url, self.store.clone());
+            }
+            // Local rides DataFusion's built-in `file://` store — nothing to register.
+            Kind::Local { .. } => {}
         }
         Ok(())
     }
@@ -107,6 +164,7 @@ impl Storage {
                     .to_string())
             }
             Kind::Memory => Ok(format!("memory:///{relative}")),
+            Kind::S3 { bucket } => Ok(format!("s3://{bucket}/{relative}")),
         }
     }
 }
@@ -155,6 +213,38 @@ mod tests {
         assert_eq!(
             storage.table_path("lineitem.parquet")?,
             "memory:///lineitem.parquet"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn s3_build_wires_addressing_without_network() -> Result<()> {
+        // Building an S3 store only configures addressing/credentials-from-env; it makes no
+        // network call, so this is safe offline. A MinIO-style endpoint with http allowed
+        // exercises the S3-compatible path.
+        let cfg = StorageConfig::S3 {
+            bucket: "lldb-warehouse".to_string(),
+            region: Some("us-east-1".to_string()),
+            endpoint: Some("http://127.0.0.1:9000".to_string()),
+            allow_http: true,
+        };
+        let storage = cfg.build()?;
+        assert!(matches!(storage.kind, Kind::S3 { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn s3_table_path_uses_s3_scheme() -> Result<()> {
+        let cfg = StorageConfig::S3 {
+            bucket: "lldb-warehouse".to_string(),
+            region: None,
+            endpoint: None,
+            allow_http: false,
+        };
+        let storage = cfg.build()?;
+        assert_eq!(
+            storage.table_path("sf1/lineitem.parquet")?,
+            "s3://lldb-warehouse/sf1/lineitem.parquet"
         );
         Ok(())
     }
