@@ -41,5 +41,6 @@ pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
 };
-pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
+pub use session::{build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};
+pub use tpch::{TPCH_TABLES, tpch_manifest};
