@@ -19,16 +19,28 @@ cross-version compatible. Bumping DataFusion to 54 waits on `iceberg-datafusion`
 
 ## Layout
 
-- `crates/lldb-qe-core` — storage, session, exec nodes, plan codec
-- `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — added in Phase 3
+- `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
+  (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
+  config (`config.rs`)
+- `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries
+- `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
+- `Dockerfile` / `docker-compose.yml` — one image, both roles; a MinIO + worker-fleet cluster
 - `data/` — generated TPC-H + local Iceberg warehouse (gitignored)
+
+## Catalogs are config, not code
+
+Do NOT hardcode schemas. Declare tables in a `Manifest` (see `manifest.rs`) and load them with
+`catalog::apply_manifest`. `tpch_manifest` / `register_tpch_parquet` are thin TPC-H seeds over
+that generic path — add new schemas as manifests, not bespoke loaders.
 
 ## Commands
 
 ```
 tpchgen-cli -s 1 --format=parquet --output-dir data/sf1   # test data
-cargo test                                                # unit + integration
+cargo test                                                # unit + integration (data-absent tests skip)
 cargo fmt --all && cargo clippy --all-targets
+docker compose up --build                                 # full containerized cluster
+LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smoke test (needs a daemon)
 ```
 
 ## Testing bar

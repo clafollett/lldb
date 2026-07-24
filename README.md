@@ -39,9 +39,32 @@ SQL ──parse──▶ Logical Plan ──optimize──▶ Physical Plan ─�
 
 | Crate | Role |
 | - | - |
-| `lldb-qe-core` | Storage abstraction, session/catalog setup, execution nodes, plan codec |
-| `lldb-qe-coordinator` | SQL entry point; cuts plans into stages and dispatches to workers *(coming)* |
-| `lldb-qe-worker` | Stateless Flight server that executes sub-plans *(coming)* |
+| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec |
+| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight |
+| `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
+
+## Catalogs & schemas
+
+Tables are declared as **data**, not code. A [manifest](manifests/) describes arbitrary
+`catalogs → namespaces → tables` — their format (transactional Iceberg or a plain parquet
+listing), source, and (optionally) schema — and `apply_manifest` materializes them into a
+DataFusion session. Nothing is tied to TPC-H; it is just one example manifest
+([`manifests/tpch.toml`](manifests/tpch.toml)). The storage backend (`local`, `memory`, or
+`s3`/MinIO) is chosen at runtime, so the same binary runs against a laptop directory in dev
+and an S3 warehouse in production.
+
+## Running a cluster (Docker)
+
+Bring the whole system up as containers — MinIO (the S3 warehouse), a worker fleet, and a
+coordinator that ships a plan over Arrow Flight — to see the distributed path end-to-end:
+
+```bash
+docker compose up --build     # coordinator prints a result streamed back from a worker
+```
+
+The default query is a constant, so the cluster proves cross-container transport without
+seeded data; point `--manifest` at S3 data to run real queries. See
+[`docker-compose.yml`](docker-compose.yml).
 
 ## Quickstart
 
@@ -70,6 +93,10 @@ cargo test
 - [x] **Phase 3** — Arrow Flight coordinator/worker transport
 - [x] **Phase 4** — Distributed hash aggregation (the shuffle)
 - [x] **Phase 5** — Benchmark distributed vs single-node ([BENCHMARKS.md](BENCHMARKS.md))
+- [x] **Phase 6** — Generic config-as-data catalog (multi-schema), S3 storage backend
+- [x] **Phase 7** — Containerized cluster + cross-container test + CI
+- [ ] **Next** — Persistent shared catalog (SQL/REST); real network-shuffle exec node +
+  worker-to-worker `do_exchange`; scan-level slicing; AWS IaC
 
 ## Versioning
 
