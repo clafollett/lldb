@@ -16,6 +16,8 @@ We practice trunk-based development. `main` is always releasable.
 
 ## Building and Testing
 
+New checkout? Run `./scripts/bootstrap.sh` first — it installs the TPC-H data generator and generates the benchmark data the test suite needs.
+
 ```sh
 cargo build                                      # build
 cargo test                                       # run the test suite
