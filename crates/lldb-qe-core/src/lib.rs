@@ -15,7 +15,7 @@
 //! |------------------|-------------------------------------------|-------|
 //! | [`storage`]      | Where bytes live — abstracted so local dev today, S3 later | 0 |
 //! | [`session`]      | A configured DataFusion context + registered tables        | 0 |
-//! | Iceberg catalog  | Files → transactional, versioned tables   | 1 (next) |
+//! | [`lakehouse`]    | Iceberg: files → transactional, versioned tables           | 1 |
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //!
@@ -24,8 +24,10 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 
+pub mod lakehouse;
 pub mod session;
 pub mod storage;
 
+pub use lakehouse::Lakehouse;
 pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};

@@ -48,8 +48,9 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 url = "2"
 
-# --- Benchmarking (dev) ---
+# --- Benchmarking + test utilities (dev) ---
 criterion = { version = "0.8", features = ["async_tokio"] }
+tempfile = "3"
 
 [profile.release]
 # Analytical engines live and die on the optimizer; make release builds honest.

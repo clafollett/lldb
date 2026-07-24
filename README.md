@@ -45,6 +45,10 @@ SQL ──parse──▶ Logical Plan ──optimize──▶ Physical Plan ─�
 
 ## Quickstart
 
+**Easy path:** run `./scripts/bootstrap.sh` — it checks your toolchain, installs the
+TPC-H generator, and generates the data for you (honors `SCALE_FACTOR`, default `1`).
+Then run `cargo test`. The manual steps below are the explicit alternative.
+
 Prerequisites: Rust 1.97+ (via `rustup`) and the pure-Rust TPC-H generator:
 
 ```bash
@@ -61,7 +65,7 @@ cargo test
 ## Roadmap
 
 - [x] **Phase 0** — Foundation: workspace, storage abstraction, first query over Parquet
-- [ ] **Phase 1** — Iceberg: local catalog, tables, snapshots
+- [x] **Phase 1** — Iceberg: local catalog, tables, snapshots
 - [ ] **Phase 2** — Physical plans + single-node TPC-H baseline
 - [ ] **Phase 3** — Arrow Flight coordinator/worker transport
 - [ ] **Phase 4** — Distributed hash-join (the shuffle)
