@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Fast path: format, lint, and the in-process test suite. Integration tests that need SF1
+  # data or Docker skip themselves, so this stays green without either.
+  check:
+    name: fmt • clippy • test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # `rustup show` installs the toolchain pinned by rust-toolchain.toml (1.97.1).
+      - name: Install pinned toolchain
+        run: |
+          rustup show
+          rustup component add rustfmt clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+  # Proves the distributed communication path across real containers (MinIO + worker fleet +
+  # coordinator over gRPC/Arrow Flight). Runs the LLDB_DOCKER-gated cluster test.
+  docker-cluster:
+    name: cross-container cluster
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install pinned toolchain
+        run: rustup show
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Cross-container distributed smoke test
+        env:
+          LLDB_DOCKER: "1"
+        run: cargo test -p lldb-qe-core --test distributed_cluster -- --nocapture

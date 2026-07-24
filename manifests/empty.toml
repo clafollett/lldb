@@ -1,0 +1,3 @@
+# Minimal manifest: no catalogs. Used by the compose demo so the coordinator can run a
+# constant query (proving cross-container transport) without seeding any data.
+catalogs = []
