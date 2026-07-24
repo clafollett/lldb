@@ -30,6 +30,8 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
 - `Dockerfile` / `docker-compose.yml` — one image, both roles; a MinIO + worker-fleet cluster
+- `infra/` — AWS CDK (TypeScript): ECS Fargate worker fleet, S3 warehouse, ECR. **CDK, not
+  Terraform.** Deploys one pinned `imageTag` to every role; synth fails on `latest`
 - `data/` — generated TPC-H + local Iceberg warehouse (gitignored)
 
 ## Catalogs are config, not code
@@ -46,6 +48,8 @@ cargo test                                                # unit + integration (
 cargo fmt --all && cargo clippy --all-targets
 docker compose up --build                                 # full containerized cluster
 LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smoke test (needs a daemon)
+cd infra && npm ci && npm test                            # CDK assertion tests
+cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```
 
 ## Testing bar
