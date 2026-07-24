@@ -27,6 +27,7 @@
 pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
+pub mod manifest;
 pub mod session;
 pub mod storage;
 pub mod tpch;
@@ -34,5 +35,9 @@ pub mod tpch;
 pub use distributed::distributed_group_count;
 pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;
+pub use manifest::{
+    CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
+    TableSource,
+};
 pub use session::{TPCH_TABLES, build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};
