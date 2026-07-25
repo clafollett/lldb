@@ -18,6 +18,22 @@ RUN apt-get update \
 RUN cargo install cargo-chef --locked
 WORKDIR /build
 
+# Build-speed knobs, defaulting to the real `[profile.release]` in Cargo.toml.
+#
+# That profile is tuned for benchmark honesty — `lto = "thin"` plus `codegen-units = 1`. Thin LTO
+# is a *whole-program* link pass, so it runs across the entire DataFusion/Arrow/Iceberg graph even
+# when every dependency is already compiled and cached, single-threaded, on every build. Touching
+# one line of our own code costs the full pass.
+#
+# Callers that only need working binaries (the CI cluster smoke test, the compose demo) override
+# these to trade runtime speed for build speed. A plain `docker build` still produces the
+# optimized image. Set before `cargo chef cook` so the dependency layer and the final build agree
+# — otherwise cargo considers the cooked deps stale and recompiles them.
+ARG CARGO_PROFILE_RELEASE_LTO=thin
+ARG CARGO_PROFILE_RELEASE_CODEGEN_UNITS=1
+ENV CARGO_PROFILE_RELEASE_LTO=$CARGO_PROFILE_RELEASE_LTO \
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS=$CARGO_PROFILE_RELEASE_CODEGEN_UNITS
+
 # ---- Planner: distill the dependency graph into a recipe (invalidated only by manifests) ---
 FROM chef AS planner
 COPY . .

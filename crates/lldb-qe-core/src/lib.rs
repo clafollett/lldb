@@ -40,6 +40,7 @@ pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
+pub mod remote;
 pub mod session;
 pub mod storage;
 pub mod tpch;
@@ -53,6 +54,7 @@ pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
 };
+pub use remote::{FlightReaderExec, LldbCodec};
 pub use session::{build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};
 pub use tpch::{TPCH_TABLES, tpch_manifest};

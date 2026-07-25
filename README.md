@@ -95,9 +95,23 @@ cargo test
 - [x] **Phase 5** — Benchmark distributed vs single-node ([BENCHMARKS.md](BENCHMARKS.md))
 - [x] **Phase 6** — Generic config-as-data catalog (multi-schema), S3 storage backend
 - [x] **Phase 7** — Containerized cluster + cross-container test + CI
-- [ ] **Next** — Persistent shared catalog (SQL/REST); real network-shuffle exec node +
-  worker-to-worker `do_exchange`; scan-level slicing; AWS IaC (CDK) deploying the image to
-  an ECS Fargate worker fleet
+- [x] **Phase 8** — AWS IaC in CDK: ECS Fargate worker fleet + S3 warehouse ([infra/](infra/))
+- [ ] **Next** — Real network-shuffle exec node + worker-to-worker `do_exchange`; scan-level
+  slicing (the work that makes fan-out across the fleet meaningful); persistent shared catalog
+  (SQL/REST); publish versioned images to a registry from CI
+
+## Deploying to AWS
+
+[`infra/`](infra/) is a CDK app that stands the engine up on ECS Fargate — a service-discovered
+worker fleet, an S3 Iceberg warehouse, and a one-shot coordinator task:
+
+```bash
+cd infra && npm ci
+npx cdk deploy -c imageTag=0.1.0+8c6d8d6b57d8    # deploy one exact build, fleet-wide
+```
+
+The stack refuses to synth without a pinned tag — coordinator and workers must be the identical
+build. See [infra/README.md](infra/README.md) for the deploy walkthrough and cost notes.
 
 ## Versioning
 

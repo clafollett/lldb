@@ -71,6 +71,8 @@ jobs:
           tags: lldb:ci
           build-args: |
             GIT_SHA=${{ steps.ver.outputs.sha }}
+            CARGO_PROFILE_RELEASE_LTO=false
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           cache-from: type=gha,scope=lldb-image
           cache-to: type=gha,mode=max,scope=lldb-image
 
@@ -79,3 +81,34 @@ jobs:
           LLDB_DOCKER: "1"
           LLDB_IMAGE: lldb:ci
         run: cargo test -p lldb-qe-core --test distributed_cluster -- --nocapture
+
+  # The CDK app is real code with real invariants (one image tag fleet-wide, no world-open
+  # Flight port), so it gets the same bar as the Rust crates: it must compile, pass its
+  # assertion tests, and synthesize valid CloudFormation.
+  infra:
+    name: cdk synth • test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: infra
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npm test
+
+      - name: Synth
+        run: npx cdk synth -c imageTag=0.1.0+ci --quiet

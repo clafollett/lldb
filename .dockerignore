@@ -7,4 +7,11 @@ data/
 .git/
 .github/
 *.md
-!README.md
+
+# Everything below is NOT an input to `cargo build`, and the build context is part of the
+# `COPY . .` layer's cache key — so anything left here invalidates the (expensive) compile layer
+# whenever it changes. A CDK-only or docs-only commit was paying for a full Rust rebuild.
+# `manifests/` is bind-mounted by docker-compose rather than baked in; `scripts/` is dev tooling.
+infra/
+scripts/
+manifests/
