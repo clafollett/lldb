@@ -113,8 +113,9 @@ pub struct StageCache {
     inner: Mutex<Inner>,
     /// Number of stages to retain before evicting least-recently-used.
     capacity: usize,
-    /// Count of *actual* materializations (cache misses). Incremented once inside the single-flight
-    /// closure, so concurrent first-pulls of one stage bump it exactly once.
+    /// Count of *successful* materializations (cache misses that produced output). Incremented once,
+    /// after a stage's `init` completes, inside the single-flight closure — so concurrent first-pulls
+    /// of one stage bump it exactly once, and a failed materialization is not counted.
     materializations: AtomicUsize,
 }
 
@@ -185,8 +186,12 @@ impl StageCache {
         let stage = cell
             .get_or_try_init(|| async {
                 // Reached by exactly one caller per materialization (OnceCell serializes the rest).
+                // Count only *after* `init` succeeds: a failed materialization is not cached (the
+                // cell stays empty and the next puller retries), so it must not count as an
+                // execution.
+                let stage = init().await?;
                 self.materializations.fetch_add(1, Ordering::SeqCst);
-                init().await
+                Ok::<_, anyhow::Error>(stage)
             })
             .await?;
         Ok(Arc::clone(stage))
@@ -316,6 +321,30 @@ mod tests {
         }
 
         assert_eq!(runs.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.execution_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_materialization_is_not_counted_and_can_retry() {
+        let cache = StageCache::new();
+
+        // A miss whose init fails is not cached and not counted.
+        let failed = cache
+            .get_or_materialize(1, || async { Err(anyhow::anyhow!("boom")) })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(
+            cache.execution_count(),
+            0,
+            "a failed init is not an execution"
+        );
+        assert_eq!(cache.len(), 1, "the (empty) cell is retained for retry");
+
+        // A later pull of the same stage retries and, on success, counts once.
+        cache
+            .get_or_materialize(1, || async { Ok(sample_stage()) })
+            .await
+            .unwrap();
         assert_eq!(cache.execution_count(), 1);
     }
 

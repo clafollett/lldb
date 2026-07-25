@@ -184,8 +184,19 @@ impl FlightService for WorkerFlightService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
-        let (stage_id, partition, plan_bytes) = decode_ticket(&ticket.ticket)
+        let (ticket_stage_id, partition, plan_bytes) = decode_ticket(&ticket.ticket)
             .map_err(|e| Status::invalid_argument(format!("bad ticket: {e}")))?;
+
+        // The stage id is content-addressed, so recompute it from the plan bytes rather than trust
+        // the header: a buggy or hostile client must not be able to point a plan's request at a
+        // *different* stage's cached output. Reject a ticket whose header disagrees with its own
+        // plan bytes, and key the cache on the recomputed id.
+        let stage_id = stage_id_of(plan_bytes);
+        if stage_id != ticket_stage_id {
+            return Err(Status::invalid_argument(format!(
+                "ticket stage id {ticket_stage_id} does not match its plan bytes (hash {stage_id})"
+            )));
+        }
 
         // Materialize the whole producer once per stage; subsequent consumers (and other
         // partitions) hit the cache. The plan is deserialized and executed only inside this
@@ -207,19 +218,30 @@ impl FlightService for WorkerFlightService {
             .map_err(|e| Status::internal(format!("materialize stage {stage_id}: {e}")))?;
 
         let idx = partition as usize;
-        let batches = materialized.partitions.get(idx).ok_or_else(|| {
-            Status::invalid_argument(format!(
+        if idx >= materialized.partition_count() {
+            return Err(Status::invalid_argument(format!(
                 "partition {partition} out of range: stage {stage_id} produced {} partition(s)",
                 materialized.partition_count()
-            ))
-        })?;
+            )));
+        }
 
-        // Serve the cached batches. Set the schema explicitly so a partition with zero batches
-        // still encodes a valid (schema-only) stream that the consumer can decode.
-        let owned: Vec<RecordBatch> = batches.clone();
-        let batch_stream = futures::stream::iter(owned.into_iter().map(Ok::<_, FlightError>));
+        // Stream the cached partition straight from the shared `Arc`, cloning one batch at a time as
+        // the consumer pulls — no upfront clone of the whole partition vector. The `unfold` state
+        // owns the `Arc`, so the buffer outlives the stream. Set the schema explicitly so a
+        // partition with zero batches still encodes a valid (schema-only) stream.
+        let schema = materialized.schema.clone();
+        let batch_stream =
+            futures::stream::unfold((materialized, idx, 0usize), |(stage, idx, i)| async move {
+                let partition = &stage.partitions[idx];
+                if i < partition.len() {
+                    let batch = partition[i].clone();
+                    Some((Ok::<_, FlightError>(batch), (stage, idx, i + 1)))
+                } else {
+                    None
+                }
+            });
         let flight_data = FlightDataEncoderBuilder::new()
-            .with_schema(materialized.schema.clone())
+            .with_schema(schema)
             .build(batch_stream)
             .map_err(|e| Status::internal(format!("flight encode: {e}")));
 
