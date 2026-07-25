@@ -34,10 +34,6 @@ use arrow_flight::{
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionContext;
-use datafusion_proto::bytes::{
-    physical_plan_from_bytes_with_extension_codec, physical_plan_to_bytes_with_extension_codec,
-};
-use datafusion_proto::physical_plan::DefaultPhysicalExtensionCodec;
 use futures::{Stream, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
@@ -67,24 +63,22 @@ fn decode_ticket(ticket: &[u8]) -> Result<(u32, &[u8])> {
 
 /// Serialize a physical plan for shipping to a worker.
 ///
-/// Phase 3 uses the default codec (built-in DataFusion nodes only). Custom nodes — the
-/// Phase 4 network-shuffle exec — will need a real [`PhysicalExtensionCodec`].
+/// Uses [`LldbCodec`], not the default codec, so plans containing our own nodes survive the
+/// trip. That is what makes worker-to-worker exchange possible: a reduce stage is just a plan
+/// whose leaves are [`FlightReaderExec`]s pointing at map workers, and a worker can only run
+/// such a plan if it can decode those leaves.
 ///
-/// [`PhysicalExtensionCodec`]: datafusion_proto::physical_plan::PhysicalExtensionCodec
+/// [`LldbCodec`]: crate::remote::LldbCodec
+/// [`FlightReaderExec`]: crate::remote::FlightReaderExec
 pub fn serialize_plan(plan: Arc<dyn ExecutionPlan>) -> Result<Vec<u8>> {
-    let codec = DefaultPhysicalExtensionCodec {};
-    let bytes = physical_plan_to_bytes_with_extension_codec(plan, &codec)
-        .context("serializing physical plan")?;
-    Ok(bytes.to_vec())
+    crate::remote::serialize_plan(plan).context("serializing physical plan")
 }
 
 /// Deserialize a physical plan received from a coordinator, executable in `ctx`.
 pub fn deserialize_plan(bytes: &[u8], ctx: &SessionContext) -> Result<Arc<dyn ExecutionPlan>> {
-    let codec = DefaultPhysicalExtensionCodec {};
     // The proto decoder resolves UDFs/runtime from a TaskContext, not the session directly.
     let task_ctx = ctx.task_ctx();
-    physical_plan_from_bytes_with_extension_codec(bytes, task_ctx.as_ref(), &codec)
-        .context("deserializing physical plan")
+    crate::remote::deserialize_plan(bytes, task_ctx.as_ref()).context("deserializing physical plan")
 }
 
 // ---------------------------------------------------------------------------
@@ -216,11 +210,32 @@ pub async fn fetch(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>> {
     let plan_bytes = serialize_plan(plan)?;
+    let stream = fetch_stream(worker_url.to_string(), partition, plan_bytes).await?;
+    let batches = stream
+        .try_collect::<Vec<_>>()
+        .await
+        .context("decoding flight data stream")?;
+    Ok(batches)
+}
+
+/// Like [`fetch`], but hands back the *stream* instead of collecting it, and takes plan bytes
+/// that are already serialized.
+///
+/// This is what [`FlightReaderExec`] needs: an `ExecutionPlan` must produce batches lazily, so
+/// buffering a whole remote partition into a `Vec` first would defeat the point — a reduce
+/// stage should start work on the first batch, not the last.
+///
+/// [`FlightReaderExec`]: crate::remote::FlightReaderExec
+pub async fn fetch_stream(
+    worker_url: String,
+    partition: u32,
+    plan_bytes: Vec<u8>,
+) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
     let ticket = Ticket {
         ticket: encode_ticket(partition, &plan_bytes).into(),
     };
 
-    let channel = Channel::from_shared(worker_url.to_string())
+    let channel = Channel::from_shared(worker_url.clone())
         .with_context(|| format!("invalid worker url {worker_url}"))?
         .connect()
         .await
@@ -234,11 +249,7 @@ pub async fn fetch(
         .into_inner()
         .map_err(|status| FlightError::ExternalError(Box::new(status)));
 
-    let batches = FlightRecordBatchStream::new_from_flight_data(flight_data)
-        .try_collect::<Vec<_>>()
-        .await
-        .context("decoding flight data stream")?;
-    Ok(batches)
+    Ok(FlightRecordBatchStream::new_from_flight_data(flight_data))
 }
 
 #[cfg(test)]
