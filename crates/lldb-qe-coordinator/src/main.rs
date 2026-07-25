@@ -1,10 +1,31 @@
-//! `lldb-qe-coordinator` — builds a query's physical plan and runs it on a remote worker over
-//! Arrow Flight, then prints the result.
+//! `lldb-qe-coordinator` — builds a query's physical plan, distributes it across the whole worker
+//! fleet, and prints the result.
 //!
 //! Configured by flags/env so it drops cleanly into a container:
-//!   `--workers` (`LLDB_WORKERS`, comma-separated fleet), `--manifest` (`LLDB_MANIFEST`, a
+//!   `--workers` (`LLDB_WORKERS`, comma-separated endpoints), `--manifest` (`LLDB_MANIFEST`, a
 //!   TOML catalog description; when omitted it seeds the TPC-H listing tables under
 //!   `--tpch-subdir`), `--sql`, and the shared `--storage …` group.
+//!
+//! # Fleet discovery
+//!
+//! Each `--workers` entry is an *endpoint*, not necessarily a single worker: its host is resolved
+//! to **every** IP behind it (see [`discover_workers`]). A literal IP is one worker; a single Cloud
+//! Map DNS name like `http://worker.lldb.local:50051` enumerates the whole ECS service — one URL per
+//! healthy task. Because that resolution runs on every invocation, scaling the fleet changes the
+//! discovered worker count, and therefore the plan's fan-out, with no redeploy. The discovered fleet
+//! size is logged at startup so an operator can *see* scaling take effect.
+//!
+//! # Distribute vs. offload
+//!
+//! Once the fleet is known the coordinator builds the physical plan and hands it to
+//! [`plan_distributed`], which rewrites distribution boundaries (a `GROUP BY`, a partitioned join)
+//! into map/reduce stages fanned across the fleet. The policy: **distribute what can be distributed
+//! and reduce locally; offload a boundary-less plan whole to one worker.** Concretely — if the
+//! rewrite inserted any [`FlightReaderExec`] leaves, the plan is genuinely distributed and the
+//! coordinator runs it locally with `collect` (the leaves make the remote calls). If it did not
+//! (a constant query, a bare scan — nothing to shuffle), there is nothing to fan out, so the whole
+//! plan is shipped to one worker over Flight. That keeps simple queries exercising a real worker,
+//! which is exactly what the cross-container cluster smoke test relies on.
 //!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
@@ -14,11 +35,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    StorageArgs, StorageConfig, apply_manifest, build_session, fetch, init_tracing,
-    register_tpch_parquet,
+    FlightReaderExec, StorageArgs, StorageConfig, apply_manifest, build_session, discover_workers,
+    fetch, init_tracing, plan_distributed, register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -28,7 +51,10 @@ use lldb_qe_core::{
     version = lldb_qe_core::BUILD_VERSION
 )]
 struct Cli {
-    /// Comma-separated worker Flight URLs. The demo ships the plan to the first one.
+    /// Comma-separated worker Flight endpoints (`scheme://host:port`). Each entry is resolved to the
+    /// whole fleet behind it: a literal IP is one worker, while a single DNS name (e.g. a Cloud Map
+    /// service name) enumerates every task registered under it. Distributable stages then fan across
+    /// all discovered workers.
     #[arg(
         long,
         env = "LLDB_WORKERS",
@@ -85,16 +111,67 @@ async fn main() -> Result<()> {
         None => register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?,
     }
 
-    // Collapse to a single output partition, then run partition 0 on the first worker.
-    let plan = ctx.sql(&cli.sql).await?.create_physical_plan().await?;
-    let plan = Arc::new(CoalescePartitionsExec::new(plan));
+    // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
+    // level is the operator-visible signal that scaling the ECS service actually changed the fleet.
+    let fleet = discover_workers(&cli.workers)
+        .await
+        .context("discovering the worker fleet")?;
+    if fleet.is_empty() {
+        bail!(
+            "no workers discovered from --workers {:?}: every endpoint resolved to nothing",
+            cli.workers
+        );
+    }
+    tracing::info!(
+        fleet_size = fleet.len(),
+        workers = ?fleet,
+        "discovered worker fleet"
+    );
 
-    let worker = cli
-        .workers
-        .first()
-        .context("at least one worker required")?;
-    tracing::info!(worker = %worker, "shipping plan to worker");
-    let batches = fetch(worker, 0, plan).await?;
+    // Build the physical plan, then rewrite its distribution boundaries across the whole fleet.
+    let plan = ctx.sql(&cli.sql).await?.create_physical_plan().await?;
+    let coordinated = plan_distributed(Arc::clone(&plan), &fleet)?;
+
+    // Policy: distribute what can be distributed and reduce locally; offload a boundary-less plan
+    // whole to one worker. `plan_distributed` returns the plan *unchanged* when there is no
+    // distribution boundary (a constant query, a bare scan), so detect "did it actually distribute"
+    // by looking for the FlightReaderExec leaves the rewrite inserts.
+    let batches = if contains_flight_reader(&coordinated) {
+        // Genuinely distributed: the coordinator runs the reduce side locally and its
+        // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight.
+        collect(coordinated, ctx.task_ctx())
+            .await
+            .context("running the distributed query across the fleet")?
+    } else {
+        // Boundary-less: nothing to fan out. Collapse to a single output partition and ship the
+        // whole plan to one worker — this still exercises a real worker over Flight (what the
+        // cross-container cluster smoke test proves) instead of running everything locally.
+        let plan = Arc::new(CoalescePartitionsExec::new(plan));
+        let worker = &fleet[0];
+        tracing::info!(worker = %worker, "no distribution boundary; offloading the whole plan to one worker");
+        fetch(worker, 0, plan)
+            .await
+            .context("running the query on a single worker")?
+    };
+
     println!("{}", pretty_format_batches(&batches)?);
     Ok(())
+}
+
+/// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]
+/// actually cut a distribution boundary and inserted remote reads, rather than returning the plan
+/// unchanged.
+fn contains_flight_reader(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let mut found = false;
+    // `apply` is infallible here (the closure never errors), so the expect cannot fire.
+    plan.apply(|node| {
+        if node.as_any().downcast_ref::<FlightReaderExec>().is_some() {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    })
+    .expect("walking the plan for FlightReaderExec does not error");
+    found
 }

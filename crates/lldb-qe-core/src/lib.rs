@@ -36,6 +36,7 @@ pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
 
 pub mod catalog;
 pub mod config;
+pub mod discovery;
 pub mod distributed;
 pub mod flight;
 pub mod lakehouse;
@@ -50,6 +51,7 @@ pub mod tpch;
 
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
+pub use discovery::discover_workers;
 pub use flight::{fetch, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
