@@ -1,8 +1,8 @@
 //! Phase 5 scorecard: distributed vs single-node, on the same grouped COUNT(*).
 //!
-//! At SF1 the distributed path is expected to be *slower* — two workers each scan the whole
-//! `orders` file (filtering to their slice), plus plan serialization and gRPC round-trips,
-//! all to beat a query that already fits in one machine's cache. That's the lesson:
+//! At SF1 the distributed path is expected to be *slower* — even though each worker now scans
+//! only its own byte-range slice of `orders`, the plan serialization and gRPC round-trips still
+//! cost more than a query that already fits in one machine's cache. That's the lesson:
 //! distribution is a tax you pay to break the single-machine memory/IO wall, not a free win.
 //!
 //! Run with `cargo bench -p lldb-qe-core --bench distributed` (needs `./scripts/bootstrap.sh`).
@@ -61,7 +61,7 @@ fn distributed_vs_single(c: &mut Criterion) {
     });
     group.bench_function("distributed-2-workers", |b| {
         b.to_async(&rt).iter(|| async {
-            distributed_group_count(&ctx, &workers, "orders", "o_orderstatus", "o_orderkey")
+            distributed_group_count(&ctx, &workers, "orders", "o_orderstatus")
                 .await
                 .unwrap()
         });
