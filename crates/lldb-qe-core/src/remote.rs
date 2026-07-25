@@ -27,9 +27,11 @@
 //! a *push* shuffle where producers send partitions to consumers. This is a **pull** shuffle:
 //! the consumer opens `do_get` against each producer. Pull is what Ballista does, it reuses the
 //! transport already built, and it makes the plan tree the single source of truth about who
-//! talks to whom. The tradeoff is that a producer re-runs its sub-plan per consumer that pulls
-//! from it — fine while each stage has one consumer, and the reason a real engine eventually
-//! materializes shuffle output. Noted, not hidden.
+//! talks to whom. Pull's natural hazard — a producer would re-run its sub-plan once per consumer
+//! that pulls from it — is defused on the worker: `do_get` materializes each producer stage once
+//! into a [`crate::stage_cache::StageCache`] and serves every consumer (and every output
+//! partition) from that one buffer. So the `R` reduce stages that all pull the same map producer
+//! now share a single execution. See [`crate::flight`] for the stage-id ticket and the cache.
 //!
 //! Serialization: [`LldbCodec`] is a real [`PhysicalExtensionCodec`], replacing the
 //! `DefaultPhysicalExtensionCodec` that could only handle built-in nodes.

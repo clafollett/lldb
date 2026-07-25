@@ -43,13 +43,14 @@ pub mod manifest;
 pub mod remote;
 pub mod scan_split;
 pub mod session;
+pub mod stage_cache;
 pub mod staging;
 pub mod storage;
 pub mod tpch;
 
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
-pub use flight::{fetch, serve_worker};
+pub use flight::{fetch, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
@@ -58,6 +59,7 @@ pub use manifest::{
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use scan_split::split_scan;
 pub use session::{build_session, register_tpch_parquet};
+pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
 pub use staging::plan_distributed;
 pub use storage::{Storage, StorageConfig};
 pub use tpch::{TPCH_TABLES, tpch_manifest};
