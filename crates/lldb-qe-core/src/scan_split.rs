@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow, bail};
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
+use datafusion::datasource::listing::PartitionedFile;
 use datafusion::datasource::physical_plan::{FileGroup, FileGroupPartitioner, FileScanConfig};
 use datafusion::datasource::source::DataSourceExec;
 use datafusion::physical_plan::ExecutionPlan;
@@ -40,28 +41,35 @@ use datafusion::physical_plan::ExecutionPlan;
 /// keeps a caller's one-plan-per-worker bookkeeping simple.
 ///
 /// # Errors
-/// Returns an error if `plan` has no file-scan leaf, or more than one — scan-level slicing is a
-/// single-scan operation in this POC (a join over two scans would need each side sliced and
-/// co-located, which is the staging planner's job, not this primitive's).
+/// Returns an error if `partitions` is zero, if `plan` has no file-scan leaf, or if it has more
+/// than one — scan-level slicing is a single-scan operation in this POC (a join over two scans
+/// would need each side sliced and co-located, which is the staging planner's job, not this
+/// primitive's).
 pub fn split_scan(
     plan: Arc<dyn ExecutionPlan>,
     partitions: usize,
 ) -> Result<Vec<Arc<dyn ExecutionPlan>>> {
-    assert!(partitions > 0, "need at least one partition");
+    if partitions == 0 {
+        bail!("need at least one partition to slice a scan into");
+    }
 
     let groups = find_scan_file_groups(&plan)?;
     let slices = slice_by_size(&groups, partitions);
 
-    (0..partitions)
-        .map(|i| {
-            // `slice_by_size` may yield fewer groups than requested when the data is small;
-            // the missing slices scan nothing.
-            let group = slices
-                .get(i)
-                .cloned()
-                .unwrap_or_else(|| FileGroup::new(Vec::new()));
-            rebuild_with_file_group(Arc::clone(&plan), group)
-        })
+    // Fold the produced slices into *exactly* `partitions` file groups, round-robin. The
+    // partitioner normally returns ≤ `partitions` groups, so this usually places one slice per
+    // bucket and leaves any surplus buckets empty (a worker that scans nothing). Folding rather
+    // than indexing keeps correctness independent of that guarantee: if it ever returned more
+    // groups than requested, they wrap back into earlier buckets instead of being dropped, so no
+    // file group — and no data — is ever lost.
+    let mut buckets: Vec<Vec<PartitionedFile>> = vec![Vec::new(); partitions];
+    for (i, group) in slices.into_iter().enumerate() {
+        buckets[i % partitions].extend(group.into_inner());
+    }
+
+    buckets
+        .into_iter()
+        .map(|files| rebuild_with_file_group(Arc::clone(&plan), FileGroup::new(files)))
         .collect()
 }
 
@@ -245,6 +253,28 @@ mod tests {
         assert_eq!(
             sliced_total, whole,
             "coverage is preserved even when over-split"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn errors_on_zero_partitions() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = seed_parquet(tmp.path(), 64)?;
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nums",
+            path.to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        let plan = scan_plan(&ctx, "SELECT n FROM nums").await;
+
+        // A public API returning `Result` should reject bad input with an error, not a panic.
+        let err = split_scan(plan, 0).expect_err("zero partitions is invalid");
+        assert!(
+            err.to_string().contains("at least one partition"),
+            "got: {err}"
         );
         Ok(())
     }
