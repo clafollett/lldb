@@ -39,9 +39,9 @@ async fn distributed_group_count_matches_single_node() -> anyhow::Result<()> {
     let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;
     register_tpch_parquet(&ctx, &storage, "sf1").await?;
 
-    // Distributed: map across 2 workers, hash-shuffle by o_orderstatus, reduce.
-    let distributed =
-        distributed_group_count(&ctx, &workers, "orders", "o_orderstatus", "o_orderkey").await?;
+    // Distributed: map across 2 workers (each reading its own byte-range slice of orders),
+    // hash-shuffle by o_orderstatus, reduce.
+    let distributed = distributed_group_count(&ctx, &workers, "orders", "o_orderstatus").await?;
     println!("distributed group counts: {distributed:?}");
 
     // Single-node oracle.

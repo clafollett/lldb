@@ -41,6 +41,7 @@ pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
 pub mod remote;
+pub mod scan_split;
 pub mod session;
 pub mod storage;
 pub mod tpch;
@@ -55,6 +56,7 @@ pub use manifest::{
     TableSource,
 };
 pub use remote::{FlightReaderExec, LldbCodec};
+pub use scan_split::split_scan;
 pub use session::{build_session, register_tpch_parquet};
 pub use storage::{Storage, StorageConfig};
 pub use tpch::{TPCH_TABLES, tpch_manifest};

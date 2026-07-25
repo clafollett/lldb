@@ -32,12 +32,16 @@ path across two workers (`cargo bench --bench distributed`).
 At SF1 the `orders` file fits comfortably in memory/cache, so distribution is all cost and no
 benefit:
 
-- **Redundant IO** — in this POC each worker scans the whole file and filters to its slice, so
-  two workers do ~2× the scan work. (A production engine slices the scan itself.)
 - **Serialization** — the physical plan is encoded to protobuf per request.
 - **Network** — Arrow batches cross a gRPC boundary instead of staying in-process.
 - **Co-located reduce** — the shuffle and reduce run on the coordinator (worker-to-worker
   `do_exchange` is the documented next step), adding a gather hop.
+
+IO is no longer redundant: each worker now scans only its own byte-range slice of the file
+(`scan_split`), so the fleet's total scan work is ~1× a single node, not N×. At SF1 that scan is
+cache-cheap either way, so the fixed serialization/network/reduce taxes above still dominate — the
+table's numbers predate scan slicing and are expected to be within noise of it here. Slicing pays
+off where the scan is the bottleneck: data too large for one node's cache/RAM.
 
 Distribution earns its keep only when the data no longer fits on one machine — when a single
 node would spill to disk, thrash cache, or simply run out of RAM. Then N machines scanning
