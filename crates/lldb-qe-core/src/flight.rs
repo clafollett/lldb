@@ -3,17 +3,31 @@
 //! This is the foundation of distributed execution. The moves:
 //!
 //! 1. **Coordinator** serializes a physical sub-plan to bytes ([`datafusion_proto`]) and puts
-//!    them in a Flight `Ticket` alongside the partition index to run.
-//! 2. **Worker** ([`WorkerFlightService`]) receives the ticket in `do_get`, deserializes the
-//!    plan, calls `plan.execute(partition, ..)`, and streams the resulting `RecordBatch`es
-//!    back encoded as `FlightData`.
+//!    them in a Flight `Ticket` alongside a stage id and the partition index to run.
+//! 2. **Worker** ([`WorkerFlightService`]) receives the ticket in `do_get`, materializes the
+//!    plan's output **once per stage** into a [`StageCache`], and streams the requested
+//!    partition's cached `RecordBatch`es back encoded as `FlightData`.
 //! 3. **Coordinator** decodes the `FlightData` stream back into `RecordBatch`es.
 //!
 //! Arrow Flight is just gRPC that speaks Arrow natively — the batches cross the wire with no
-//! row-by-row (de)serialization. In Phase 3 there is no distribution *logic* yet: we prove a
-//! sub-plan can round-trip and execute remotely. Phase 4 builds the shuffle on top.
+//! row-by-row (de)serialization.
 //!
-//! Ticket wire format (little): `partition: u32 LE` ++ `serialized physical plan`.
+//! # Materialize-once shuffle
+//!
+//! This is a **pull** shuffle: each consumer opens `do_get` against a producer. Earlier, `do_get`
+//! deserialized the ticket's plan and called `plan.execute(partition, ..)` on *every* request, so a
+//! producer pulled by `R` consumers (e.g. the `R` reduce stages of a partitioned hash join, all
+//! pulling different partitions of one shared map producer) re-ran its whole scan + partial `R`
+//! times — an `M×R` blowup across `M` producers. Now the worker keys on a **stage id** carried in
+//! the ticket, runs the producer's plan exactly once via a [`StageCache`], buffers all its output
+//! partitions, and serves every consumer straight from that buffer. The producer executes once; the
+//! consumers each still get complete, correct output. See [`crate::stage_cache`] for the design
+//! (single-flight, all-partitions materialization, LRU eviction, execution metric).
+//!
+//! Ticket wire format (little-endian): `stage_id: u64 LE` ++ `partition: u32 LE` ++
+//! `serialized physical plan`. The `stage_id` is a stable content hash of the plan bytes, derived
+//! at fetch time (see [`fetch_stream`]), so all consumers of one producer name the same cache
+//! entry without any coordinator-side stage assignment.
 //!
 //! Note: coordinator and worker MUST run the identical DataFusion build — serialized plans
 //! are not cross-version compatible.
@@ -32,7 +46,7 @@ use arrow_flight::{
     HandshakeRequest, HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::{ExecutionPlan, collect_partitioned};
 use datafusion::prelude::SessionContext;
 use futures::{Stream, TryStreamExt};
 use tokio::net::TcpListener;
@@ -40,25 +54,39 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::stage_cache::{MaterializedStage, StageCache, stage_id_of};
+
 /// Boxed tonic response stream.
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
-/// Encode a Flight ticket: 4-byte little-endian partition index, then the plan bytes.
-fn encode_ticket(partition: u32, plan_bytes: &[u8]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(4 + plan_bytes.len());
+/// Number of fixed header bytes in a ticket: `stage_id` (u64) + `partition` (u32).
+const TICKET_HEADER_LEN: usize = 8 + 4;
+
+/// Encode a Flight ticket: 8-byte LE stage id, 4-byte LE partition index, then the plan bytes.
+///
+/// The `stage_id` names the producer stage so the worker can serve many consumers of the same
+/// producer from one materialization (see [`StageCache`]); the `partition` selects which of that
+/// stage's output partitions this consumer wants.
+fn encode_ticket(stage_id: u64, partition: u32, plan_bytes: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(TICKET_HEADER_LEN + plan_bytes.len());
+    buf.extend_from_slice(&stage_id.to_le_bytes());
     buf.extend_from_slice(&partition.to_le_bytes());
     buf.extend_from_slice(plan_bytes);
     buf
 }
 
-/// Decode a Flight ticket into `(partition, plan_bytes)`.
-fn decode_ticket(ticket: &[u8]) -> Result<(u32, &[u8])> {
-    if ticket.len() < 4 {
-        return Err(anyhow!("ticket too short: {} bytes", ticket.len()));
+/// Decode a Flight ticket into `(stage_id, partition, plan_bytes)`.
+fn decode_ticket(ticket: &[u8]) -> Result<(u64, u32, &[u8])> {
+    if ticket.len() < TICKET_HEADER_LEN {
+        return Err(anyhow!(
+            "ticket too short: {} bytes, need at least {TICKET_HEADER_LEN}",
+            ticket.len()
+        ));
     }
-    let (head, plan_bytes) = ticket.split_at(4);
-    let partition = u32::from_le_bytes(head.try_into().expect("4 bytes"));
-    Ok((partition, plan_bytes))
+    let (head, plan_bytes) = ticket.split_at(TICKET_HEADER_LEN);
+    let stage_id = u64::from_le_bytes(head[..8].try_into().expect("8 bytes"));
+    let partition = u32::from_le_bytes(head[8..12].try_into().expect("4 bytes"));
+    Ok((stage_id, partition, plan_bytes))
 }
 
 /// Serialize a physical plan for shipping to a worker.
@@ -85,21 +113,53 @@ pub fn deserialize_plan(bytes: &[u8], ctx: &SessionContext) -> Result<Arc<dyn Ex
 // Worker side — a Flight server that executes sub-plans.
 // ---------------------------------------------------------------------------
 
-/// A stateless worker: executes whatever physical plan arrives over Flight.
+/// A worker that executes physical plans arriving over Flight, caching each producer stage's
+/// output so it is materialized once and served to many consumers.
+///
+/// The cache lives as long as the service (an `Arc<StageCache>` shared across every `do_get`), so
+/// the `R` reducers of a shuffle that all pull one producer share a single execution. Cloning the
+/// service — tonic clones it per request — clones the `Arc`, not the cache, so all clones share the
+/// one cache.
 #[derive(Clone)]
 pub struct WorkerFlightService {
     ctx: SessionContext,
+    cache: Arc<StageCache>,
 }
 
 impl WorkerFlightService {
+    /// A worker with a fresh, empty stage cache.
     pub fn new(ctx: SessionContext) -> Self {
-        Self { ctx }
+        Self::new_with_cache(ctx, Arc::new(StageCache::new()))
+    }
+
+    /// A worker sharing the given stage cache. Tests use this to retain a handle to the cache and
+    /// assert [`StageCache::execution_count`] after driving consumers.
+    pub fn new_with_cache(ctx: SessionContext, cache: Arc<StageCache>) -> Self {
+        Self { ctx, cache }
+    }
+
+    /// The stage cache this worker serves from.
+    pub fn stage_cache(&self) -> &Arc<StageCache> {
+        &self.cache
     }
 }
 
-/// Serve the worker on `listener` until the process ends.
+/// Serve the worker on `listener` until the process ends, with a fresh stage cache.
 pub async fn serve_worker(listener: TcpListener, ctx: SessionContext) -> Result<()> {
-    let service = FlightServiceServer::new(WorkerFlightService::new(ctx));
+    serve_worker_with_cache(listener, ctx, Arc::new(StageCache::new())).await
+}
+
+/// Like [`serve_worker`] but sharing a caller-provided [`StageCache`].
+///
+/// The caller keeps its own `Arc` clone, so a test can start a real in-process worker and then read
+/// the cache's [`execution_count`](StageCache::execution_count) to prove a producer ran exactly once
+/// across `N` consumer pulls.
+pub async fn serve_worker_with_cache(
+    listener: TcpListener,
+    ctx: SessionContext,
+    cache: Arc<StageCache>,
+) -> Result<()> {
+    let service = FlightServiceServer::new(WorkerFlightService::new_with_cache(ctx, cache));
     Server::builder()
         .add_service(service)
         .serve_with_incoming(TcpListenerStream::new(listener))
@@ -117,26 +177,50 @@ impl FlightService for WorkerFlightService {
     type DoActionStream = TonicStream<arrow_flight::Result>;
     type ListActionsStream = TonicStream<ActionType>;
 
-    /// Execute the sub-plan in the ticket and stream its batches back.
+    /// Materialize the ticket's producer stage (once, via the cache) and stream the requested
+    /// partition's batches back.
     async fn do_get(
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         let ticket = request.into_inner();
-        let (partition, plan_bytes) = decode_ticket(&ticket.ticket)
+        let (stage_id, partition, plan_bytes) = decode_ticket(&ticket.ticket)
             .map_err(|e| Status::invalid_argument(format!("bad ticket: {e}")))?;
 
-        let plan = deserialize_plan(plan_bytes, &self.ctx)
-            .map_err(|e| Status::internal(format!("deserialize plan: {e}")))?;
+        // Materialize the whole producer once per stage; subsequent consumers (and other
+        // partitions) hit the cache. The plan is deserialized and executed only inside this
+        // once-closure, i.e. only on a cache miss.
+        let plan_bytes = plan_bytes.to_vec();
+        let ctx = self.ctx.clone();
+        let materialized = self
+            .cache
+            .get_or_materialize(stage_id, || async move {
+                let plan = deserialize_plan(&plan_bytes, &ctx)?;
+                let schema = plan.schema();
+                // Drive every output partition concurrently — a RepartitionExec fans its single
+                // input read into per-partition channels, so draining them one-at-a-time can
+                // deadlock. See `stage_cache` for the full rationale.
+                let partitions = collect_partitioned(plan, ctx.task_ctx()).await?;
+                Ok(Arc::new(MaterializedStage { schema, partitions }))
+            })
+            .await
+            .map_err(|e| Status::internal(format!("materialize stage {stage_id}: {e}")))?;
 
-        let batches = plan
-            .execute(partition as usize, self.ctx.task_ctx())
-            .map_err(|e| Status::internal(format!("execute partition {partition}: {e}")))?;
+        let idx = partition as usize;
+        let batches = materialized.partitions.get(idx).ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "partition {partition} out of range: stage {stage_id} produced {} partition(s)",
+                materialized.partition_count()
+            ))
+        })?;
 
-        // Adapt DataFusion errors to Flight errors, then Arrow-encode the batch stream.
-        let batches = batches.map_err(|e| FlightError::ExternalError(Box::new(e)));
+        // Serve the cached batches. Set the schema explicitly so a partition with zero batches
+        // still encodes a valid (schema-only) stream that the consumer can decode.
+        let owned: Vec<RecordBatch> = batches.clone();
+        let batch_stream = futures::stream::iter(owned.into_iter().map(Ok::<_, FlightError>));
         let flight_data = FlightDataEncoderBuilder::new()
-            .build(batches)
+            .with_schema(materialized.schema.clone())
+            .build(batch_stream)
             .map_err(|e| Status::internal(format!("flight encode: {e}")));
 
         Ok(Response::new(Box::pin(flight_data)))
@@ -231,8 +315,12 @@ pub async fn fetch_stream(
     partition: u32,
     plan_bytes: Vec<u8>,
 ) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
+    // Derive the stage id from the plan bytes themselves: every consumer of one producer ships
+    // byte-identical bytes (only `partition` differs), so they all name the same cache entry on the
+    // worker without any coordinator-side stage assignment.
+    let stage_id = stage_id_of(&plan_bytes);
     let ticket = Ticket {
-        ticket: encode_ticket(partition, &plan_bytes).into(),
+        ticket: encode_ticket(stage_id, partition, &plan_bytes).into(),
     };
 
     let channel = Channel::from_shared(worker_url.clone())
@@ -258,14 +346,26 @@ mod tests {
 
     #[test]
     fn ticket_roundtrips() {
-        let ticket = encode_ticket(7, b"plan-bytes");
-        let (partition, plan) = decode_ticket(&ticket).unwrap();
+        let ticket = encode_ticket(0xDEAD_BEEF_1234_5678, 7, b"plan-bytes");
+        let (stage_id, partition, plan) = decode_ticket(&ticket).unwrap();
+        assert_eq!(stage_id, 0xDEAD_BEEF_1234_5678);
         assert_eq!(partition, 7);
         assert_eq!(plan, b"plan-bytes");
     }
 
     #[test]
+    fn ticket_carries_an_empty_plan() {
+        // A stage-only ticket (no plan bytes) still round-trips its header.
+        let ticket = encode_ticket(1, 2, b"");
+        let (stage_id, partition, plan) = decode_ticket(&ticket).unwrap();
+        assert_eq!((stage_id, partition), (1, 2));
+        assert!(plan.is_empty());
+    }
+
+    #[test]
     fn short_ticket_errors() {
+        // Fewer than the 12 header bytes must error, not panic.
         assert!(decode_ticket(&[1, 2]).is_err());
+        assert!(decode_ticket(&[0; TICKET_HEADER_LEN - 1]).is_err());
     }
 }

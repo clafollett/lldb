@@ -39,8 +39,10 @@
 //!   single scan, so a `GROUP BY` over a join naturally surfaces as an error there too.
 //! - If no boundary is found the plan is returned **unchanged**: the query simply runs locally.
 //!   A no-op is a valid answer — not every query needs a fleet.
-//! - Map producers re-run per consumer that pulls from them (the pull-shuffle tradeoff documented
-//!   on [`FlightReaderExec`]); a real engine would materialize shuffle output once.
+//! - Map producers are pulled by several reduce consumers, but each producer stage executes only
+//!   **once**: the worker materializes it into a [`crate::stage_cache::StageCache`] on the first
+//!   pull and serves the rest from that buffer (the pull-shuffle hazard documented on
+//!   [`FlightReaderExec`], now closed). Shuffle output is buffered in worker memory, not spilled.
 
 use std::sync::Arc;
 
@@ -171,8 +173,11 @@ fn distribute_aggregate(
 /// This nests a `FlightReaderExec` (map) inside a `FlightReaderExec` (reduce) — the composition
 /// [`crate::remote::LldbCodec`] was built to serialize.
 ///
-/// Map producers re-run once per reduce partition that pulls from them (the documented
-/// pull-shuffle tradeoff); fine for a POC, where a real engine would materialize shuffle output.
+/// All `N` reduce stages pull *the same* `Arc`-shared map producer (differing only in which
+/// partition they request), so a naive worker would re-run that producer `N` times. The worker's
+/// [`crate::stage_cache::StageCache`] closes that: the producer materializes once — keyed on the
+/// stage id derived from its identical plan bytes — and every reduce partition reads from the one
+/// buffered result.
 ///
 /// Note on partitioning: the planner only reaches here when the optimizer chose
 /// [`PartitionMode::Partitioned`]. A `CollectLeft` join (small build side) has no repartition seam
