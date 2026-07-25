@@ -10,9 +10,9 @@
 //! 2. **IO is divided, not multiplied** — the `bytes_scanned` metric summed across the slices is
 //!    ≈ a single-node scan, nowhere near `n`× it.
 //!
-//! A second test drives the full map→reduce that [`lldb_qe_core::distributed_group_count`] uses —
-//! slice a grouped `COUNT(*)`, run each slice, sum the partials — and checks the answer matches a
-//! single-node `GROUP BY` exactly, the issue's third "Done when".
+//! A second test drives the same map→reduce shape that [`lldb_qe_core::plan_distributed`] builds
+//! for a distributed aggregate — slice a grouped `COUNT(*)`, run each slice, sum the partials — and
+//! checks the answer matches a single-node `GROUP BY` exactly, the issue's third "Done when".
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -153,7 +153,7 @@ async fn slices_read_disjoint_bytes_and_match_the_single_node_scan() -> anyhow::
     Ok(())
 }
 
-/// The map→reduce that [`lldb_qe_core::distributed_group_count`] runs, exercised end to end
+/// The map→reduce that [`lldb_qe_core::plan_distributed`] builds for an aggregate, exercised end to end
 /// without workers or external data: slice a grouped `COUNT(*)`, run each slice, sum the partials,
 /// and require the result to equal a single-node `GROUP BY`.
 #[tokio::test]

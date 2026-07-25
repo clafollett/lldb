@@ -113,8 +113,8 @@ async fn a_worker_pulls_from_another_worker() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// A two-stage aggregation where the reduce runs on a worker, not the coordinator — the thing
-/// `distributed_group_count` could not do.
+/// A two-stage aggregation where the reduce runs on a worker, not the coordinator — the
+/// worker-to-worker exchange that [`lldb_qe_core::plan_distributed`] now composes automatically.
 #[tokio::test]
 async fn aggregation_reduces_on_a_worker() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
