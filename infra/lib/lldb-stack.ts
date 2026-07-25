@@ -89,7 +89,12 @@ export class LldbStack extends cdk.Stack {
       );
     }
 
+    // `-c workerCount=…` arrives as an unvalidated string through `Number()`, so a typo becomes
+    // NaN and a fractional/zero value would synthesize a nonsense DesiredCount. Fail at synth.
     const workerCount = props.workerCount ?? 2;
+    if (!Number.isInteger(workerCount) || workerCount < 1) {
+      throw new Error(`workerCount must be a positive integer, got ${JSON.stringify(props.workerCount)}`);
+    }
     const cpu = props.cpu ?? 1024;
     const memoryLimitMiB = props.memoryLimitMiB ?? 4096;
 

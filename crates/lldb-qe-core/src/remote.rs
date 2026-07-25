@@ -172,7 +172,10 @@ impl ExecutionPlan for FlightReaderExec {
         let stream = futures::stream::once(async move {
             flight::fetch_stream(url, remote_partition, plan_bytes)
                 .await
-                .map_err(|e| DataFusionError::External(Box::new(SendError(e.to_string()))))
+                // `anyhow::Error` is not itself a `std::error::Error`, but it converts into a
+                // boxed one — which keeps the underlying cause chain (bad URL, connect refused,
+                // worker-side status) instead of flattening it to a string.
+                .map_err(|e: anyhow::Error| DataFusionError::External(e.into()))
         })
         .map(|res| res.map(|s| s.map_err(|e| DataFusionError::External(Box::new(e)))))
         .try_flatten();
@@ -180,18 +183,6 @@ impl ExecutionPlan for FlightReaderExec {
         Ok(Box::pin(RecordBatchStreamAdapter::new(schema, stream)))
     }
 }
-
-/// `anyhow::Error` is not `std::error::Error`, so wrap its message to cross into DataFusion.
-#[derive(Debug)]
-struct SendError(String);
-
-impl fmt::Display for SendError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-impl std::error::Error for SendError {}
 
 // ---------------------------------------------------------------------------
 // Codec

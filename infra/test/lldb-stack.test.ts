@@ -93,9 +93,18 @@ describe('worker fleet', () => {
   });
 
   test('fleet size is configurable', () => {
-    synth({ workerCount: 5 } as any).hasResourceProperties('AWS::ECS::Service', { DesiredCount: 5 });
+    synth({ workerCount: 5 }).hasResourceProperties('AWS::ECS::Service', { DesiredCount: 5 });
     synth().hasResourceProperties('AWS::ECS::Service', { DesiredCount: 2 });
   });
+
+  // `-c workerCount=…` is a string run through Number(), so a typo yields NaN. Catch it at
+  // synth rather than shipping a service with a nonsense DesiredCount.
+  test.each([[NaN, 'a typo'], [0, 'zero'], [-1, 'negative'], [1.5, 'fractional']])(
+    'rejects workerCount=%s (%s)',
+    (workerCount) => {
+      expect(() => synth({ workerCount })).toThrow(/positive integer/);
+    },
+  );
 });
 
 describe('security', () => {
