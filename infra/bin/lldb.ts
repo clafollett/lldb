@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { LldbStack } from '../lib/lldb-stack';
+import { LldbStack, EgressMode } from '../lib/lldb-stack';
 
 const app = new cdk.App();
 
@@ -19,8 +19,17 @@ if (!imageTag) {
 
 const workerCountCtx = app.node.tryGetContext('workerCount');
 
+// `-c egress=nat-instance` moves tasks into private subnets behind a ~$3/mo fck-nat box;
+// `nat-gateway` uses the managed (~$33/mo) service. Default `none` keeps the fleet in public
+// subnets at $0 — safe because inbound is default-deny, just not defense in depth.
+const egress = app.node.tryGetContext('egress') as EgressMode | undefined;
+if (egress && !['none', 'nat-instance', 'nat-gateway'].includes(egress)) {
+  throw new Error(`unknown egress mode '${egress}' (expected none | nat-instance | nat-gateway)`);
+}
+
 new LldbStack(app, 'LldbStack', {
   imageTag,
+  egress,
   workerCount: workerCountCtx ? Number(workerCountCtx) : undefined,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,

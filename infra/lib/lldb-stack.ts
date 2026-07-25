@@ -14,6 +14,29 @@ export const WORKER_PORT = 50051;
 export const NAMESPACE = 'lldb.local';
 export const WORKER_SERVICE_NAME = 'worker';
 
+/**
+ * How worker/coordinator tasks reach the services they need that are *not* the warehouse
+ * (pulling from ECR, writing CloudWatch logs). Warehouse traffic never enters into it — that
+ * rides a free S3 gateway endpoint in every mode.
+ *
+ * - `none` (default): tasks sit in public subnets with public IPs and egress straight through
+ *   the internet gateway. **$0.** Inbound is still default-deny and the Flight port is only
+ *   open to the coordinator's security group, so this is safe — it just isn't defense in depth.
+ * - `nat-instance`: tasks move to private subnets behind a single small NAT instance
+ *   (fck-nat on `t4g.nano` ≈ **$3/mo**). No public IPs on the data plane.
+ * - `nat-gateway`: same private layout behind a managed NAT gateway (≈ **$33/mo** + $0.045/GB).
+ *   Buys AWS-managed HA and no instance to patch.
+ *
+ * Worth knowing: the "no NAT at all, pure PrivateLink" alternative is the *most* expensive of
+ * these — private subnets would need `ecr.api`, `ecr.dkr` and `logs` interface endpoints at
+ * ~$7.30/mo each per AZ.
+ */
+export type EgressMode = 'none' | 'nat-instance' | 'nat-gateway';
+
+/** fck-nat (https://fck-nat.dev) — a free, purpose-built NAT AMI. Published under this owner. */
+const FCK_NAT_OWNER = '568608671756';
+const FCK_NAT_AMI_NAME = 'fck-nat-amzn2-*-arm64-ebs';
+
 export interface LldbStackProps extends cdk.StackProps {
   /**
    * Image tag both roles run. This is the whole point of the single-tag design: serialized
@@ -26,6 +49,16 @@ export interface LldbStackProps extends cdk.StackProps {
   /** Fargate task sizing (analytical work is memory-hungry; defaults suit the POC). */
   readonly cpu?: number;
   readonly memoryLimitMiB?: number;
+  /** How tasks reach ECR/CloudWatch. See {@link EgressMode}. Defaults to `none` ($0). */
+  readonly egress?: EgressMode;
+  /**
+   * AMI for the `nat-instance` mode. Defaults to looking up the latest **fck-nat** arm64 image,
+   * which requires a concrete account/region (a lookup hits the real EC2 API at synth time).
+   * Pass an explicit image to keep synth hermetic — that is what the tests do.
+   */
+  readonly natMachineImage?: ec2.IMachineImage;
+  /** Instance type for `nat-instance`. Defaults to `t4g.nano` (arm64, matches the fck-nat AMI). */
+  readonly natInstanceType?: ec2.InstanceType;
 }
 
 /**
@@ -81,13 +114,54 @@ export class LldbStack extends cdk.Stack {
     });
 
     // ---- Network ------------------------------------------------------------------------
+    const egress: EgressMode = props.egress ?? 'none';
+    const isPrivate = egress !== 'none';
+
+    // One NAT (instance or gateway) serves both AZs. Paying per-AZ for HA is not a POC concern;
+    // raise `natGateways` to `maxAzs` when a NAT outage taking the fleet offline actually costs
+    // more than the second NAT does.
+    const natInstanceProvider =
+      egress === 'nat-instance'
+        ? ec2.NatProvider.instanceV2({
+            instanceType: props.natInstanceType ?? ec2.InstanceType.of(ec2.InstanceClass.T4G, ec2.InstanceSize.NANO),
+            machineImage:
+              props.natMachineImage ??
+              ec2.MachineImage.lookup({ name: FCK_NAT_AMI_NAME, owners: [FCK_NAT_OWNER] }),
+            // CDK's default here is INBOUND_AND_OUTBOUND, which opens the NAT instance to the
+            // whole internet. It only ever needs to accept traffic from inside the VPC (that
+            // rule is added below, once the CIDR exists).
+            defaultAllowedTraffic: ec2.NatTrafficDirection.OUTBOUND_ONLY,
+          })
+        : undefined;
+    const natGatewayProvider = natInstanceProvider;
+
     const vpc = new ec2.Vpc(this, 'Vpc', {
       maxAzs: 2,
-      natGateways: 0,
-      subnetConfiguration: [{ name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 }],
+      natGateways: isPrivate ? 1 : 0,
+      ...(natGatewayProvider ? { natGatewayProvider } : {}),
+      subnetConfiguration: isPrivate
+        ? [
+            { name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
+            { name: 'private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
+          ]
+        : [{ name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 }],
     });
-    // Free egress to S3 — keeps warehouse traffic off the public internet and off a NAT bill.
+    // The NAT forwards traffic originating in the VPC, so it must accept exactly that and
+    // nothing else. Without this the instance would be internet-reachable.
+    natInstanceProvider?.connections.allowFrom(
+      ec2.Peer.ipv4(vpc.vpcCidrBlock),
+      ec2.Port.allTraffic(),
+      'NAT forwards traffic from inside the VPC only',
+    );
+
+    // Free egress to S3 in every mode — warehouse traffic never touches the NAT (or the public
+    // internet), which is exactly the traffic you would not want billed per-GB.
     vpc.addGatewayEndpoint('S3Endpoint', { service: ec2.GatewayVpcEndpointAwsService.S3 });
+
+    // Where the tasks run, and whether they need a public IP to reach ECR.
+    const taskSubnets: ec2.SubnetSelection = {
+      subnetType: isPrivate ? ec2.SubnetType.PRIVATE_WITH_EGRESS : ec2.SubnetType.PUBLIC,
+    };
 
     this.cluster = new ecs.Cluster(this, 'Cluster', {
       vpc,
@@ -151,7 +225,10 @@ export class LldbStack extends cdk.Stack {
       cluster: this.cluster,
       taskDefinition: workerTask,
       desiredCount: workerCount,
-      assignPublicIp: true, // no NAT: tasks need a public IP to pull from ECR
+      // Without a NAT the task needs its own public IP to reach ECR; behind one it must not
+      // have a public IP at all (that is the whole point of moving it to a private subnet).
+      assignPublicIp: !isPrivate,
+      vpcSubnets: taskSubnets,
       securityGroups: [workerSg],
       // Fail a bad rollout fast (and roll back) instead of letting ECS grind for up to 3 hours.
       circuitBreaker: { rollback: true },
@@ -187,5 +264,15 @@ export class LldbStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'WorkerDns', { value: `${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`, description: 'Cloud Map DNS for the worker fleet' });
     new cdk.CfnOutput(this, 'CoordinatorTaskArn', { value: this.coordinatorTask.taskDefinitionArn, description: 'Run with `aws ecs run-task` to execute a query' });
     new cdk.CfnOutput(this, 'CoordinatorSecurityGroup', { value: coordinatorSg.securityGroupId, description: 'Use this SG when running the coordinator task' });
+    // Everything `aws ecs run-task --network-configuration` needs, matching the egress mode.
+    new cdk.CfnOutput(this, 'TaskSubnets', {
+      value: cdk.Fn.join(',', vpc.selectSubnets(taskSubnets).subnetIds),
+      description: 'Subnets to run the coordinator task in',
+    });
+    new cdk.CfnOutput(this, 'AssignPublicIp', {
+      value: isPrivate ? 'DISABLED' : 'ENABLED',
+      description: 'assignPublicIp for run-task (DISABLED behind a NAT)',
+    });
+    new cdk.CfnOutput(this, 'EgressMode', { value: egress });
   }
 }
