@@ -10,10 +10,9 @@
 use std::path::PathBuf;
 
 use criterion::{Criterion, criterion_group, criterion_main};
+use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
-use lldb_qe_core::{
-    StorageConfig, build_session, distributed_group_count, flight, register_tpch_parquet,
-};
+use lldb_qe_core::{StorageConfig, build_session, flight, plan_distributed, register_tpch_parquet};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 
@@ -61,9 +60,18 @@ fn distributed_vs_single(c: &mut Criterion) {
     });
     group.bench_function("distributed-2-workers", |b| {
         b.to_async(&rt).iter(|| async {
-            distributed_group_count(&ctx, &workers, "orders", "o_orderstatus")
+            // The staging planner rewrites the same grouped COUNT(*) into map/reduce stages: the
+            // partial aggregate is sliced across the workers, the final aggregate reduces on the
+            // coordinator. `collect` drives it; the FlightReaderExec leaves make the remote calls.
+            let plan = ctx
+                .sql("SELECT o_orderstatus, count(*) FROM orders GROUP BY o_orderstatus")
                 .await
                 .unwrap()
+                .create_physical_plan()
+                .await
+                .unwrap();
+            let distributed = plan_distributed(plan, &workers).unwrap();
+            collect(distributed, ctx.task_ctx()).await.unwrap()
         });
     });
     group.finish();

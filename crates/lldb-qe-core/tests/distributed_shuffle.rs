@@ -1,21 +1,27 @@
-//! Phase 4 deliverable: a distributed hash aggregation across two workers matches the
-//! single-node answer exactly. Map is distributed over Flight; the coordinator hash-shuffles
-//! partials by group key and reduces. Skips if the data is absent.
+//! The staging planner distributes an arbitrary `GROUP BY` and the result matches single-node.
+//!
+//! This is the aggregate half of issue #4's "done when": a `GROUP BY` distributes with **no**
+//! bespoke code — `plan_distributed` rewrites the physical plan into map/reduce stages, the
+//! coordinator executes the rewritten plan with `collect`, and the FlightReaderExec leaves fan the
+//! map stage across a fleet of in-process workers. We assert the distributed answer equals the
+//! plain single-node answer, for two group cardinalities.
+//!
+//! No external data: the test seeds its own multi-row-group parquet in a tempdir, so it runs in CI.
 
-use std::path::PathBuf;
+use std::sync::Arc;
 
-use datafusion::prelude::SessionContext;
+use datafusion::arrow::array::{Int64Array, StringArray};
+use datafusion::arrow::datatypes::{DataType, Field, Schema};
+use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::parquet::arrow::ArrowWriter;
+use datafusion::parquet::file::properties::WriterProperties;
+use datafusion::physical_plan::{ExecutionPlan, collect};
+use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use lldb_qe_core::distributed::{GroupCount, extract_group_counts};
-use lldb_qe_core::{
-    StorageConfig, build_session, distributed_group_count, flight, register_tpch_parquet,
-};
+use lldb_qe_core::{flight, plan_distributed};
 use tokio::net::TcpListener;
 
-fn data_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
-}
-
-/// Start a worker on a random port and return its URL.
+/// Start an in-process worker on a random port; returns its URL.
 async fn start_worker() -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
@@ -27,38 +33,119 @@ async fn start_worker() -> anyhow::Result<String> {
     Ok(format!("http://{addr}"))
 }
 
+/// Seed a parquet file with several row groups (so the byte-range split can divide it between map
+/// workers) and a controllable number of distinct groups.
+fn seed_parquet(
+    dir: &std::path::Path,
+    rows: i64,
+    groups: i64,
+) -> anyhow::Result<std::path::PathBuf> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("g", DataType::Utf8, false),
+        Field::new("v", DataType::Int64, false),
+    ]));
+    let g: Vec<String> = (0..rows).map(|i| format!("g{}", i % groups)).collect();
+    let batch = RecordBatch::try_new(
+        Arc::clone(&schema),
+        vec![
+            Arc::new(StringArray::from(g)),
+            Arc::new(Int64Array::from((0..rows).collect::<Vec<_>>())),
+        ],
+    )?;
+    let path = dir.join("rows.parquet");
+    let props = WriterProperties::builder()
+        .set_max_row_group_row_count(Some(128))
+        .build();
+    let file = std::fs::File::create(&path)?;
+    let mut writer = ArrowWriter::try_new(file, schema, Some(props))?;
+    writer.write(&batch)?;
+    writer.close()?;
+    Ok(path)
+}
+
+/// A session configured so tiny test data still yields a real distribution boundary: multiple
+/// target partitions and file scans splittable down to the byte.
+fn distributing_ctx() -> SessionContext {
+    let mut cfg = SessionConfig::new().with_target_partitions(4);
+    cfg.options_mut().optimizer.repartition_file_min_size = 1;
+    SessionContext::new_with_config(cfg)
+}
+
+/// Run `sql`'s grouped counts distributed across `workers`, then sorted for comparison.
+async fn distributed_counts(
+    ctx: &SessionContext,
+    workers: &[String],
+    sql: &str,
+) -> anyhow::Result<Vec<GroupCount>> {
+    let plan = ctx.sql(sql).await?.create_physical_plan().await?;
+    let dist: Arc<dyn ExecutionPlan> = plan_distributed(plan, workers)?;
+    let batches = collect(dist, ctx.task_ctx()).await?;
+    let mut counts = extract_group_counts(&batches)?;
+    counts.sort();
+    Ok(counts)
+}
+
+async fn single_node_counts(ctx: &SessionContext, sql: &str) -> anyhow::Result<Vec<GroupCount>> {
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut counts = extract_group_counts(&batches)?;
+    counts.sort();
+    Ok(counts)
+}
+
 #[tokio::test]
-async fn distributed_group_count_matches_single_node() -> anyhow::Result<()> {
-    if !data_dir().join("sf1/orders.parquet").exists() {
-        eprintln!("SKIP: no data — run ./scripts/bootstrap.sh");
-        return Ok(());
-    }
+async fn distributed_group_by_matches_single_node() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = seed_parquet(tmp.path(), 2000, 5)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let workers = vec![
+        start_worker().await?,
+        start_worker().await?,
+        start_worker().await?,
+    ];
 
-    let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;
-    register_tpch_parquet(&ctx, &storage, "sf1").await?;
+    let ctx = distributing_ctx();
+    ctx.register_parquet(
+        "rows",
+        path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
 
-    // Distributed: map across 2 workers (each reading its own byte-range slice of orders),
-    // hash-shuffle by o_orderstatus, reduce.
-    let distributed = distributed_group_count(&ctx, &workers, "orders", "o_orderstatus").await?;
-    println!("distributed group counts: {distributed:?}");
-
-    // Single-node oracle.
-    let batches = ctx
-        .sql("SELECT o_orderstatus AS g, count(*) AS cnt FROM orders GROUP BY o_orderstatus")
-        .await?
-        .collect()
-        .await?;
-    let mut expected: Vec<GroupCount> = extract_group_counts(&batches)?;
-    expected.sort();
+    let sql = "SELECT g, count(*) AS cnt FROM rows GROUP BY g";
+    let distributed = distributed_counts(&ctx, &workers, sql).await?;
+    let expected = single_node_counts(&ctx, sql).await?;
 
     assert_eq!(
         distributed, expected,
-        "distributed hash aggregation must equal the single-node group-by"
+        "distributed GROUP BY must equal the single-node answer"
     );
-    // Sanity: the counts cover all 1.5M orders.
+    // Sanity: every seeded row is accounted for.
     let total: i64 = distributed.iter().map(|(_, c)| c).sum();
-    assert_eq!(total, 1_500_000, "TPC-H SF1 has 1,500,000 orders");
+    assert_eq!(total, 2000);
+    Ok(())
+}
+
+/// A different cardinality and worker count, to show the rewrite is not tuned to one shape.
+#[tokio::test]
+async fn distributed_group_by_high_cardinality() -> anyhow::Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let path = seed_parquet(tmp.path(), 3000, 50)?;
+
+    let workers = vec![start_worker().await?, start_worker().await?];
+
+    let ctx = distributing_ctx();
+    ctx.register_parquet(
+        "rows",
+        path.to_str().unwrap(),
+        ParquetReadOptions::default(),
+    )
+    .await?;
+
+    let sql = "SELECT g, count(*) AS cnt FROM rows GROUP BY g";
+    let distributed = distributed_counts(&ctx, &workers, sql).await?;
+    let expected = single_node_counts(&ctx, sql).await?;
+
+    assert_eq!(distributed, expected);
+    assert_eq!(distributed.len(), 50, "all 50 groups present exactly once");
     Ok(())
 }

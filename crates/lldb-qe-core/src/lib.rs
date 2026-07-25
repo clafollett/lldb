@@ -43,12 +43,12 @@ pub mod manifest;
 pub mod remote;
 pub mod scan_split;
 pub mod session;
+pub mod staging;
 pub mod storage;
 pub mod tpch;
 
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
-pub use distributed::distributed_group_count;
 pub use flight::{fetch, serve_worker};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
@@ -58,5 +58,6 @@ pub use manifest::{
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use scan_split::split_scan;
 pub use session::{build_session, register_tpch_parquet};
+pub use staging::plan_distributed;
 pub use storage::{Storage, StorageConfig};
 pub use tpch::{TPCH_TABLES, tpch_manifest};

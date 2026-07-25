@@ -1,111 +1,23 @@
-//! Distributed execution: the hash shuffle.
+//! Result helpers shared by the distributed tests and benches.
 //!
-//! This is the heart of a distributed query engine. To aggregate (or join) across machines
-//! you must ensure every row with the same key is processed by the same node. You get there
-//! by **hash-partitioning**: `partition = hash(key) % num_reducers`.
+//! This module used to own `distributed_group_count`: a hand-written, three-stage distributed
+//! grouped `COUNT(*)` — map each byte-range slice on a worker, hash-shuffle the partials on the
+//! coordinator, reduce. It proved the shuffle worked, but it distributed *one* query written in
+//! Rust rather than *arbitrary* SQL. [`crate::staging::plan_distributed`] replaced it: the shuffle
+//! now falls out of the physical plan's own distribution boundaries, no query-specific code.
 //!
-//! [`distributed_group_count`] implements a distributed grouped `COUNT(*)` in three stages:
-//!
-//! 1. **Map** — each worker aggregates a *disjoint slice* of the table and returns per-group
-//!    partial counts. The slice is a set of **byte ranges** of the table's files, assigned by
-//!    [`crate::scan_split`], so a worker reads only its own bytes: IO is divided across the
-//!    fleet, not multiplied. These run in parallel over Arrow Flight, so both the scan and the
-//!    aggregation are genuinely distributed.
-//! 2. **Shuffle** — the coordinator routes every partial into a reduce bucket by
-//!    `hash(group) % n`. This is the move that makes distributed aggregation correct: every
-//!    occurrence of a group lands in the same bucket.
-//! 3. **Reduce** — sum the partials within each bucket into the final per-group count.
-//!
-//! The result is identical to a single-node `GROUP BY`. A hash **join** uses the exact same
-//! shuffle, keyed on the join column so matching rows from both sides meet on one node.
-//!
-//! POC scope, stated plainly:
-//! - The reduce runs on the coordinator. Real engines push each shuffle partition to a reduce
-//!   worker over Flight `do_exchange`. That worker-to-worker exchange is the documented next
-//!   step; here the shuffle is made explicit but co-located.
-
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+//! What survives here is the small, still-useful bit: pulling `(group, count)` pairs out of an
+//! aggregation's result batches, and the type alias for them. Tests use it to compare a
+//! distributed answer against the single-node oracle.
 
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::DataType;
 use datafusion::arrow::record_batch::RecordBatch;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::prelude::SessionContext;
-use futures::future::try_join_all;
-
-use crate::flight;
 
 /// A group value and its (partial or final) count.
 pub type GroupCount = (String, i64);
-
-/// Distributed grouped `COUNT(*)` over `workers`, keyed on a string `group_col`. Returns
-/// `(group, count)` pairs sorted by group.
-///
-/// The map stage's scan is sliced by [`crate::scan_split::split_scan`] into one disjoint
-/// byte-range slice per worker, so the fleet's total IO ≈ a single-node scan rather than `n`×.
-///
-/// The result matches `SELECT {group_col}, count(*) FROM {table} GROUP BY {group_col}` run on
-/// a single node.
-pub async fn distributed_group_count(
-    ctx: &SessionContext,
-    workers: &[String],
-    table: &str,
-    group_col: &str,
-) -> Result<Vec<GroupCount>> {
-    let n = workers.len();
-    assert!(n > 0, "need at least one worker");
-
-    // Build the map plan once — partial per-group counts over the *whole* table — then slice its
-    // scan into `n` disjoint byte-range copies, one per worker.
-    let sql = format!("SELECT {group_col} AS g, count(*) AS cnt FROM {table} GROUP BY {group_col}");
-    let map_plan = ctx.sql(&sql).await?.create_physical_plan().await?;
-    let slices = crate::scan_split::split_scan(map_plan, n)?;
-
-    // --- Map: ship each slice to its worker, in parallel over Flight. ---
-    let map_tasks = slices.into_iter().zip(workers).map(|(plan, url)| {
-        let plan = Arc::new(CoalescePartitionsExec::new(plan));
-        let url = url.clone();
-        async move {
-            let batches = flight::fetch(&url, 0, plan).await?;
-            anyhow::Ok(extract_group_counts(&batches)?)
-        }
-    });
-    let per_worker: Vec<Vec<GroupCount>> = try_join_all(map_tasks).await?;
-
-    // --- Shuffle: route each partial into a reduce bucket by hash(group) % n. ---
-    let mut buckets: Vec<Vec<GroupCount>> = vec![Vec::new(); n];
-    for partials in per_worker {
-        for (group, cnt) in partials {
-            let bucket = (hash_key(&group) % n as u64) as usize;
-            buckets[bucket].push((group, cnt));
-        }
-    }
-
-    // --- Reduce: sum counts per group within each bucket (a group lives in exactly one). ---
-    let mut result: Vec<GroupCount> = Vec::new();
-    for bucket in buckets {
-        let mut totals: HashMap<String, i64> = HashMap::new();
-        for (group, cnt) in bucket {
-            *totals.entry(group).or_default() += cnt;
-        }
-        result.extend(totals);
-    }
-    result.sort();
-    Ok(result)
-}
-
-/// Deterministic hash of a group key. `DefaultHasher` uses fixed keys, so the same group
-/// always routes to the same bucket — the property the shuffle depends on.
-fn hash_key(key: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    key.hash(&mut hasher);
-    hasher.finish()
-}
 
 /// Pull `(group: Utf8, count: Int64)` pairs out of aggregation result batches.
 pub fn extract_group_counts(batches: &[RecordBatch]) -> Result<Vec<GroupCount>> {
@@ -134,9 +46,26 @@ pub fn extract_group_counts(batches: &[RecordBatch]) -> Result<Vec<GroupCount>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::arrow::array::{Int64Array, StringArray};
+    use datafusion::arrow::datatypes::{Field, Schema};
+    use std::sync::Arc;
 
     #[test]
-    fn hashing_is_deterministic() {
-        assert_eq!(hash_key("A"), hash_key("A"));
+    fn extracts_and_casts_group_counts() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("g", DataType::Utf8, false),
+            Field::new("cnt", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![3, 2])),
+            ],
+        )
+        .unwrap();
+
+        let pairs = extract_group_counts(&[batch]).unwrap();
+        assert_eq!(pairs, vec![("a".to_string(), 3), ("b".to_string(), 2)]);
     }
 }
