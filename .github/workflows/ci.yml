@@ -71,6 +71,8 @@ jobs:
           tags: lldb:ci
           build-args: |
             GIT_SHA=${{ steps.ver.outputs.sha }}
+            CARGO_PROFILE_RELEASE_LTO=false
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS=16
           cache-from: type=gha,scope=lldb-image
           cache-to: type=gha,mode=max,scope=lldb-image
 

@@ -21,6 +21,11 @@ x-lldb-build: &lldb-build
   context: .
   args:
     GIT_SHA: ${LLDB_GIT_SHA:-unknown}
+    # This cluster is a demo/dev target running a constant query, so it wants fast *builds*, not
+    # fast binaries. Thin LTO with one codegen unit adds many minutes of whole-program link time
+    # to every rebuild. Override for a release image: LLDB_LTO=thin LLDB_CODEGEN_UNITS=1.
+    CARGO_PROFILE_RELEASE_LTO: ${LLDB_LTO:-false}
+    CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${LLDB_CODEGEN_UNITS:-16}
 
 x-s3-env: &s3-env
   AWS_ACCESS_KEY_ID: minioadmin
