@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { LldbStack, EgressMode, ServicesDbMode } from '../lib/lldb-stack';
+import { LldbStack, EgressMode, ServicesDbMode, WarehouseDefinition } from '../lib/lldb-stack';
 
 const app = new cdk.App();
 
@@ -18,6 +18,40 @@ if (!imageTag) {
 }
 
 const workerCountCtx = app.node.tryGetContext('workerCount');
+
+// `-c warehouses=analytics:4,etl:1:suspended` deploys one ECS service per virtual warehouse,
+// each registered under its own Cloud Map name, each sized independently. Omitted, the stack
+// deploys the single `worker` warehouse sized by `workerCount` — the pre-warehouse fleet, byte
+// for byte, so adopting warehouses breaks nothing already deployed.
+//
+// This is the *infrastructure* half. The services database holds the same facts as rows, and the
+// engine reads those rows to route a query; nothing in the engine calls the ECS API, so keeping
+// the two in step is a deploy step (or one `aws ecs update-service`), not magic.
+const warehousesCtx = app.node.tryGetContext('warehouses') as string | undefined;
+const warehouses = warehousesCtx ? parseWarehouses(warehousesCtx) : undefined;
+
+/**
+ * Parse `name:size[:state],…`. Sizes go through `Number()`, so anything unparseable becomes NaN
+ * here and is rejected by the stack's own validation with a message naming the warehouse — one
+ * place that check lives, rather than two that can disagree.
+ */
+function parseWarehouses(raw: string): WarehouseDefinition[] {
+  return raw
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0)
+    .map((entry) => {
+      const [name, size, state] = entry.split(':');
+      if (size === undefined) {
+        throw new Error(`warehouse '${entry}' is missing a size — use name:size[:running|suspended]`);
+      }
+      return {
+        name,
+        size: Number(size),
+        ...(state ? { state: state as WarehouseDefinition['state'] } : {}),
+      };
+    });
+}
 
 // `-c egress=nat-instance` moves tasks into private subnets behind a ~$3/mo fck-nat box;
 // `nat-gateway` uses the managed (~$33/mo) service. Default `none` keeps the fleet in public
@@ -40,6 +74,7 @@ new LldbStack(app, 'LldbStack', {
   egress,
   servicesDb,
   workerCount: workerCountCtx ? Number(workerCountCtx) : undefined,
+  warehouses,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,
     region: process.env.CDK_DEFAULT_REGION,

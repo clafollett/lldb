@@ -40,7 +40,7 @@ SQL ──parse──▶ Logical Plan ──optimize──▶ Physical Plan ─�
 | Crate | Role |
 | - | - |
 | `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, services-DB connection layer |
-| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds `lldb-qe-migrate` |
+| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds the control-plane one-shots `lldb-qe-migrate` and `lldb-qe-warehouse` |
 | `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
 
 ## Services database (control plane)
@@ -65,6 +65,42 @@ Connection settings come from `LLDB_METADATA_URL`, or from the discrete
 injects a Secrets Manager password as its own variable and cannot interpolate one into a URL.
 **A services database is optional:** with none configured, single-node and local runs behave
 exactly as before.
+
+## Virtual warehouses (elastic compute)
+
+A **warehouse** is a named, independently sized pool of workers: you size it for the workload
+pointed at it, suspend it when nobody is asking, and resume it — without touching storage, the
+catalog, or any other warehouse. Two teams can hold a small warehouse and a large one against the
+same tables and neither can slow the other down, because the only thing they share is bytes at
+rest.
+
+```bash
+WH="cargo run -q -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
+  --metadata-url postgres://lldb:lldb@localhost:5432/lldb"
+
+$WH create --name analytics --size 4     # define it
+$WH create --name etl --size 1
+$WH list
+$WH resize  --name analytics --size 8    # change its desired size
+$WH suspend --name analytics             # release its compute; the definition and size survive
+$WH resume  --name analytics
+
+# route a query to a warehouse: resolved in Postgres, then discovered by DNS
+cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."
+```
+
+Each warehouse gets its **own DNS name** (`<name>.lldb.local` on ECS, a compose network alias
+locally), which resolves to every worker in that warehouse and no other — so a query fans out
+across exactly the warehouse it was routed to, and a resize changes the observed parallelism of
+the next query with no redeploy. A **suspended** warehouse is refused with an error naming the
+resume command rather than silently running somewhere else.
+
+**The database holds desired state; something else applies it.** `lldb-qe-warehouse` writes rows;
+the CDK stack (one ECS service per warehouse) or `aws ecs update-service --desired-count` — or
+`docker compose up --scale` locally — makes the compute match. The engine deliberately carries no
+orchestrator SDK, so the same rows can drive ECS, compose, or whatever runs workers next; every
+mutation prints the exact apply command. Without a services database configured, none of this is
+in the way: `--workers` behaves exactly as it always has.
 
 ## Catalogs & schemas
 

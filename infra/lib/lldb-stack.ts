@@ -19,7 +19,44 @@ export const SERVICES_DB_USER = 'lldb';
 
 /** Private DNS namespace the fleet registers into, e.g. `worker.lldb.local`. */
 export const NAMESPACE = 'lldb.local';
+/**
+ * Name of the warehouse the stack deploys when none are declared. It is `worker` for a reason:
+ * every pre-warehouse deploy pointed its coordinator at `worker.lldb.local`, and a default that
+ * kept the name means adopting warehouses is not a breaking change to anything already running.
+ */
 export const WORKER_SERVICE_NAME = 'worker';
+
+/**
+ * Template the coordinator renders a warehouse name into (`LLDB_WAREHOUSE_ENDPOINT`). One Cloud
+ * Map name per warehouse is the whole routing mechanism: each warehouse's ECS service registers
+ * its tasks under its *own* name, so `<warehouse>.lldb.local` resolves to exactly that
+ * warehouse's fleet and nothing else.
+ */
+export const WAREHOUSE_ENDPOINT_TEMPLATE = `http://{warehouse}.${NAMESPACE}:${WORKER_PORT}`;
+
+/**
+ * A virtual warehouse: a named, independently sized pool of workers.
+ *
+ * This is the infrastructure half of the concept whose control-plane half lives in the services
+ * database's `warehouses` table. The database holds **desired state** — the engine deliberately
+ * carries no AWS SDK and calls no ECS API (see `crates/lldb-qe-core/src/warehouse.rs`) — and this
+ * stack is one of the two things that *applies* it. The other is an operator running
+ * `aws ecs update-service --desired-count`, which is the no-deploy path for a resize or a
+ * suspend; a redeploy with an edited `warehouses` list is the durable one.
+ *
+ * Keep the two in step: a warehouse row the stack does not know about has no compute, and a
+ * service the database does not know about cannot be routed to. The coordinator logs a warning
+ * when the size it read disagrees with the fleet that answered, which is what that drift looks
+ * like from the inside.
+ */
+export interface WarehouseDefinition {
+  /** Name — also the Cloud Map DNS label, so: lowercase `[a-z0-9-]`, not starting/ending with `-`. */
+  readonly name: string;
+  /** Desired worker count. Retained across a suspend; this is what `running` scales to. */
+  readonly size: number;
+  /** `suspended` deploys the service at `desiredCount: 0` — defined and sized, but costing nothing. */
+  readonly state?: 'running' | 'suspended';
+}
 
 /**
  * How worker/coordinator tasks reach the services they need that are *not* the warehouse
@@ -66,8 +103,18 @@ export interface LldbStackProps extends cdk.StackProps {
    * worker must be the *identical* build. CI stamps images `version+git-sha`; deploy that tag.
    */
   readonly imageTag: string;
-  /** Number of worker tasks in the fleet. */
+  /**
+   * Size of the single default warehouse. Shorthand for `warehouses: [{ name: 'worker', size: n }]`
+   * — the two are mutually exclusive, because a stack that accepted both would have to pick one
+   * silently.
+   */
   readonly workerCount?: number;
+  /**
+   * The virtual warehouses to deploy: one ECS service each, `desiredCount` from `size`, and its
+   * own Cloud Map name. Defaults to a single `worker` warehouse of `workerCount` tasks, which is
+   * byte-for-byte the fleet this stack deployed before warehouses existed.
+   */
+  readonly warehouses?: WarehouseDefinition[];
   /** Fargate task sizing (analytical work is memory-hungry; defaults suit the POC). */
   readonly cpu?: number;
   readonly memoryLimitMiB?: number;
@@ -98,7 +145,10 @@ export class LldbStack extends cdk.Stack {
   public readonly repository: ecr.Repository;
   public readonly warehouse: s3.Bucket;
   public readonly cluster: ecs.Cluster;
+  /** The default (first) warehouse's service — kept for callers that predate warehouses. */
   public readonly workerService: ecs.FargateService;
+  /** Every warehouse's service, by warehouse name. */
+  public readonly warehouseServices: Record<string, ecs.FargateService> = {};
   public readonly coordinatorTask: ecs.FargateTaskDefinition;
   /** The services database, when `servicesDb: 'aurora'`. */
   public readonly servicesDb?: rds.DatabaseCluster;
@@ -121,6 +171,13 @@ export class LldbStack extends cdk.Stack {
     if (!Number.isInteger(workerCount) || workerCount < 1) {
       throw new Error(`workerCount must be a positive integer, got ${JSON.stringify(props.workerCount)}`);
     }
+    if (props.warehouses && props.workerCount !== undefined) {
+      throw new Error(
+        'workerCount and warehouses are mutually exclusive — workerCount sizes the single default ' +
+          'warehouse, so pass sizes inside `warehouses` instead.',
+      );
+    }
+    const warehouses = validateWarehouses(props.warehouses ?? [{ name: WORKER_SERVICE_NAME, size: workerCount }]);
     const cpu = props.cpu ?? 1024;
     const memoryLimitMiB = props.memoryLimitMiB ?? 4096;
 
@@ -310,46 +367,60 @@ export class LldbStack extends cdk.Stack {
       RUST_LOG: 'info',
     };
 
-    // ---- Worker fleet -------------------------------------------------------------------
-    const workerTask = new ecs.FargateTaskDefinition(this, 'WorkerTask', { cpu, memoryLimitMiB });
-    workerTask.addContainer('worker', {
-      image,
-      command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
-      environment: { ...storageEnv, ...metadataEnv },
-      secrets: metadataSecrets,
-      portMappings: [{ containerPort: WORKER_PORT }],
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'worker', logGroup }),
-      // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port.
-      healthCheck: {
-        command: ['CMD-SHELL', `nc -z 127.0.0.1 ${WORKER_PORT} || exit 1`],
-        interval: cdk.Duration.seconds(15),
-        timeout: cdk.Duration.seconds(5),
-        retries: 3,
-        startPeriod: cdk.Duration.seconds(30),
-      },
-    });
-    this.warehouse.grantReadWrite(workerTask.taskRole);
+    // ---- Warehouses: one worker fleet each ----------------------------------------------
+    // Each warehouse gets its own task definition, its own ECS service, and — the part that makes
+    // routing work — its own Cloud Map name. `analytics.lldb.local` resolves to the analytics
+    // warehouse's tasks and to nothing else, so a coordinator handed a warehouse name cannot
+    // reach another warehouse's compute even by accident.
+    for (const definition of warehouses) {
+      const id = `Warehouse${pascalCase(definition.name)}`;
+      const task = new ecs.FargateTaskDefinition(this, `${id}Task`, { cpu, memoryLimitMiB });
+      task.addContainer('worker', {
+        image,
+        command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
+        environment: { ...storageEnv, ...metadataEnv },
+        secrets: metadataSecrets,
+        portMappings: [{ containerPort: WORKER_PORT }],
+        logging: ecs.LogDrivers.awsLogs({ streamPrefix: `worker-${definition.name}`, logGroup }),
+        // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port.
+        healthCheck: {
+          command: ['CMD-SHELL', `nc -z 127.0.0.1 ${WORKER_PORT} || exit 1`],
+          interval: cdk.Duration.seconds(15),
+          timeout: cdk.Duration.seconds(5),
+          retries: 3,
+          startPeriod: cdk.Duration.seconds(30),
+        },
+      });
+      // Every warehouse reads the same warehouse bucket. Compute is what is partitioned here,
+      // never storage — that separation is the entire premise of the abstraction.
+      this.warehouse.grantReadWrite(task.taskRole);
 
-    this.workerService = new ecs.FargateService(this, 'WorkerService', {
-      cluster: this.cluster,
-      taskDefinition: workerTask,
-      desiredCount: workerCount,
-      // Without a NAT the task needs its own public IP to reach ECR; behind one it must not
-      // have a public IP at all (that is the whole point of moving it to a private subnet).
-      assignPublicIp: !isPrivate,
-      vpcSubnets: taskSubnets,
-      securityGroups: [workerSg],
-      // Fail a bad rollout fast (and roll back) instead of letting ECS grind for up to 3 hours.
-      circuitBreaker: { rollback: true },
-      minHealthyPercent: 50,
-      // Registers each task in Cloud Map as `worker.lldb.local`. An A-record query returns
-      // every healthy task IP, which is how the coordinator finds the fleet.
-      cloudMapOptions: {
-        name: WORKER_SERVICE_NAME,
-        dnsRecordType: servicediscovery.DnsRecordType.A,
-        dnsTtl: cdk.Duration.seconds(10),
-      },
-    });
+      const service = new ecs.FargateService(this, `${id}Service`, {
+        cluster: this.cluster,
+        taskDefinition: task,
+        // Suspended means zero tasks: the definition survives, the bill does not. Resuming is
+        // this number going back to `size` — a deploy, or one `aws ecs update-service` call.
+        desiredCount: definition.state === 'suspended' ? 0 : definition.size,
+        // Without a NAT the task needs its own public IP to reach ECR; behind one it must not
+        // have a public IP at all (that is the whole point of moving it to a private subnet).
+        assignPublicIp: !isPrivate,
+        vpcSubnets: taskSubnets,
+        securityGroups: [workerSg],
+        // Fail a bad rollout fast (and roll back) instead of letting ECS grind for up to 3 hours.
+        circuitBreaker: { rollback: true },
+        minHealthyPercent: 50,
+        // Registers each task in Cloud Map as `<warehouse>.lldb.local`. An A-record query returns
+        // every healthy task IP, which is how the coordinator finds *this* warehouse's fleet.
+        cloudMapOptions: {
+          name: definition.name,
+          dnsRecordType: servicediscovery.DnsRecordType.A,
+          dnsTtl: cdk.Duration.seconds(10),
+        },
+      });
+      this.warehouseServices[definition.name] = service;
+    }
+    // The first warehouse is the one a bare `run-task` coordinator points at.
+    this.workerService = this.warehouseServices[warehouses[0].name];
 
     // ---- Coordinator --------------------------------------------------------------------
     // One-shot by nature (plan → fetch → print → exit), so it is a task definition to
@@ -361,7 +432,13 @@ export class LldbStack extends cdk.Stack {
       environment: {
         ...storageEnv,
         ...metadataEnv,
-        LLDB_WORKERS: `http://${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`,
+        // Two routing paths, and the coordinator picks by whether `--warehouse` is set.
+        // `LLDB_WORKERS` is the pre-warehouse behaviour (the first warehouse's fleet, verbatim),
+        // so a `run-task` with no extra arguments works exactly as it always did.
+        LLDB_WORKERS: `http://${warehouses[0].name}.${NAMESPACE}:${WORKER_PORT}`,
+        // …and this is the template `--warehouse <name>` renders into. Override `LLDB_WAREHOUSE`
+        // per `run-task` to send a query to a specific warehouse.
+        LLDB_WAREHOUSE_ENDPOINT: WAREHOUSE_ENDPOINT_TEMPLATE,
       },
       secrets: metadataSecrets,
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'coordinator', logGroup }),
@@ -372,7 +449,17 @@ export class LldbStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'RepositoryUri', { value: this.repository.repositoryUri, description: 'Push the CI-built image here' });
     new cdk.CfnOutput(this, 'WarehouseBucket', { value: this.warehouse.bucketName, description: 'S3 Iceberg warehouse' });
     new cdk.CfnOutput(this, 'ClusterName', { value: this.cluster.clusterName });
-    new cdk.CfnOutput(this, 'WorkerDns', { value: `${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`, description: 'Cloud Map DNS for the worker fleet' });
+    new cdk.CfnOutput(this, 'WorkerDns', { value: `${warehouses[0].name}.${NAMESPACE}:${WORKER_PORT}`, description: 'Cloud Map DNS for the default warehouse fleet' });
+    new cdk.CfnOutput(this, 'Warehouses', {
+      value: warehouses.map((w) => `${w.name}=${w.size}/${w.state ?? 'running'}`).join(','),
+      description: 'Deployed warehouses as name=size/state',
+    });
+    // The names `aws ecs update-service --service …` wants, which is how a suspend/resume/resize
+    // recorded in the services database gets applied without a redeploy.
+    new cdk.CfnOutput(this, 'WarehouseServices', {
+      value: cdk.Fn.join(',', warehouses.map((w) => `${w.name}=${this.warehouseServices[w.name].serviceName}`)),
+      description: 'warehouse=ECS service name, for `aws ecs update-service --desired-count`',
+    });
     new cdk.CfnOutput(this, 'CoordinatorTaskArn', { value: this.coordinatorTask.taskDefinitionArn, description: 'Run with `aws ecs run-task` to execute a query' });
     new cdk.CfnOutput(this, 'CoordinatorSecurityGroup', { value: coordinatorSg.securityGroupId, description: 'Use this SG when running the coordinator task' });
     // Everything `aws ecs run-task --network-configuration` needs, matching the egress mode.
@@ -399,4 +486,59 @@ export class LldbStack extends cdk.Stack {
       });
     }
   }
+}
+
+/** A DNS label: lowercase alphanumerics and `-`, not leading or trailing. Mirrors the engine's
+ * `validate_warehouse_name`, and for the same reason — the name becomes a hostname. */
+const WAREHOUSE_NAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/;
+/** One DNS label's worth. */
+const MAX_WAREHOUSE_NAME_LEN = 63;
+
+/**
+ * Refuse a warehouse list that cannot be deployed, at synth time.
+ *
+ * Every one of these is a failure that would otherwise surface late and confusingly: a name that
+ * is not a DNS label produces a Cloud Map service nothing can resolve; two warehouses with one
+ * name produce two services fighting over one record; a `size` from `-c warehouses=…` arrives as
+ * a string through `Number()`, so a typo becomes `NaN` and CloudFormation gets a nonsense
+ * `DesiredCount`. A suspended warehouse still needs a positive size — that is the number resume
+ * scales back to, exactly as in the database.
+ */
+function validateWarehouses(warehouses: WarehouseDefinition[]): WarehouseDefinition[] {
+  if (warehouses.length === 0) {
+    throw new Error('at least one warehouse is required — a stack with no compute cannot run a query');
+  }
+  const seen = new Set<string>();
+  for (const warehouse of warehouses) {
+    if (typeof warehouse.name !== 'string' || !WAREHOUSE_NAME_RE.test(warehouse.name) || warehouse.name.length > MAX_WAREHOUSE_NAME_LEN) {
+      throw new Error(
+        `warehouse name ${JSON.stringify(warehouse.name)} must be a DNS label: 1-${MAX_WAREHOUSE_NAME_LEN} ` +
+          'characters of lowercase [a-z0-9-], not starting or ending with `-` (it becomes <name>.lldb.local)',
+      );
+    }
+    if (seen.has(warehouse.name)) {
+      throw new Error(`duplicate warehouse name '${warehouse.name}' — names are Cloud Map records and must be unique`);
+    }
+    seen.add(warehouse.name);
+    if (!Number.isInteger(warehouse.size) || warehouse.size < 1) {
+      throw new Error(
+        `warehouse '${warehouse.name}' size must be a positive integer, got ${JSON.stringify(warehouse.size)} ` +
+          '(a suspended warehouse keeps its size; suspension is state, not size 0)',
+      );
+    }
+    if (warehouse.state !== undefined && warehouse.state !== 'running' && warehouse.state !== 'suspended') {
+      throw new Error(`warehouse '${warehouse.name}' has unknown state ${JSON.stringify(warehouse.state)} (expected running | suspended)`);
+    }
+  }
+  return warehouses;
+}
+
+/** `wh-analytics` → `WhAnalytics`, for a construct id. Ids are alphanumeric by convention and
+ * appear in every logical id, so a warehouse name's `-` cannot go through verbatim. */
+function pascalCase(name: string): string {
+  return name
+    .split('-')
+    .filter((part) => part.length > 0)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join('');
 }

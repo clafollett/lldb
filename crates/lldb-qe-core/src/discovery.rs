@@ -18,20 +18,68 @@
 //! size — and therefore the observed fan-out of the plan — with **no redeploy**. That is the
 //! "scaling changes parallelism" property the issue asks for, and it falls out of one DNS query.
 //!
+//! # One fleet, or one fleet per warehouse
+//!
+//! Virtual warehouses ([`crate::warehouse`]) make "the fleet" plural: each warehouse is its own
+//! pool of workers, and a query must reach *its* pool and no other. The mechanism is already here
+//! — one DNS name that fans out to every task behind it — so a warehouse needs nothing more than
+//! its **own** name. [`render_warehouse_endpoint`] turns a template like
+//! `http://{warehouse}.lldb.local:50051` plus a warehouse name into that endpoint, which
+//! [`discover_workers`] then expands exactly as before.
+//!
+//! A template rather than a hard-coded pattern because the same substitution has to work in two
+//! places that spell DNS differently: Cloud Map registers `<warehouse>.lldb.local`, while a
+//! compose network alias is a bare `<warehouse>`. One flag covers both, and the placeholder is
+//! validated so a template that forgot it fails at startup instead of quietly routing every
+//! warehouse to one pool.
+//!
 //! # Testability
 //!
 //! Real DNS is not something a unit test should touch. So the enumeration logic is written against
-//! an injected resolver ([`discover_with`]): a generic closure `Fn(host:port) -> Future<Vec<SocketAddr>>`.
-//! [`discover_workers`] supplies the production resolver (`tokio::net::lookup_host`, which enumerates
-//! every A/AAAA record); tests supply a fake map from host to a fixed set of addresses and exercise
-//! the parsing, expansion, dedup, and error paths with no network at all. The generic-closure shape
-//! needs no `async-trait` and no new dependency — `std::future::Future` is enough.
+//! an injected resolver ([`discover_workers_with`]): a generic closure
+//! `Fn(host:port) -> Future<Vec<SocketAddr>>`. [`discover_workers`] supplies the production
+//! resolver (`tokio::net::lookup_host`, which enumerates every A/AAAA record); tests supply a fake
+//! map from host to a fixed set of addresses and exercise the parsing, expansion, dedup, and error
+//! paths with no network at all. The generic-closure shape needs no `async-trait` and no new
+//! dependency — `std::future::Future` is enough.
 
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, bail};
+
+/// The token a warehouse endpoint template must contain, replaced with the warehouse's name.
+pub const WAREHOUSE_PLACEHOLDER: &str = "{warehouse}";
+
+/// Default warehouse endpoint template: the Cloud Map name the CDK stack registers each
+/// warehouse's ECS service under, in the `lldb.local` private namespace.
+///
+/// Compose overrides it with `http://{warehouse}:50051`, because a Docker network alias is a bare
+/// label with no namespace suffix.
+pub const DEFAULT_WAREHOUSE_ENDPOINT: &str = "http://{warehouse}.lldb.local:50051";
+
+/// Render a warehouse's Flight endpoint from a template.
+///
+/// The result is a *fan-out point*, not a worker: pass it to [`discover_workers`] to get one URL
+/// per task in that warehouse. Both failure modes are caught here rather than at query time —
+/// a template missing the placeholder (which would route every warehouse to the same pool, the
+/// worst kind of bug because it produces correct-looking answers on the wrong compute), and a
+/// substitution that does not yield a parseable `scheme://host:port`.
+pub fn render_warehouse_endpoint(template: &str, warehouse: &str) -> Result<String> {
+    if !template.contains(WAREHOUSE_PLACEHOLDER) {
+        bail!(
+            "warehouse endpoint template `{template}` does not contain `{WAREHOUSE_PLACEHOLDER}`, \
+             so every warehouse would resolve to the same fleet"
+        );
+    }
+    let rendered = template.replace(WAREHOUSE_PLACEHOLDER, warehouse);
+    // Parse the result now: a bad template is an operator's typo, and it should fail at startup
+    // with the rendered string in hand rather than deep inside a resolver.
+    Endpoint::parse(&rendered)
+        .with_context(|| format!("rendering warehouse endpoint from template `{template}`"))?;
+    Ok(rendered)
+}
 
 /// Resolve each `--workers` endpoint to the concrete set of worker Flight URLs behind it.
 ///
@@ -51,7 +99,7 @@ use anyhow::{Context, Result, bail};
 /// scaling the fleet changes the number of URLs returned here, and thus the plan's fan-out, without
 /// a redeploy.
 pub async fn discover_workers(endpoints: &[String]) -> Result<Vec<String>> {
-    discover_with(endpoints, |authority| async move {
+    discover_workers_with(endpoints, |authority| async move {
         // `lookup_host` performs a real DNS (or `/etc/hosts`, or literal-IP) resolution and yields
         // *every* A/AAAA record — which for a Cloud Map service name is one address per healthy task.
         let addrs = tokio::net::lookup_host(&authority)
@@ -63,12 +111,17 @@ pub async fn discover_workers(endpoints: &[String]) -> Result<Vec<String>> {
     .await
 }
 
-/// The enumeration logic, factored out from real DNS so it is unit-testable.
+/// The enumeration logic, factored out from real DNS so it is testable.
 ///
 /// `resolve` maps an `"host:port"` authority to the addresses behind it. Production passes a closure
 /// backed by `tokio::net::lookup_host`; tests pass a fake that returns fixed addresses, so the parse
 /// / expand / dedup / error behavior is exercised without touching the network.
-async fn discover_with<F, Fut>(endpoints: &[String], resolve: F) -> Result<Vec<String>>
+///
+/// Public because the fake resolver is the only honest way to prove the *warehouse* routing story
+/// without a Cloud Map namespace: an integration test stands up N in-process workers, has the fake
+/// answer `<warehouse>.lldb.local` with exactly those N addresses — which is precisely what Cloud
+/// Map does for an ECS service at `desiredCount: N` — and watches the plan's fan-out follow.
+pub async fn discover_workers_with<F, Fut>(endpoints: &[String], resolve: F) -> Result<Vec<String>>
 where
     F: Fn(String) -> Fut,
     Fut: Future<Output = Result<Vec<SocketAddr>>>,
@@ -209,7 +262,7 @@ mod tests {
             "worker.lldb.local:50051",
             vec!["10.0.0.1:50051", "10.0.0.2:50051", "10.0.0.3:50051"],
         )]);
-        let fleet = discover_with(&eps(&["http://worker.lldb.local:50051"]), resolve)
+        let fleet = discover_workers_with(&eps(&["http://worker.lldb.local:50051"]), resolve)
             .await
             .unwrap();
         assert_eq!(
@@ -225,7 +278,7 @@ mod tests {
     #[tokio::test]
     async fn literal_ip_passes_through_as_one_url() {
         let resolve = resolver(vec![("10.0.0.4:50051", vec!["10.0.0.4:50051"])]);
-        let fleet = discover_with(&eps(&["http://10.0.0.4:50051"]), resolve)
+        let fleet = discover_workers_with(&eps(&["http://10.0.0.4:50051"]), resolve)
             .await
             .unwrap();
         assert_eq!(fleet, vec!["http://10.0.0.4:50051"]);
@@ -238,7 +291,7 @@ mod tests {
             ("a.local:50051", vec!["10.0.0.1:50051", "10.0.0.2:50051"]),
             ("b.local:50051", vec!["10.0.0.2:50051", "10.0.0.3:50051"]),
         ]);
-        let fleet = discover_with(
+        let fleet = discover_workers_with(
             &eps(&["http://a.local:50051", "http://b.local:50051"]),
             resolve,
         )
@@ -258,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn scheme_and_port_are_preserved() {
         let resolve = resolver(vec![("secure.local:8443", vec!["10.1.0.1:8443"])]);
-        let fleet = discover_with(&eps(&["https://secure.local:8443"]), resolve)
+        let fleet = discover_workers_with(&eps(&["https://secure.local:8443"]), resolve)
             .await
             .unwrap();
         assert_eq!(fleet, vec!["https://10.1.0.1:8443"]);
@@ -267,14 +320,14 @@ mod tests {
     #[tokio::test]
     async fn empty_input_yields_empty() {
         let resolve = resolver(vec![]);
-        let fleet = discover_with(&[], resolve).await.unwrap();
+        let fleet = discover_workers_with(&[], resolve).await.unwrap();
         assert!(fleet.is_empty());
     }
 
     #[tokio::test]
     async fn missing_scheme_errors_clearly() {
         let resolve = resolver(vec![]);
-        let err = discover_with(&eps(&["worker.local:50051"]), resolve)
+        let err = discover_workers_with(&eps(&["worker.local:50051"]), resolve)
             .await
             .expect_err("no scheme is invalid");
         assert!(err.to_string().contains("scheme://"), "got: {err}");
@@ -283,7 +336,7 @@ mod tests {
     #[tokio::test]
     async fn missing_port_errors_clearly() {
         let resolve = resolver(vec![]);
-        let err = discover_with(&eps(&["http://worker.local"]), resolve)
+        let err = discover_workers_with(&eps(&["http://worker.local"]), resolve)
             .await
             .expect_err("no port is invalid");
         assert!(err.to_string().contains(":port"), "got: {err}");
@@ -293,7 +346,7 @@ mod tests {
     async fn resolver_error_is_surfaced_with_the_host() {
         // A resolver failure must name the endpoint/host so an operator can tell which one is bad.
         let resolve = resolver(vec![]); // every lookup misses → error
-        let err = discover_with(&eps(&["http://broken.lldb.local:50051"]), resolve)
+        let err = discover_workers_with(&eps(&["http://broken.lldb.local:50051"]), resolve)
             .await
             .expect_err("resolver failure must surface");
         let chain = format!("{err:#}");
@@ -303,11 +356,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_warehouse_renders_into_its_own_endpoint() {
+        assert_eq!(
+            render_warehouse_endpoint(DEFAULT_WAREHOUSE_ENDPOINT, "analytics").unwrap(),
+            "http://analytics.lldb.local:50051"
+        );
+        // The compose spelling: a bare network alias, no namespace suffix.
+        assert_eq!(
+            render_warehouse_endpoint("http://{warehouse}:50051", "etl").unwrap(),
+            "http://etl:50051"
+        );
+        // Distinct warehouses must never collapse onto one endpoint.
+        assert_ne!(
+            render_warehouse_endpoint(DEFAULT_WAREHOUSE_ENDPOINT, "small").unwrap(),
+            render_warehouse_endpoint(DEFAULT_WAREHOUSE_ENDPOINT, "large").unwrap()
+        );
+    }
+
+    #[test]
+    fn a_template_without_the_placeholder_is_refused() {
+        // The dangerous typo: it "works", and every warehouse silently shares one fleet.
+        let err = render_warehouse_endpoint("http://worker.lldb.local:50051", "analytics")
+            .expect_err("a template with no placeholder must not be accepted");
+        assert!(err.to_string().contains(WAREHOUSE_PLACEHOLDER), "{err}");
+    }
+
+    #[test]
+    fn a_template_that_renders_to_garbage_fails_at_render_time() {
+        // No port, no scheme: catch it while the template is still in hand, not inside a resolver.
+        for template in ["http://{warehouse}.lldb.local", "{warehouse}:50051"] {
+            let err = render_warehouse_endpoint(template, "analytics")
+                .expect_err("an unparseable rendering must be rejected");
+            let chain = format!("{err:#}");
+            assert!(chain.contains(template), "must name the template: {chain}");
+        }
+    }
+
     #[tokio::test]
     async fn ipv6_literal_is_bracketed_and_expanded() {
         // A bracketed IPv6 endpoint parses, and its expanded URL is re-bracketed by SocketAddr.
         let resolve = resolver(vec![("[::1]:50051", vec!["[::1]:50051"])]);
-        let fleet = discover_with(&eps(&["http://[::1]:50051"]), resolve)
+        let fleet = discover_workers_with(&eps(&["http://[::1]:50051"]), resolve)
             .await
             .unwrap();
         assert_eq!(fleet, vec!["http://[::1]:50051"]);
