@@ -39,9 +39,32 @@ SQL ──parse──▶ Logical Plan ──optimize──▶ Physical Plan ─�
 
 | Crate | Role |
 | - | - |
-| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec |
-| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight |
+| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, services-DB connection layer |
+| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds `lldb-qe-migrate` |
 | `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
+
+## Services database (control plane)
+
+Query execution is stateless; the *control plane* is not. Accounts, the SQL catalog, virtual
+warehouses and query history are facts the whole fleet has to agree on while it is running, so
+they live in a shared PostgreSQL database rather than in any one process's memory.
+
+Schema changes are migrations checked into
+[`crates/lldb-qe-core/migrations/`](crates/lldb-qe-core/migrations/), embedded into the binaries
+at compile time and applied by an explicit one-shot — `lldb-qe-migrate` — never on startup. A
+rolling fleet must not race to apply the same DDL.
+
+```bash
+# Apply migrations and make sure an account exists (idempotent; safe on every deploy).
+cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
+  --metadata-url postgres://lldb:lldb@localhost:5432/lldb --seed-account default
+```
+
+Connection settings come from `LLDB_METADATA_URL`, or from the discrete
+`LLDB_METADATA_HOST/PORT/DATABASE/USER/PASSWORD/SSLMODE` — the second form exists because ECS
+injects a Secrets Manager password as its own variable and cannot interpolate one into a URL.
+**A services database is optional:** with none configured, single-node and local runs behave
+exactly as before.
 
 ## Catalogs & schemas
 
@@ -55,15 +78,17 @@ and an S3 warehouse in production.
 
 ## Running a cluster (Docker)
 
-Bring the whole system up as containers — MinIO (the S3 warehouse), a worker fleet, and a
-coordinator that ships a plan over Arrow Flight — to see the distributed path end-to-end:
+Bring the whole system up as containers — MinIO (the S3 warehouse), PostgreSQL 18.4 (the
+services database, migrated by a one-shot `db-migrate` step), a worker fleet, and a coordinator
+that ships a plan over Arrow Flight — to see the distributed path end-to-end:
 
 ```bash
 docker compose up --build     # coordinator prints a result streamed back from a worker
 ```
 
 The default query is a constant, so the cluster proves cross-container transport without
-seeded data; point `--manifest` at S3 data to run real queries. See
+seeded data; point `--manifest` at S3 data to run real queries. Postgres is published on
+`localhost:5432` (`psql -U lldb lldb`) so you can inspect the control plane while it runs. See
 [`docker-compose.yml`](docker-compose.yml).
 
 ## Quickstart

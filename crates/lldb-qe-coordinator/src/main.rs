@@ -27,6 +27,20 @@
 //! plan is shipped to one worker over Flight. That keeps simple queries exercising a real worker,
 //! which is exactly what the cross-container cluster smoke test relies on.
 //!
+//! # Tenancy
+//!
+//! When a services database is configured (`--metadata-url`, or the discrete `--metadata-*`
+//! parts — see [`ServicesArgs`]), the coordinator resolves `--account` to a row in `accounts` at
+//! startup and logs its id. That is the hook every later control-plane feature hangs off: a
+//! warehouse, a query-history row and a grant all need to know *whose* they are, and resolving
+//! it once at startup means the rest of the process can carry an id rather than re-deriving a
+//! name. Enforcement — refusing to touch another tenant's data — lands with accounts/RBAC
+//! (#19); this only establishes the identity.
+//!
+//! With **no** services database configured the coordinator behaves exactly as it always has.
+//! A checkout, a laptop, and a single-node demo have no control plane to talk to, and requiring
+//! one would mean `cargo run` needs Postgres.
+//!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
 use std::path::PathBuf;
@@ -40,8 +54,8 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    FlightReaderExec, StorageArgs, StorageConfig, apply_manifest, build_session, discover_workers,
-    fetch, init_tracing, plan_distributed, register_tpch_parquet,
+    FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig, apply_manifest, build_session,
+    discover_workers, fetch, init_tracing, plan_distributed, register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -75,8 +89,16 @@ struct Cli {
     #[arg(long, default_value = "SELECT n_name FROM nation ORDER BY n_name")]
     sql: String,
 
+    /// Tenant this invocation runs as. Only consulted when a services database is configured;
+    /// it must already exist (`lldb-qe-migrate --seed-account <NAME>` creates it).
+    #[arg(long, env = "LLDB_ACCOUNT", default_value = "default")]
+    account: String,
+
     #[command(flatten)]
     storage: StorageArgs,
+
+    #[command(flatten)]
+    services: ServicesArgs,
 }
 
 #[tokio::main]
@@ -98,6 +120,25 @@ async fn main() -> Result<()> {
              per-process, so workers can't see the coordinator's data. Use `--storage local` \
              (a shared filesystem) or `--storage s3`."
         );
+    }
+
+    // Resolve the tenant, if there is a control plane to resolve it against. A missing account is
+    // an error naming the tool that creates one — a silent fallback would let a typo run a query
+    // under nobody's identity, which is precisely the bug #19's enforcement has to rule out.
+    if let Some(db) = cli.services.connect().await? {
+        let account = db.account_by_name(&cli.account).await?.with_context(|| {
+            format!(
+                "account `{}` does not exist in the services database; create it with \
+                 `lldb-qe-migrate --seed-account {}`",
+                cli.account, cli.account
+            )
+        })?;
+        tracing::info!(
+            account = %account.name,
+            account_id = account.id,
+            "resolved tenant"
+        );
+        db.close().await;
     }
 
     let (ctx, storage) = build_session(config).await?;

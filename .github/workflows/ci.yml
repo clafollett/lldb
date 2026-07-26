@@ -19,6 +19,24 @@ jobs:
     name: fmt • clippy • test
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # The services-database test (tests/services_db.rs) proves claims only a real server can
+    # settle — that the migrations apply, that re-applying them is a no-op, and that deleting an
+    # account cascades to its warehouses. It skips itself when no database is reachable, so
+    # without this container CI would report green on a test that never ran. Same 18.4 as compose.
+    services:
+      postgres:
+        image: postgres:18.4-alpine
+        env:
+          POSTGRES_USER: lldb
+          POSTGRES_PASSWORD: lldb
+          POSTGRES_DB: lldb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U lldb -d lldb"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
     steps:
       - uses: actions/checkout@v4
 
@@ -37,6 +55,10 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Test
+        env:
+          # Point the services-database test at the service container above so it actually runs
+          # instead of printing its skip message.
+          LLDB_TEST_POSTGRES_URL: postgres://lldb:lldb@localhost:5432/lldb?sslmode=disable
         run: cargo test --workspace
 
   # Proves the distributed communication path across real containers (MinIO + worker fleet +

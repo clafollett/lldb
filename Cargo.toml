@@ -52,7 +52,12 @@ futures = "0.3"
 
 # --- Services DB (metadata/catalog/accounts): pinned to sqlx 0.8 because
 # `iceberg-catalog-sql` 0.10 (issue #8) depends on sqlx ^0.8.1 — one sqlx tree-wide.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "chrono"] }
+#
+# `macros` is on because `sqlx::migrate!` lives behind it — that is what embeds the SQL in
+# `crates/lldb-qe-core/migrations/` into the binary at compile time, so an image carries its own
+# schema. It does NOT mean we use the compile-time-checked `query!` family: those need a live
+# database at build time, which would break `cargo build` in CI and in Docker.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "chrono"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # --- Errors, logging, small utils ---

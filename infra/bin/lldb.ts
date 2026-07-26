@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { LldbStack, EgressMode } from '../lib/lldb-stack';
+import { LldbStack, EgressMode, ServicesDbMode } from '../lib/lldb-stack';
 
 const app = new cdk.App();
 
@@ -27,9 +27,18 @@ if (egress && !['none', 'nat-instance', 'nat-gateway'].includes(egress)) {
   throw new Error(`unknown egress mode '${egress}' (expected none | nat-instance | nat-gateway)`);
 }
 
+// `-c servicesDb=none` deploys a query-only fleet with no control plane — no Aurora cluster, no
+// LLDB_METADATA_* on the tasks. Default `aurora` provisions the shared services database that
+// accounts, the SQL catalog, warehouses and query history all live in.
+const servicesDb = app.node.tryGetContext('servicesDb') as ServicesDbMode | undefined;
+if (servicesDb && !['aurora', 'none'].includes(servicesDb)) {
+  throw new Error(`unknown servicesDb mode '${servicesDb}' (expected aurora | none)`);
+}
+
 new LldbStack(app, 'LldbStack', {
   imageTag,
   egress,
+  servicesDb,
   workerCount: workerCountCtx ? Number(workerCountCtx) : undefined,
   env: {
     account: process.env.CDK_DEFAULT_ACCOUNT,

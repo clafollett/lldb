@@ -37,6 +37,10 @@ criterion.workspace = true
 datafusion.workspace = true
 tempfile.workspace = true
 tracing-subscriber.workspace = true
+# The services-database integration test issues raw SQL (foreign keys, information_schema) that
+# has no business on `ServicesDb`'s public API, so it needs sqlx/chrono in its own right.
+sqlx.workspace = true
+chrono.workspace = true
 
 [[bench]]
 name = "tpch"
