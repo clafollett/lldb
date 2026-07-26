@@ -8,7 +8,8 @@
 //! [[catalogs]]
 //! name = "shop"
 //! warehouse = "file:///tmp/shop-wh"          # required when any table is Iceberg
-//! backend = { kind = "memory" }              # or { kind = "sql", uri = "sqlite://…" }
+//! backend = { kind = "memory" }              # per-process; or { kind = "sql" } to share one
+//!                                            # persistent catalog across the whole fleet
 //!
 //! [[catalogs.namespaces]]
 //! name = "sales"
@@ -102,13 +103,27 @@ pub enum TableFormat {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CatalogBackend {
-    /// In-process catalog; metadata lives in RAM (per-process, not shared). Dev default.
+    /// In-process catalog; metadata lives in RAM. **Per-process, not shared** — two workers
+    /// each build their own and can disagree about what exists. Fine for dev and tests; the
+    /// default because it needs nothing running.
     #[default]
     Memory,
-    /// Persistent SQL catalog (SQLite/Postgres/…). Durable and shareable across processes.
-    /// Requires the `sql-catalog` build feature.
-    Sql { uri: String },
-    /// Remote Iceberg REST catalog. Requires the `rest-catalog` build feature.
+    /// Persistent SQL catalog in Postgres — durable, and *shared* by every process pointed at
+    /// it. This is what makes "which tables exist, at which snapshot" one fact instead of N.
+    ///
+    /// `uri` is optional on purpose. A manifest is config-as-data that lives in git, and a
+    /// Postgres URI carries a password; omitting it means "the services database this fleet is
+    /// already configured with", resolved from `LLDB_METADATA_*` exactly the way every binary
+    /// resolves it (see [`crate::services::ServicesArgs::from_env`]). Set it explicitly when a
+    /// manifest genuinely targets a different database than the control plane.
+    Sql {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        uri: Option<String>,
+    },
+    /// Remote Iceberg REST catalog. Not implemented — [`crate::lakehouse::Lakehouse::open`]
+    /// still errors for it. The door is deliberately left open: `Sql` covers the
+    /// shared-catalog requirement, and a REST catalog is a separate deployment decision
+    /// (another service to run) rather than a missing line of code.
     Rest { uri: String },
 }
 
@@ -154,6 +169,19 @@ impl Manifest {
             if !catalog_names.insert(catalog.name.as_str()) {
                 bail!("duplicate catalog name: {}", catalog.name);
             }
+            // An explicitly-set-but-blank URI is a misconfiguration, not "use the default":
+            // `uri = ""` in a manifest almost always means an unexpanded template variable, and
+            // silently connecting to the control-plane database instead would hide that.
+            if let CatalogBackend::Sql { uri: Some(uri) } = &catalog.backend
+                && uri.trim().is_empty()
+            {
+                bail!(
+                    "catalog `{}` declares a sql backend with an empty `uri` — omit the key \
+                     entirely to use the fleet's services database (LLDB_METADATA_*)",
+                    catalog.name
+                );
+            }
+
             let has_iceberg = catalog
                 .namespaces
                 .iter()
@@ -317,6 +345,57 @@ mod tests {
         let again = Manifest::from_toml_str(&text)?;
         assert_eq!(m, again);
         Ok(())
+    }
+
+    #[test]
+    fn sql_backend_uri_is_optional_and_round_trips() -> Result<()> {
+        // Omitted `uri` is the compose/ECS shape: the manifest says "share a SQL catalog", the
+        // environment says *which* database, and the password never enters git.
+        let implicit = r#"
+            [[catalogs]]
+            name = "c"
+            warehouse = "file:///tmp/wh"
+            backend = { kind = "sql" }
+            [[catalogs.namespaces]]
+            name = "n"
+            [[catalogs.namespaces.tables]]
+            name = "t"
+            source = { type = "parquet", path = "a.parquet" }
+        "#;
+        let m = Manifest::from_toml_str(implicit)?;
+        assert_eq!(m.catalogs[0].backend, CatalogBackend::Sql { uri: None });
+        assert_eq!(Manifest::from_toml_str(&toml::to_string(&m)?)?, m);
+
+        let explicit = implicit.replace(
+            r#"backend = { kind = "sql" }"#,
+            r#"backend = { kind = "sql", uri = "postgres://lldb@db/lldb" }"#,
+        );
+        let m = Manifest::from_toml_str(&explicit)?;
+        assert_eq!(
+            m.catalogs[0].backend,
+            CatalogBackend::Sql {
+                uri: Some("postgres://lldb@db/lldb".to_string())
+            }
+        );
+        assert_eq!(Manifest::from_toml_str(&toml::to_string(&m)?)?, m);
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_a_blank_sql_uri() {
+        // `uri = ""` is an unexpanded template variable far more often than it is intent.
+        let toml = r#"
+            [[catalogs]]
+            name = "c"
+            warehouse = "file:///tmp/wh"
+            backend = { kind = "sql", uri = "  " }
+            [[catalogs.namespaces]]
+            name = "n"
+            [[catalogs.namespaces.tables]]
+            name = "t"
+            source = { type = "parquet", path = "a.parquet" }
+        "#;
+        assert!(Manifest::from_toml_str(toml).is_err());
     }
 
     #[test]

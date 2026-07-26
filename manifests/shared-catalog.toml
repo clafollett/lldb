@@ -1,0 +1,56 @@
+# Example: a **shared** Iceberg catalog, so every process in the fleet sees one set of tables.
+#
+# The only difference from a dev manifest is `backend = { kind = "sql" }`. With the default
+# `memory` backend each coordinator and worker builds its own catalog from its own copy of this
+# file, and nothing reconciles them: two workers can disagree about which snapshot of `orders`
+# is current, and the disagreement only surfaces as a wrong row count. A `sql` backend puts that
+# state in one Postgres row instead.
+#
+# No `uri` here on purpose. A manifest is config-as-data that lives in git and a Postgres URI
+# carries a password, so an omitted `uri` means "the services database this process is already
+# configured with" — the same `LLDB_METADATA_*` / `--metadata-*` settings every binary reads
+# (docker-compose sets them for every role). Give it an explicit
+#   backend = { kind = "sql", uri = "postgres://…" }
+# only when a catalog genuinely lives somewhere other than the control plane.
+#
+# The catalog creates and owns its own two tables (`iceberg_tables`,
+# `iceberg_namespace_properties`) the first time it is opened; they are NOT part of
+# `crates/lldb-qe-core/migrations/`, which owns the services schema and nothing else.
+#
+#   cargo run -p lldb-qe-coordinator -- \
+#     --manifest manifests/shared-catalog.toml \
+#     --metadata-url postgres://lldb@localhost/lldb \
+#     --sql 'SELECT count(*) FROM shared.sales.orders'
+#
+# WAREHOUSE: `file://` only. Iceberg 0.10 ships no object-store `StorageFactory`, so an
+# `s3://` warehouse under a sql catalog is rejected at startup rather than silently written to
+# local disk (see the `lakehouse` module docs). Point this at storage every process can reach —
+# a shared volume or NFS mount — until an object-store factory exists.
+
+[[catalogs]]
+name = "shared"
+warehouse = "file:///var/lib/lldb/warehouse"
+backend = { kind = "sql" }
+
+[[catalogs.namespaces]]
+name = "sales"
+
+# An empty table with a declared schema: the catalog entry is created and shared immediately,
+# and rows arrive later via INSERT from whichever process has them.
+[[catalogs.namespaces.tables]]
+name = "orders"
+source = { type = "empty" }
+schema = [
+    { name = "o_orderkey", data_type = "int64", nullable = false },
+    { name = "o_custkey", data_type = "int64" },
+    { name = "o_orderstatus", data_type = "string" },
+    { name = "o_totalprice", data_type = "decimal(15,2)" },
+    { name = "o_orderdate", data_type = "date" },
+]
+
+# A table seeded from parquet. The process that first applies this manifest creates and loads
+# it; every process afterwards finds it already there and leaves it alone — applying a manifest
+# to a persistent catalog is idempotent, or a restart would append the data twice.
+[[catalogs.namespaces.tables]]
+name = "nation"
+source = { type = "parquet", path = "sf1/nation.parquet" }

@@ -2702,6 +2702,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "iceberg-catalog-sql"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4764334c991abc844f163740826e642aa4115005016b4361f078fa66e38bf1ec"
+dependencies = [
+ "async-trait",
+ "iceberg",
+ "sqlx",
+ "strum",
+]
+
+[[package]]
 name = "iceberg-datafusion"
 version = "0.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3094,6 +3106,7 @@ dependencies = [
  "datafusion-proto",
  "futures",
  "iceberg",
+ "iceberg-catalog-sql",
  "iceberg-datafusion",
  "object_store",
  "serde",
