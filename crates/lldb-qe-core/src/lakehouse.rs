@@ -313,12 +313,21 @@ fn table_creation(name: &str, arrow_schema: &ArrowSchema) -> Result<TableCreatio
 /// `/tmp/wh` → `None`. Split on `:` rather than `://` because SQLite URIs have no authority.
 fn uri_scheme(uri: &str) -> Option<String> {
     let (scheme, _) = uri.split_once(':')?;
-    // A Windows drive letter or a stray colon in a path is not a scheme.
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '+')
-    {
+    // RFC 3986: a scheme starts with a letter, then letters, digits, `+`, `-` or `.`. Two extra
+    // restrictions on top of that, both deliberate:
+    //
+    // - **At least two characters.** A single letter before a colon is a Windows drive
+    //   (`C:\warehouse`), not a scheme. RFC 3986 would permit a one-letter scheme, but none is in
+    //   use and every scheme this function must recognise is far longer, so reading `C:` as a path
+    //   is correct every time it matters. Getting this wrong is not cosmetic: `C:\warehouse` would
+    //   be read as scheme `c` and rejected with "iceberg 0.10 provides no StorageFactory for
+    //   `c://`" — a baffling message for what is simply a local path.
+    // - **A leading digit disqualifies it**, so a path fragment like `2024:snapshot` stays a path.
+    let mut chars = scheme.chars();
+    if scheme.len() < 2 || !chars.next().is_some_and(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')) {
         return None;
     }
     Some(scheme.to_ascii_lowercase())
@@ -439,6 +448,17 @@ mod tests {
         assert_eq!(uri_scheme("no-colon-here"), None);
         // A path that merely contains a colon is not a scheme.
         assert_eq!(uri_scheme("/tmp/odd:name"), None);
+        // A Windows drive letter is a path, not a one-letter scheme. Left unhandled this reads as
+        // scheme `c` and the warehouse is rejected for having no `c://` StorageFactory.
+        assert_eq!(uri_scheme(r"C:\warehouse"), None);
+        assert_eq!(uri_scheme("c:/warehouse"), None);
+        // A scheme starts with a letter, so a leading digit keeps it a path.
+        assert_eq!(uri_scheme("2024:snapshot"), None);
+        // …but the RFC-legal punctuation still parses.
+        assert_eq!(
+            uri_scheme("postgres+ssl://h/db").as_deref(),
+            Some("postgres+ssl")
+        );
     }
 
     #[test]
