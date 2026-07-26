@@ -54,6 +54,14 @@
 # something else actuates it (compose here, `aws ecs update-service` or a deploy on AWS). The
 # engine carries no orchestrator SDK — see crates/lldb-qe-core/src/warehouse.rs for why.
 #
+# ---- One query, or many ---------------------------------------------------------------------
+#
+# Two coordinator shapes ship in this image and both are here. `coordinator` is the one-shot: it
+# plans a query, runs it, prints, exits — that is what the cross-container smoke test drives.
+# `query-server` is the long-running scheduler (issue #18): it holds the catalog open, accepts
+# concurrent submissions on 50050, admits a bounded number per warehouse, queues the rest, and
+# records every query's state and timings in the `queries` table.
+#
 # Image/version knobs (both optional):
 #   LLDB_IMAGE  — tag every service runs (default lldb:latest). CI prebuilds a cached, versioned
 #                 image and sets this so `up`/`run` reuse it instead of rebuilding.
@@ -277,6 +285,53 @@ services:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---- The query server: a long-running coordinator ------------------------------------------
+  #
+  # The other shape of a coordinator. `coordinator` below runs one query and exits; this one stays
+  # up, accepts queries over Arrow Flight on 50050, bounds how many run at once per warehouse,
+  # queues the rest, and writes every one to `queries` in Postgres.
+  #
+  #   # submit through it with any Flight client; the ticket is
+  #   #   <u32 account_len><account><u32 warehouse_len><warehouse><sql>
+  #   docker compose logs -f query-server
+  #   psql -h localhost -U lldb lldb -c \
+  #     'SELECT id, state, warehouse_id, started_at - submitted_at AS queued, \
+  #             finished_at - started_at AS ran FROM queries ORDER BY id DESC LIMIT 10'
+  #
+  # IMPORTANT: admission control is per *process*. Scaling this service to two replicas doubles
+  # the number of queries a warehouse will run at once, because neither replica can see the other.
+  # See crates/lldb-qe-core/src/scheduler.rs.
+  query-server:
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
+    command:
+      - "lldb-qe-server"
+      - "--bind"
+      - "0.0.0.0:50050"
+      - "--workers"
+      - "http://worker-1:50051,http://worker-2:50051"
+      - "--manifest"
+      - "/manifests/empty.toml"
+    ports:
+      - "50050:50050"
+    environment:
+      <<: [*s3-env, *metadata-env, *warehouse-env]
+    volumes:
+      - ./manifests:/manifests:ro
+      - warehouse:/var/lib/lldb/warehouse
+    depends_on:
+      worker-1:
+        condition: service_healthy
+      worker-2:
+        condition: service_healthy
+      warehouse-setup:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50050"]
       interval: 3s
       timeout: 3s
       retries: 20

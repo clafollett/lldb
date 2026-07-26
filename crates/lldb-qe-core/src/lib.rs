@@ -20,6 +20,10 @@
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
 //! | [`warehouse`]    | Virtual warehouses: named, resizable, suspend/resume compute pools    | 5 |
+//! | [`engine`]       | Running one query: plan → distribute → collect, shared by both front ends | 5 |
+//! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
+//! | [`query_log`]    | Query history: what ran, when, and how it ended                       | 5 |
+//! | [`server`]       | The long-running coordinator: concurrent queries over one Flight port  | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
@@ -40,12 +44,16 @@ pub mod catalog;
 pub mod config;
 pub mod discovery;
 pub mod distributed;
+pub mod engine;
 pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
+pub mod query_log;
 pub mod remote;
 pub mod retry;
 pub mod scan_split;
+pub mod scheduler;
+pub mod server;
 pub mod services;
 pub mod session;
 pub mod stage_cache;
@@ -60,15 +68,22 @@ pub use discovery::{
     DEFAULT_WAREHOUSE_ENDPOINT, WAREHOUSE_PLACEHOLDER, discover_workers, discover_workers_with,
     render_warehouse_endpoint,
 };
+pub use engine::{
+    CatalogSource, build_query_session, contains_flight_reader, execute_query,
+    reject_inmemory_storage, resolve_fleet,
+};
 pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
 };
+pub use query_log::{QueryRecord, QueryState};
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
+pub use scheduler::{Admission, AdmissionError, AdmissionLimits, QuerySlot, Scheduler};
+pub use server::{Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query};
 pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
 pub use session::{build_session, register_tpch_parquet};
 pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
