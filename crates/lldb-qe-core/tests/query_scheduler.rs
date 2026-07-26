@@ -661,8 +661,20 @@ async fn abandonment_body(harness: &Harness) -> Result<()> {
     let request = QueryRequest::new(workload(0)).on_warehouse(harness.warehouse.clone());
     let query_id = {
         let mut running = Box::pin(harness.coordinator.run_query(request));
-        // Poll until the row exists and the query is parked in the queue. It has to get through
-        // target resolution and the `queued` insert first, both of which are database round trips.
+        // Drive it until it is **parked in the line**, and wait for that specific signal rather
+        // than for the history row to appear.
+        //
+        // The distinction is the whole test. The row is inserted by an `await` inside
+        // `record_submission`, and that insert commits before the future is resumed with its
+        // result — so there is a window where the row is visible to this connection while
+        // `run_query` has not yet reached the line that constructs its guard. Dropping in that
+        // window destroys a future that has nothing to clean up, and the test would be asserting
+        // that a guard which never existed did not run. (It is not hypothetical: waiting on the
+        // row alone failed roughly one run in six, here and in CI.)
+        //
+        // `queued == 1` on the gate is the precise signal, because reaching it means the future
+        // got past `record_submission` *and* past guard construction, and is now blocked on a
+        // permit that this test is holding — so it will stay there until dropped.
         let mut found = None;
         let deadline = std::time::Instant::now() + PATIENCE;
         while std::time::Instant::now() < deadline {
@@ -670,8 +682,11 @@ async fn abandonment_body(harness: &Harness) -> Result<()> {
                 futures::poll!(&mut running).is_pending(),
                 "no permit is free, so this cannot complete"
             );
-            let active = harness.db.list_active_queries(harness.account_id).await?;
-            if let Some(record) = active.first() {
+            if gate.snapshot().queued == 1 {
+                let active = harness.db.list_active_queries(harness.account_id).await?;
+                let record = active
+                    .first()
+                    .context("the query is queued on the gate, so its row must exist")?;
                 assert_eq!(record.state, QueryState::Queued);
                 found = Some(record.id);
                 break;

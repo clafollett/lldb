@@ -654,8 +654,20 @@ pub fn abandoned_unclosed() -> usize {
 /// `Handle::try_current` rather than a bare `tokio::spawn` because dropping after the runtime has
 /// gone (shutdown, a test) would otherwise panic in a destructor.
 ///
-/// Rows abandoned by a *coordinator that dies outright* are still not covered — nothing in-process
-/// can be. That is what the `coordinator` column is for, and a reaper remains future work.
+/// Two gaps remain, and both are a reaper's job rather than oversights:
+///
+/// - **A coordinator that dies outright.** Nothing in-process can close out a row once the process
+///   is gone.
+/// - **The insert-to-guard window.** The row is created by an `await`, and that insert commits
+///   before the future is resumed with the new id — so between "the row exists" and "this guard
+///   exists" there is an instant in which a cancellation leaves the row active with nothing
+///   watching it. It cannot be closed from here, because constructing a guard needs an id that
+///   only the completed insert can supply. The window is one scheduler wake-up wide and a client
+///   has to hang up inside it, so it is small — but it is real, and it was not theoretical: the
+///   test for this guard originally dropped its query in exactly that window and failed about one
+///   run in six until it was taught to wait for the query to reach the admission queue.
+///
+/// That is what the `coordinator` column is for.
 struct ActiveQuery {
     db: ServicesDb,
     query_id: i64,
