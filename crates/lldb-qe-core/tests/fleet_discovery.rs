@@ -1,5 +1,5 @@
 //! Fleet discovery drives real distribution: a query fans across *all* discovered workers, and a
-//! worker that vanishes mid-query fails with an error that names it.
+//! fleet with no healthy worker left fails with an error that names every node it tried.
 //!
 //! This is issue #6's "done when", proven end-to-end without external data or DNS:
 //!
@@ -9,9 +9,12 @@
 //!    rewrites the `GROUP BY` to fan across all N, and we assert both that the distributed answer
 //!    equals the single-node answer *and* that the rewritten plan references all N distinct worker
 //!    URLs — the proof that fan-out follows the discovered fleet size (discover N → fan across N).
-//! 2. **A vanished worker is named.** Build the same distributed plan but include a worker URL that
-//!    nothing is listening on. Running it must fail with an error string containing that worker's
-//!    address, so an operator knows which node died (retry/reassignment is a follow-up, not here).
+//! 2. **Vanished workers are named — after the fleet is exhausted.** Issue #15 changed what a dead
+//!    worker means: a stage whose primary is gone is now reassigned to a healthy fallback (see
+//!    `stage_reassignment.rs`), so a query fails only once *every* candidate has been tried. The
+//!    assertion below is the strengthened form of the original: an entirely dead fleet must still
+//!    fail with an error naming the nodes, so an operator learns which ones died rather than getting
+//!    an opaque status.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -193,15 +196,24 @@ async fn fewer_workers_fan_out_less() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// A query fails only after every healthy target is exhausted — and then it names them.
+///
+/// This assertion used to mean "one vanished worker fails the query immediately". Since issue #15 it
+/// means something stronger: a lost worker is reassigned to a fallback (proven in
+/// `stage_reassignment.rs`), so failing the query now requires losing the *whole* fleet — and the
+/// error must still say which nodes were tried, or an operator is left with nothing to act on.
 #[tokio::test]
-async fn a_vanished_worker_is_named_in_the_error() -> anyhow::Result<()> {
+async fn a_query_fails_only_after_exhausting_the_fleet_and_names_every_worker_tried()
+-> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = seed_parquet(tmp.path(), 2000, 6)?;
 
-    // Two live workers plus one that is not listening. The scan is split across all three, so the
-    // dead one's slice is pulled during execution and must fail — naming the dead node.
-    let dead = dead_worker().await?;
-    let fleet = vec![start_worker().await?, dead.clone(), start_worker().await?];
+    // Every worker is a port nothing listens on: each stage burns its primary and both fallbacks.
+    let fleet = vec![
+        dead_worker().await?,
+        dead_worker().await?,
+        dead_worker().await?,
+    ];
 
     let ctx = distributing_ctx();
     ctx.register_parquet(
@@ -220,16 +232,17 @@ async fn a_vanished_worker_is_named_in_the_error() -> anyhow::Result<()> {
 
     let err = collect(dist, ctx.task_ctx())
         .await
-        .expect_err("a vanished worker must fail the query, not hang or silently drop rows");
+        .expect_err("a fleet with no reachable worker must fail the query, not hang or drop rows");
 
-    // The dead worker's `host:port` must appear in the error chain so an operator knows which node
-    // died. `fetch_stream` adds `connecting to worker {url}` context, surfaced through the plan's
-    // error chain rather than flattened to an opaque tonic status.
-    let addr = dead.strip_prefix("http://").unwrap();
+    // Every candidate's `host:port` must appear, so the operator sees the whole set that died
+    // rather than only whichever one happened to be pulled first.
     let chain = format!("{err}");
-    assert!(
-        chain.contains(addr),
-        "error must name the dead worker `{addr}`, got: {chain}"
-    );
+    for worker in &fleet {
+        let addr = worker.strip_prefix("http://").unwrap();
+        assert!(
+            chain.contains(addr),
+            "error must name every worker tried, missing `{addr}`, got: {chain}"
+        );
+    }
     Ok(())
 }

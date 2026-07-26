@@ -27,6 +27,10 @@
 //! plan is shipped to one worker over Flight. That keeps simple queries exercising a real worker,
 //! which is exactly what the cross-container cluster smoke test relies on.
 //!
+//! Both paths tolerate losing a worker: the distributed one reassigns each stage through the
+//! fallbacks its [`FlightReaderExec`] leaves carry, and the offload path walks the fleet with
+//! `fetch_with_failover`. A query fails only once every healthy target has been tried.
+//!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
 use std::path::PathBuf;
@@ -41,7 +45,7 @@ use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
     FlightReaderExec, StorageArgs, StorageConfig, apply_manifest, build_session, discover_workers,
-    fetch, init_tracing, plan_distributed, register_tpch_parquet,
+    fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -146,10 +150,18 @@ async fn main() -> Result<()> {
         // Boundary-less: nothing to fan out. Collapse to a single output partition and ship the
         // whole plan to one worker — this still exercises a real worker over Flight (what the
         // cross-container cluster smoke test proves) instead of running everything locally.
+        //
+        // "One worker" is a placement, not a commitment: the plan is self-contained and the worker
+        // materializes it once by content hash, so any member of the fleet produces the same answer.
+        // `fetch_with_failover` therefore walks the fleet in order — a dead `fleet[0]` no longer
+        // fails a query that N-1 healthy workers could have served.
         let plan = Arc::new(CoalescePartitionsExec::new(plan));
-        let worker = &fleet[0];
-        tracing::info!(worker = %worker, "no distribution boundary; offloading the whole plan to one worker");
-        fetch(worker, 0, plan)
+        tracing::info!(
+            worker = %fleet[0],
+            fleet_size = fleet.len(),
+            "no distribution boundary; offloading the whole plan to one worker (failing over across the fleet if it is lost)"
+        );
+        fetch_with_failover(&fleet, 0, plan)
             .await
             .context("running the query on a single worker")?
     };

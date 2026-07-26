@@ -42,6 +42,7 @@ pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
 pub mod remote;
+pub mod retry;
 pub mod scan_split;
 pub mod session;
 pub mod stage_cache;
@@ -52,13 +53,14 @@ pub mod tpch;
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
 pub use discovery::discover_workers;
-pub use flight::{fetch, serve_worker, serve_worker_with_cache};
+pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
 };
 pub use remote::{FlightReaderExec, LldbCodec};
+pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use session::{build_session, register_tpch_parquet};
 pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
