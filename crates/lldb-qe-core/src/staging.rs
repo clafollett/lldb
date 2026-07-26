@@ -43,6 +43,14 @@
 //!   **once**: the worker materializes it into a [`crate::stage_cache::StageCache`] on the first
 //!   pull and serves the rest from that buffer (the pull-shuffle hazard documented on
 //!   [`FlightReaderExec`], now closed). Shuffle output is buffered in worker memory, not spilled.
+//!
+//! # Placement and failover are separate questions
+//!
+//! Every leaf this planner builds names one **primary** worker — the assignment rules below are
+//! unchanged — and carries the rest of the fleet as ordered **failover targets** (see
+//! [`failover_targets`]). Placement decides where work goes; failover decides where it goes *again*
+//! if that node is lost. Keeping them separate is what lets fault tolerance land without touching
+//! fan-out behavior.
 
 use std::sync::Arc;
 
@@ -136,11 +144,15 @@ fn distribute_aggregate(
             // exposes.
             let leaves: Vec<Arc<dyn ExecutionPlan>> = slices
                 .into_iter()
-                .zip(workers)
-                .map(|(slice, worker)| {
+                .enumerate()
+                .map(|(i, slice)| {
                     let coalesced = Arc::new(CoalescePartitionsExec::new(slice));
-                    Arc::new(FlightReaderExec::new(worker.clone(), 0, coalesced))
-                        as Arc<dyn ExecutionPlan>
+                    Arc::new(FlightReaderExec::with_fallbacks(
+                        workers[i % workers.len()].clone(),
+                        failover_targets(workers, i),
+                        0,
+                        coalesced,
+                    )) as Arc<dyn ExecutionPlan>
                 })
                 .collect();
 
@@ -214,25 +226,30 @@ fn distribute_hash_join(
                 // pulls its bucket `i` from the map producers (here co-located on the same worker,
                 // reached via a fresh Flight hop — a real fleet would place them apart).
                 let worker = &workers[i % workers.len()];
+                let fallbacks = failover_targets(workers, i);
 
-                let left_leaf: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(
+                let left_leaf: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::with_fallbacks(
                     worker.clone(),
+                    fallbacks.clone(),
                     i as u32,
                     Arc::clone(&left_map),
                 ));
-                let right_leaf: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(
-                    worker.clone(),
-                    i as u32,
-                    Arc::clone(&right_map),
-                ));
+                let right_leaf: Arc<dyn ExecutionPlan> =
+                    Arc::new(FlightReaderExec::with_fallbacks(
+                        worker.clone(),
+                        fallbacks.clone(),
+                        i as u32,
+                        Arc::clone(&right_map),
+                    ));
 
                 // Rebuild the join over the two single-partition remote reads. It now joins just
                 // bucket `i` of each side and yields a single output partition.
                 let reduce_join =
                     Arc::clone(&node).with_new_children(vec![left_leaf, right_leaf])?;
                 let coalesced = Arc::new(CoalescePartitionsExec::new(reduce_join));
-                reduce_leaves.push(Arc::new(FlightReaderExec::new(
+                reduce_leaves.push(Arc::new(FlightReaderExec::with_fallbacks(
                     worker.clone(),
+                    fallbacks,
                     0,
                     coalesced,
                 )));
@@ -243,6 +260,32 @@ fn distribute_hash_join(
         })
         .map_err(|e| anyhow!("rewriting hash-join boundary: {e}"))?;
     Ok(rewritten.data)
+}
+
+// ---------------------------------------------------------------------------
+// Failover placement
+// ---------------------------------------------------------------------------
+
+/// The rest of the fleet, as ordered failover targets for a stage whose primary is
+/// `workers[primary % workers.len()]`.
+///
+/// Placement is unchanged — the primary is still whatever the assignment rule above chose, because
+/// changing it would change fan-out, which is a different question from fault tolerance. This only
+/// answers "if that worker is gone, who else?", and every worker is a valid answer: the stage is
+/// content-addressed and re-materializes identically wherever it lands
+/// ([`crate::stage_cache::StageCache`]).
+///
+/// The list is **rotated to start just after the primary** rather than always at worker 0. Losing a
+/// node fails several stages at once, and if every one of them named worker 0 as its first backup,
+/// recovery would stampede the whole query onto a single machine — trading a failure for an
+/// overload. Rotating spreads the reassignments the way the primary assignment is already spread.
+///
+/// A one-worker fleet yields an empty list: no reassignment is possible, and today's behavior is
+/// preserved exactly.
+fn failover_targets(workers: &[String], primary: usize) -> Vec<String> {
+    (1..workers.len())
+        .map(|offset| workers[(primary + offset) % workers.len()].clone())
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -457,6 +500,54 @@ mod tests {
                 count_readers(reader.inner()),
                 2,
                 "each reduce stage pulls a left and a right map partition"
+            );
+        }
+    }
+
+    #[test]
+    fn failover_targets_are_the_rest_of_the_fleet_rotated_after_the_primary() {
+        let fleet: Vec<String> = ["w0", "w1", "w2", "w3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Each stage prefers a *different* first backup, so losing a node does not stampede every
+        // orphaned stage onto the same machine.
+        assert_eq!(failover_targets(&fleet, 0), vec!["w1", "w2", "w3"]);
+        assert_eq!(failover_targets(&fleet, 1), vec!["w2", "w3", "w0"]);
+        assert_eq!(failover_targets(&fleet, 3), vec!["w0", "w1", "w2"]);
+        // The primary never appears in its own failover list.
+        for primary in 0..fleet.len() {
+            assert!(!failover_targets(&fleet, primary).contains(&fleet[primary]));
+        }
+    }
+
+    #[test]
+    fn a_single_worker_fleet_has_no_failover_targets() {
+        // One worker means today's behavior exactly: one target, one chance.
+        let fleet = vec!["w0".to_string()];
+        assert!(failover_targets(&fleet, 0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn map_leaves_carry_the_rest_of_the_fleet_as_fallbacks() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = seed(tmp.path(), "t", 1);
+        let ctx = distributing_ctx();
+        ctx.register_parquet("t", path.to_str().unwrap(), ParquetReadOptions::default())
+            .await
+            .unwrap();
+
+        let plan = physical(&ctx, "SELECT g, count(*) FROM t GROUP BY g").await;
+        let dist = plan_distributed(plan, &workers()).unwrap();
+
+        for reader in top_level_readers(&dist) {
+            // Two workers: each leaf keeps its primary and gains exactly the other one.
+            assert_eq!(reader.fallbacks().len(), WORKERS.len() - 1);
+            assert!(
+                !reader
+                    .fallbacks()
+                    .contains(&reader.worker_url().to_string()),
+                "a leaf must not list its own primary as a fallback"
             );
         }
     }
