@@ -84,9 +84,12 @@ async fn main() -> Result<()> {
     db.migrate()
         .await
         .with_context(|| format!("migrating the services database at {redacted}"))?;
-    let applied = lldb_qe_core::services::MIGRATOR.iter().count();
+    // The count is what this build *carries*, not what this run applied — the migrator reports no
+    // such number, and re-running is usually a no-op. Named accordingly, because "migrations=1"
+    // on a rerun would otherwise read as "one migration was just applied".
+    let embedded = lldb_qe_core::services::MIGRATOR.iter().count();
     tracing::info!(
-        migrations = applied,
+        embedded_migrations = embedded,
         url = %redacted,
         "services-database schema is up to date"
     );
