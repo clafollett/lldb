@@ -30,8 +30,14 @@ jobs:
           POSTGRES_USER: lldb
           POSTGRES_PASSWORD: lldb
           POSTGRES_DB: lldb
+        # This job runs directly on the runner, not inside a `container:`. In that mode the
+        # service's Docker-network hostname (`postgres`) does NOT resolve from a step — the port
+        # has to be published and reached over `localhost`. Do not "simplify" this to
+        # `postgres:5432` and drop the mapping; the test would go back to silently skipping.
+        # The host side is deliberately not 5432: nothing should collide with a runner that
+        # happens to have its own Postgres up.
         ports:
-          - 5432:5432
+          - 55432:5432
         options: >-
           --health-cmd "pg_isready -U lldb -d lldb"
           --health-interval 5s
@@ -58,7 +64,7 @@ jobs:
         env:
           # Point the services-database test at the service container above so it actually runs
           # instead of printing its skip message.
-          LLDB_TEST_POSTGRES_URL: postgres://lldb:lldb@localhost:5432/lldb?sslmode=disable
+          LLDB_TEST_POSTGRES_URL: postgres://lldb:lldb@localhost:55432/lldb?sslmode=disable
         run: cargo test --workspace
 
   # Proves the distributed communication path across real containers (MinIO + worker fleet +

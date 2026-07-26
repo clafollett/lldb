@@ -48,7 +48,7 @@ export type EgressMode = 'none' | 'nat-instance' | 'nat-gateway';
  *   generated password in Secrets Manager and ingress on 5432 restricted to the worker and
  *   coordinator security groups. Serverless v2 rather than a provisioned instance because a
  *   control plane's load is bursty and mostly idle — it scales to a fraction of an ACU between
- *   queries instead of billing for a always-on `db.r6g`.
+ *   queries instead of billing for an always-on `db.r6g`.
  * - `none`: no database at all, and no `LLDB_METADATA_*` on the tasks. The engine treats an
  *   unconfigured services DB as a legitimate state, so this deploys a query-only fleet — useful
  *   for a throwaway benchmark stack that should not carry a cluster's cost or blast radius.
