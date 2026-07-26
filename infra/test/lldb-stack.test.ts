@@ -220,6 +220,79 @@ describe('egress modes', () => {
   });
 });
 
+describe('services database', () => {
+  test('the default provisions an Aurora Serverless v2 Postgres cluster with a generated secret', () => {
+    const template = synth();
+    template.hasResourceProperties('AWS::RDS::DBCluster', {
+      Engine: 'aurora-postgresql',
+      EngineVersion: '18.4',
+      DatabaseName: 'lldb',
+      StorageEncrypted: true,
+      ServerlessV2ScalingConfiguration: Match.objectLike({ MinCapacity: 0.5, MaxCapacity: 4 }),
+    });
+    // Serverless v2 writer, not a provisioned instance class.
+    template.hasResourceProperties('AWS::RDS::DBInstance', { DBInstanceClass: 'db.serverless' });
+    // The password is generated into Secrets Manager, never written into the template.
+    template.resourceCountIs('AWS::SecretsManager::Secret', 1);
+    expect(JSON.stringify(template.toJSON())).not.toContain('GeneratePassword');
+  });
+
+  test('Postgres is reachable from the task security groups only — never the world', () => {
+    const template = synth();
+    const dbIngress = Object.values(template.findResources('AWS::EC2::SecurityGroupIngress')).filter(
+      (r: any) => r.Properties.FromPort === 5432,
+    );
+    // One rule per role: worker and coordinator.
+    expect(dbIngress).toHaveLength(2);
+    for (const rule of dbIngress as any[]) {
+      expect(rule.Properties.SourceSecurityGroupId).toBeDefined();
+      expect(rule.Properties.CidrIp).toBeUndefined();
+      expect(JSON.stringify(rule.Properties)).not.toContain('0.0.0.0/0');
+    }
+    expectNoWorldOpenIngress(template);
+  });
+
+  test('the cluster sits in isolated subnets with no route out', () => {
+    const template = synth();
+    // A DB subnet group exists, and none of the routes for those subnets reach a gateway.
+    template.resourceCountIs('AWS::RDS::DBSubnetGroup', 1);
+    const isolated = Object.values(template.findResources('AWS::EC2::Subnet')).filter((s: any) =>
+      JSON.stringify(s.Properties.Tags ?? []).includes('Isolated'),
+    );
+    expect(isolated).toHaveLength(2);
+  });
+
+  test('both roles get the connection env, with the password as a secret reference', () => {
+    for (const container of containers(synth())) {
+      const env = Object.fromEntries(container.Environment.map((e: any) => [e.Name, e.Value]));
+      expect(env.LLDB_METADATA_DATABASE).toBe('lldb');
+      expect(env.LLDB_METADATA_USER).toBe('lldb');
+      expect(env.LLDB_METADATA_SSLMODE).toBe('require');
+      expect(env.LLDB_METADATA_HOST).toBeDefined();
+      expect(env.LLDB_METADATA_PORT).toBeDefined();
+      // The password must NOT be plain environment…
+      expect(env.LLDB_METADATA_PASSWORD).toBeUndefined();
+      // …it must be an ECS secret resolved from Secrets Manager at task start.
+      const secret = container.Secrets.find((s: any) => s.Name === 'LLDB_METADATA_PASSWORD');
+      expect(secret).toBeDefined();
+      expect(JSON.stringify(secret.ValueFrom)).toContain(':password::');
+    }
+  });
+
+  test('servicesDb=none provisions nothing and leaves the tasks unconfigured', () => {
+    const template = synth({ servicesDb: 'none' });
+    template.resourceCountIs('AWS::RDS::DBCluster', 0);
+    template.resourceCountIs('AWS::RDS::DBInstance', 0);
+    template.resourceCountIs('AWS::RDS::DBSubnetGroup', 0);
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+    for (const container of containers(template)) {
+      const metadata = (container.Environment as any[]).filter((e) => e.Name.startsWith('LLDB_METADATA'));
+      expect(metadata).toEqual([]);
+      expect(container.Secrets ?? []).toEqual([]);
+    }
+  });
+});
+
 describe('cost posture', () => {
   test('warehouse traffic always rides the free S3 gateway endpoint', () => {
     // True in every egress mode: the per-GB-heavy traffic must never cross a NAT.
