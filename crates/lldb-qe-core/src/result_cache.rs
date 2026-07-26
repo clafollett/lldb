@@ -325,13 +325,23 @@ pub struct ResultCacheKey {
     inputs: String,
 }
 
+/// How many expired rows one store may sweep.
+///
+/// A bound, not a target: stores must stay cheap and predictable, and anything left over is
+/// collected by the next store. Unreachable rows are not urgent.
+const PRUNE_BATCH: usize = 256;
+
 impl ResultCacheKey {
     /// Compose the key from its parts. Inputs are sorted and de-duplicated so that two runs which
     /// discover the same tables in a different order agree.
     ///
-    /// Every field is length-prefixed. The statement fingerprint is `Debug` output and so can
-    /// never contain a raw newline, but relying on that to keep fields apart would make the key's
-    /// integrity depend on a formatting detail of someone else's crate.
+    /// Every field is length-prefixed, and that is load-bearing rather than defensive. The
+    /// renderings this key is built from are **not** newline-free: `plan.display_indent_schema()`
+    /// is deliberately multi-line, and a `Display`-rendered statement can carry newlines inside a
+    /// string literal. A separator-based encoding would therefore let one field's content imitate
+    /// a field boundary — two different queries composing to one key, which is the single failure
+    /// this cache must never have. Lengths make that impossible without depending on any
+    /// formatting property of someone else's crate.
     pub fn new(
         account_id: i64,
         build_version: &str,
@@ -729,10 +739,26 @@ impl ResultCache {
     /// entries beyond the cap. Runs after a store, so the table is bounded by writes rather than by
     /// a background job.
     async fn prune(&self, account_id: i64) -> Result<()> {
-        sqlx::query("DELETE FROM result_cache WHERE expires_at <= now()")
-            .execute(self.db.pool())
-            .await
-            .context("sweeping expired result-cache rows")?;
+        // Scoped to this account and bounded, because this runs on **every** successful store.
+        // An unscoped `DELETE ... WHERE expires_at <= now()` makes each store proportional to the
+        // whole table: as the cache warms, one tenant's write pays to sweep every other tenant's
+        // garbage, and busy tenants contend on rows they will never read. Neither is necessary —
+        // expiry is only a storage bound, so sweeping lazily and locally is entirely sufficient.
+        //
+        // The consequence, stated rather than hidden: a tenant that stops writing keeps its
+        // expired rows. They are unreachable (every read requires `expires_at > now()`), and their
+        // number is capped by the same per-account LRU bound below, so the cost is bounded storage
+        // for a dormant tenant — not unbounded growth, and never a wrong answer.
+        sqlx::query(
+            "DELETE FROM result_cache WHERE id IN ( \
+                 SELECT id FROM result_cache \
+                  WHERE account_id = $1 AND expires_at <= now() LIMIT $2)",
+        )
+        .bind(account_id)
+        .bind(PRUNE_BATCH as i64)
+        .execute(self.db.pool())
+        .await
+        .context("sweeping expired result-cache rows")?;
 
         sqlx::query(
             "DELETE FROM result_cache WHERE id IN ( \
