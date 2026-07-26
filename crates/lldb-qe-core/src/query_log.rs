@@ -240,11 +240,17 @@ fn query_from_row(row: QueryRow) -> Result<QueryRecord> {
 /// Cut an error message down to [`MAX_ERROR_LEN`], on a character boundary, marking that it was
 /// cut. Byte-slicing a UTF-8 message is a panic waiting for the first non-ASCII table name.
 pub fn truncate_error(message: &str) -> String {
-    if message.chars().count() <= MAX_ERROR_LEN {
-        return message.to_string();
+    // Scan only far enough to answer "is this too long?" — `chars().count()` walks the whole
+    // string, and the strings that reach here are exactly the pathological ones (a plan dump, a
+    // deserialization error quoting its input). Paying O(n) on the failure path to discover a
+    // string is 200 KB, and then again to truncate it, is avoidable.
+    //
+    // `char_indices` also gives the byte offset directly, so the head is a slice rather than a
+    // second allocation, and it lands on a char boundary by construction.
+    match message.char_indices().nth(MAX_ERROR_LEN) {
+        None => message.to_string(),
+        Some((end, _)) => format!("{}… (truncated)", &message[..end]),
     }
-    let head: String = message.chars().take(MAX_ERROR_LEN).collect();
-    format!("{head}… (truncated)")
 }
 
 impl ServicesDb {
@@ -318,6 +324,12 @@ impl ServicesDb {
         error: Option<&str>,
         result_rows: Option<i64>,
     ) -> Result<QueryRecord> {
+        // `result_rows` is assigned, not COALESCEd: a non-succeeded transition must *clear* the
+        // count rather than preserve whatever was there. `QueryRecord` documents it as populated
+        // only for a succeeded query, and a row reading `failed` while carrying a row count is a
+        // history entry that lies about what happened. No caller can reach that today — success
+        // and failure are mutually exclusive in `run_query` — but the invariant belongs where it
+        // is written, not in the discipline of every future caller.
         let row = sqlx::query_as::<_, QueryRow>(&format!(
             "UPDATE queries SET \
                  state = $2::TEXT, \
@@ -325,7 +337,7 @@ impl ServicesDb {
                  finished_at = CASE WHEN $2::TEXT IN ('succeeded', 'failed') THEN now() \
                                     ELSE finished_at END, \
                  error = $3::TEXT, \
-                 result_rows = COALESCE($4::BIGINT, result_rows) \
+                 result_rows = CASE WHEN $2::TEXT = 'succeeded' THEN $4::BIGINT ELSE NULL END \
              WHERE id = $1 \
              RETURNING {QUERY_COLUMNS}"
         ))
