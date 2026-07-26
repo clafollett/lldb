@@ -16,6 +16,20 @@
 # The default coordinator query is a constant, so the cluster proves cross-container transport
 # without needing seeded data; point --manifest at real S3 data to run real queries.
 #
+# SHARED ICEBERG CATALOG: `manifests/shared-catalog.toml` declares `backend = { kind = "sql" }`,
+# which puts catalog state in the Postgres above instead of in one process's memory — so every
+# role sees the same tables and the same snapshot. It needs no `uri`: the LLDB_METADATA_* below
+# already name the database, and a password has no business in a manifest.
+#
+#   docker compose run --rm coordinator lldb-qe-coordinator \
+#     --workers http://worker-1:50051,http://worker-2:50051 \
+#     --manifest /manifests/shared-catalog.toml --sql 'SELECT count(*) FROM shared.sales.orders'
+#
+# Its warehouse is the `warehouse` volume below, not MinIO, and that is a real constraint rather
+# than a preference: iceberg 0.10 ships no object-store StorageFactory, so a sql catalog with an
+# `s3://` warehouse is refused at startup instead of silently writing table metadata to one
+# container's local disk (see the `lakehouse` module docs). Table *data* still lives in S3; it is
+# the Iceberg metadata that needs a filesystem every role can reach, hence a shared volume.
 # ---- Virtual warehouses, locally -----------------------------------------------------------
 #
 # Two named pools of compute over the *same* MinIO warehouse and the same catalog: `analytics`
@@ -86,8 +100,10 @@ x-warehouse-env: &warehouse-env
   LLDB_WAREHOUSE_ENDPOINT: http://{warehouse}:50051
 
 services:
-  # The shared services database: accounts today, the Iceberg SQL catalog and query history next.
+  # The shared services database: accounts and the Iceberg SQL catalog today, query history next.
   # One instance for the whole cluster — the entire point is that every role sees the same rows.
+  # `iceberg_tables` / `iceberg_namespace_properties` appear here too; they are created by
+  # `iceberg-catalog-sql` itself on first open, not by `lldb-qe-migrate`.
   postgres:
     image: postgres:18.4-alpine
     environment:
@@ -186,11 +202,14 @@ services:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
-    # Workers do not read the services DB yet; they get the config now because the Iceberg SQL
-    # catalog (#8) is the next thing to land, and a worker resolving a table must see the same
-    # catalog rows the coordinator planned against.
+    # Workers execute serialized plans and do not open the catalog themselves yet, but they get
+    # the services-DB config and the shared warehouse now: the Iceberg SQL catalog landed with
+    # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
+    # and the same metadata files — the coordinator planned against.
     environment:
       <<: [*s3-env, *metadata-env]
+    volumes:
+      - warehouse:/var/lib/lldb/warehouse
     networks:
       default:
         aliases: [analytics]
@@ -209,11 +228,14 @@ services:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
-    # Workers do not read the services DB yet; they get the config now because the Iceberg SQL
-    # catalog (#8) is the next thing to land, and a worker resolving a table must see the same
-    # catalog rows the coordinator planned against.
+    # Workers execute serialized plans and do not open the catalog themselves yet, but they get
+    # the services-DB config and the shared warehouse now: the Iceberg SQL catalog landed with
+    # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
+    # and the same metadata files — the coordinator planned against.
     environment:
       <<: [*s3-env, *metadata-env]
+    volumes:
+      - warehouse:/var/lib/lldb/warehouse
     networks:
       default:
         aliases: [analytics]
@@ -239,6 +261,12 @@ services:
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
     environment:
       <<: [*s3-env, *metadata-env]
+    volumes:
+      # Same shared Iceberg metadata as every other role. A warehouse is a separate pool of
+      # *compute*, not of storage — the whole point is that `analytics` and `etl` read one
+      # catalog over one warehouse. Omitting this would give this pool its own empty metadata
+      # tree and it would report tables the others can see as missing.
+      - warehouse:/var/lib/lldb/warehouse
     networks:
       default:
         aliases: [etl]
@@ -269,6 +297,10 @@ services:
       <<: [*s3-env, *metadata-env, *warehouse-env]
     volumes:
       - ./manifests:/manifests:ro
+      # The Iceberg metadata a `sql` catalog writes. A named volume rather than MinIO because
+      # iceberg 0.10 has no object-store StorageFactory (see the header), and it must be shared
+      # so a worker reads the same metadata files the coordinator committed.
+      - warehouse:/var/lib/lldb/warehouse
     depends_on:
       worker-1:
         condition: service_healthy
@@ -285,3 +317,7 @@ services:
 # the cluster smoke test uses to start from a clean slate).
 volumes:
   pgdata:
+  # Iceberg table metadata for `sql`-catalog manifests, shared by every lldb role. The catalog
+  # rows in Postgres point at metadata files, so a catalog every process can read is only half
+  # the story — they must be able to read the files it names, too.
+  warehouse:

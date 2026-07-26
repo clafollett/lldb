@@ -65,6 +65,16 @@ Do NOT hardcode schemas. Declare tables in a `Manifest` (see `manifest.rs`) and 
 `catalog::apply_manifest`. `tpch_manifest` / `register_tpch_parquet` are thin TPC-H seeds over
 that generic path — add new schemas as manifests, not bespoke loaders.
 
+A manifest picks its catalog backend: `memory` (per-process, dev default) or `sql` (persistent
+Postgres, shared by the whole fleet — `manifests/shared-catalog.toml`). The SQL catalog's `uri`
+is optional and normally omitted, because a manifest is committed config and must not carry a
+password; it falls back to the fleet's `LLDB_METADATA_*`. Two consequences worth knowing:
+`iceberg-catalog-sql` creates and owns `iceberg_tables` / `iceberg_namespace_properties`, so
+they are **not** in `migrations/`; and applying a manifest is idempotent — a table that already
+exists is not re-created and, crucially, not re-seeded. Iceberg 0.10 ships no object-store
+`StorageFactory`, so a `sql` catalog requires a `file://` warehouse and **errors** on `s3://`
+rather than silently writing metadata to local disk.
+
 ## Control-plane state lives in Postgres
 
 Data-plane state (bytes in object storage, Arrow in flight, the per-worker stage cache) is
@@ -102,6 +112,9 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
   --metadata-url postgres://lldb@localhost/lldb --seed-account default
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test services_db  # or LLDB_DOCKER=1
 
+# Shared Iceberg catalog (`backend = { kind = "sql" }`): proves two independently-built
+# lakehouses on one Postgres see the same tables and the same snapshot. Same three-way gating.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test shared_sql_catalog
 # Virtual warehouses (elastic compute). The CLI writes DESIRED state; an actuator applies it —
 # `aws ecs update-service --desired-count`, a CDK deploy (-c warehouses=analytics:4,etl:1), or
 # `docker compose up -d --scale`. The engine carries no orchestrator SDK, on purpose.

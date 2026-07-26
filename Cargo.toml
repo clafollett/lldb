@@ -31,6 +31,9 @@ datafusion-proto = "53.1"
 # --- Apache Iceberg table format ---
 iceberg = "0.10"
 iceberg-datafusion = "0.10"
+# The persistent, shareable catalog (issue #8). Depends only on iceberg 0.10, sqlx ^0.8.1,
+# async-trait and strum — no second arrow / object_store / datafusion enters the tree.
+iceberg-catalog-sql = "0.10"
 
 # --- Arrow family: ONE version everywhere; Flight (de)serialization requires it ---
 arrow = "58.4"
@@ -57,7 +60,12 @@ futures = "0.3"
 # `crates/lldb-qe-core/migrations/` into the binary at compile time, so an image carries its own
 # schema. It does NOT mean we use the compile-time-checked `query!` family: those need a live
 # database at build time, which would break `cargo build` in CI and in Docker.
-sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "macros", "chrono"] }
+#
+# `any` is on because `iceberg-catalog-sql` drives its catalog tables through sqlx's `Any`
+# driver and calls `install_default_drivers()` itself. That call can only register drivers that
+# were *compiled in*, so the `postgres` feature above is what makes a `postgres://` catalog URI
+# resolvable at all — and is why the SQL catalog speaks Postgres and nothing else in this build.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "any", "migrate", "macros", "chrono"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # --- Errors, logging, small utils ---

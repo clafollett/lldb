@@ -9,6 +9,16 @@
 //! - creates **Iceberg** tables in the catalog's warehouse and seeds them from their source.
 //!
 //! TPC-H is now just the manifest produced by [`crate::tpch::tpch_manifest`].
+//!
+//! # Applying a manifest is idempotent
+//!
+//! Applying the same manifest twice must leave the same state, because with a persistent
+//! catalog ([`crate::manifest::CatalogBackend::Sql`]) that is the *normal* case: every process
+//! in the fleet applies it at startup, and every restart applies it again. So a table that
+//! already exists is the manifest being satisfied, not a conflict — and, crucially, it is not
+//! re-seeded. Re-running the loading `INSERT` would append a second copy of the source data and
+//! commit a new snapshot, making a query's answer depend on how many times the fleet had
+//! booted. Only tables this call actually created are seeded.
 
 use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
@@ -79,10 +89,17 @@ pub async fn apply_manifest(
         )
         .await?;
 
-        // 1. Create each table (registering its parquet source alongside for the seed step).
+        // 1. Create each table that is missing, registering its parquet source alongside for
+        //    the seed step. Tables the catalog already has are left exactly as they are — see
+        //    `seeded` below for why that distinction matters.
+        let mut seeded: Vec<(&str, &TableDef)> = Vec::new();
         for (ns_name, table) in &iceberg {
             let ns = NamespaceIdent::new((*ns_name).to_string());
             lake.ensure_namespace(&ns).await?;
+
+            if lake.table_exists(ns_name, &table.name).await? {
+                continue;
+            }
 
             let arrow_schema = match source_path(table) {
                 Some(path) => {
@@ -97,15 +114,26 @@ pub async fn apply_manifest(
                 }
                 None => explicit_arrow_schema(table)?,
             };
-            lake.create_table_from_arrow(&ns, &table.name, &arrow_schema)
-                .await?;
+            if lake
+                .ensure_table_from_arrow(&ns, &table.name, &arrow_schema)
+                .await?
+            {
+                seeded.push((*ns_name, table));
+            }
         }
 
         // 2. Register the catalog now that every table exists.
         lake.register_with(ctx).await?;
 
-        // 3. Seed each table from its parquet source (append-only). Empty sources stay empty.
-        for (ns_name, table) in &iceberg {
+        // 3. Seed from parquet — but only the tables *this call* created.
+        //
+        //    A memory catalog is empty at every startup, so that is all of them and nothing
+        //    changes. A persistent SQL catalog is not: the second process to apply the manifest,
+        //    and the same process after a restart, find the tables already populated. Seeding
+        //    those again would append a duplicate copy of the source data and mint a new
+        //    snapshot, so the fleet's answer to a query would depend on how many times a
+        //    manifest had been applied. Applying a manifest twice has to be a no-op.
+        for (ns_name, table) in &seeded {
             if source_path(table).is_some() {
                 let src = source_name(&catalog.name, ns_name, &table.name);
                 let sql = format!(
