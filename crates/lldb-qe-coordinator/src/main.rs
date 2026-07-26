@@ -45,6 +45,19 @@
 //! A checkout, a laptop, and a single-node demo have no control plane to talk to, and requiring
 //! one would mean `cargo run` needs Postgres.
 //!
+//! # The result cache sits in front of all of it
+//!
+//! Everything above — planning, the staging rewrite, fleet dispatch — is skipped entirely when the
+//! same query has already been answered over the same data. [`execute_cached`] resolves the
+//! query's tables to their Iceberg snapshot ids, composes a key from those plus the tenant and the
+//! engine build, and returns a stored result when the key matches. A write moves a snapshot, the
+//! key changes, and the next run recomputes; there is no invalidation step to forget. See
+//! [`lldb_qe_core::result_cache`] for what is deliberately *not* cached.
+//!
+//! It needs the services database and a resolved account, so it is inert in exactly the
+//! single-node case described above — and `--no-result-cache` takes it out of the picture without
+//! unconfiguring anything else.
+//!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
 use std::path::PathBuf;
@@ -58,8 +71,9 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig, apply_manifest, build_session,
-    discover_workers, fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
+    FlightReaderExec, ResultCacheArgs, ServicesArgs, StorageArgs, StorageConfig, apply_manifest,
+    build_session, discover_workers, execute_cached, fetch_with_failover, init_tracing,
+    plan_distributed, register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -103,6 +117,9 @@ struct Cli {
 
     #[command(flatten)]
     services: ServicesArgs,
+
+    #[command(flatten)]
+    result_cache: ResultCacheArgs,
 }
 
 #[tokio::main]
@@ -129,6 +146,11 @@ async fn main() -> Result<()> {
     // Resolve the tenant, if there is a control plane to resolve it against. A missing account is
     // an error naming the tool that creates one — a silent fallback would let a typo run a query
     // under nobody's identity, which is precisely the bug #19's enforcement has to rule out.
+    //
+    // The handle stays open now rather than being closed straight away: the result cache lives in
+    // this same database, and the tenant id resolved here is the first component of its key.
+    let mut account_id = None;
+    let mut result_cache = None;
     if let Some(db) = cli.services.connect().await? {
         let account = db.account_by_name(&cli.account).await?.with_context(|| {
             format!(
@@ -142,19 +164,28 @@ async fn main() -> Result<()> {
             account_id = account.id,
             "resolved tenant"
         );
-        db.close().await;
+        account_id = Some(account.id);
+        result_cache = cli.result_cache.build(db);
     }
 
     let (ctx, storage) = build_session(config).await?;
 
     // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
-    match &cli.manifest {
+    //
+    // The lakehouse handles are kept, not dropped: they are the only thing that can answer "what
+    // snapshot is this table at", which is what makes a cache key safe to trust. The TPC-H seed
+    // registers plain-parquet listing tables, which have no snapshot — so that path yields no
+    // lakehouses and nothing it can query is cacheable. That is the intended behaviour, not a gap.
+    let lakehouses = match &cli.manifest {
         Some(path) => {
             let manifest = Manifest::from_path(path)?;
-            apply_manifest(&ctx, &storage, &manifest).await?;
+            apply_manifest(&ctx, &storage, &manifest).await?
         }
-        None => register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?,
-    }
+        None => {
+            register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?;
+            Vec::new()
+        }
+    };
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
     // level is the operator-visible signal that scaling the ECS service actually changed the fleet.
@@ -173,39 +204,63 @@ async fn main() -> Result<()> {
         "discovered worker fleet"
     );
 
-    // Build the physical plan, then rewrite its distribution boundaries across the whole fleet.
-    let plan = ctx.sql(&cli.sql).await?.create_physical_plan().await?;
-    let coordinated = plan_distributed(Arc::clone(&plan), &fleet)?;
+    // Answer from the result cache when every input is unchanged; otherwise plan and run. The
+    // closure is everything a hit skips — physical planning, the staging rewrite, and every byte
+    // that would have crossed the wire.
+    let batches = execute_cached(
+        &ctx,
+        result_cache.as_ref(),
+        &lakehouses,
+        account_id,
+        &cli.sql,
+        |logical| async {
+            // `execute_logical_plan` rather than `create_physical_plan` straight off the logical
+            // plan: it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted
+            // through `--sql` still take effect. Those statements are never cacheable, so they
+            // reach here unchanged.
+            let plan = ctx
+                .execute_logical_plan(logical)
+                .await?
+                .create_physical_plan()
+                .await?;
+            // Rewrite the plan's distribution boundaries across the whole fleet.
+            let coordinated = plan_distributed(Arc::clone(&plan), &fleet)?;
 
-    // Policy: distribute what can be distributed and reduce locally; offload a boundary-less plan
-    // whole to one worker. `plan_distributed` returns the plan *unchanged* when there is no
-    // distribution boundary (a constant query, a bare scan), so detect "did it actually distribute"
-    // by looking for the FlightReaderExec leaves the rewrite inserts.
-    let batches = if contains_flight_reader(&coordinated) {
-        // Genuinely distributed: the coordinator runs the reduce side locally and its
-        // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight.
-        collect(coordinated, ctx.task_ctx())
-            .await
-            .context("running the distributed query across the fleet")?
-    } else {
-        // Boundary-less: nothing to fan out. Collapse to a single output partition and ship the
-        // whole plan to one worker — this still exercises a real worker over Flight (what the
-        // cross-container cluster smoke test proves) instead of running everything locally.
-        //
-        // "One worker" is a placement, not a commitment: the plan is self-contained and the worker
-        // materializes it once by content hash, so any member of the fleet produces the same answer.
-        // `fetch_with_failover` therefore walks the fleet in order — a dead `fleet[0]` no longer
-        // fails a query that N-1 healthy workers could have served.
-        let plan = Arc::new(CoalescePartitionsExec::new(plan));
-        tracing::info!(
-            worker = %fleet[0],
-            fleet_size = fleet.len(),
-            "no distribution boundary; offloading the whole plan to one worker (failing over across the fleet if it is lost)"
-        );
-        fetch_with_failover(&fleet, 0, plan)
-            .await
-            .context("running the query on a single worker")?
-    };
+            // Policy: distribute what can be distributed and reduce locally; offload a
+            // boundary-less plan whole to one worker. `plan_distributed` returns the plan
+            // *unchanged* when there is no distribution boundary (a constant query, a bare scan),
+            // so detect "did it actually distribute" by looking for the FlightReaderExec leaves
+            // the rewrite inserts.
+            if contains_flight_reader(&coordinated) {
+                // Genuinely distributed: the coordinator runs the reduce side locally and its
+                // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight.
+                collect(coordinated, ctx.task_ctx())
+                    .await
+                    .context("running the distributed query across the fleet")
+            } else {
+                // Boundary-less: nothing to fan out. Collapse to a single output partition and
+                // ship the whole plan to one worker — this still exercises a real worker over
+                // Flight (what the cross-container cluster smoke test proves) instead of running
+                // everything locally.
+                //
+                // "One worker" is a placement, not a commitment: the plan is self-contained and
+                // the worker materializes it once by content hash, so any member of the fleet
+                // produces the same answer. `fetch_with_failover` therefore walks the fleet in
+                // order — a dead `fleet[0]` no longer fails a query that N-1 healthy workers
+                // could have served.
+                let plan = Arc::new(CoalescePartitionsExec::new(plan));
+                tracing::info!(
+                    worker = %fleet[0],
+                    fleet_size = fleet.len(),
+                    "no distribution boundary; offloading the whole plan to one worker (failing over across the fleet if it is lost)"
+                );
+                fetch_with_failover(&fleet, 0, plan)
+                    .await
+                    .context("running the query on a single worker")
+            }
+        },
+    )
+    .await?;
 
     println!("{}", pretty_format_batches(&batches)?);
     Ok(())
