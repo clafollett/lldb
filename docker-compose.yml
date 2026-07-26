@@ -1,6 +1,11 @@
 # A whole lldb cluster on one host, to prove the distributed communication path end-to-end:
-# a MinIO object store (the S3 warehouse), a fleet of stateless workers, and a coordinator that
-# ships a physical plan to a worker over Arrow Flight and prints the result.
+# a MinIO object store (the S3 warehouse), a Postgres services database (the control plane), a
+# fleet of stateless workers, and a coordinator that ships a physical plan to a worker over
+# Arrow Flight and prints the result.
+#
+# Startup order is a chain of conditions, not sleeps: minio → minio-setup, postgres → db-migrate,
+# and every lldb role waits for db-migrate to *exit successfully*. Migrations are a one-shot step
+# on purpose — see the docs on `lldb-qe-migrate` for why a fleet must not migrate itself.
 #
 #   docker compose up --build            # bring the cluster up; coordinator prints a result
 #   docker compose run --rm coordinator lldb-qe-coordinator --workers http://worker-1:50051 \
@@ -37,7 +42,59 @@ x-s3-env: &s3-env
   LLDB_S3_ALLOW_HTTP: "true"
   RUST_LOG: info
 
+# Services-database (control plane) connection, in the discrete-parts form. Deliberately not a
+# single LLDB_METADATA_URL: that is the shape ECS/Fargate can wire up, where the password arrives
+# as its own Secrets Manager–backed variable and nothing can string-interpolate it into a URL.
+# Keeping compose on the same shape means the two environments exercise the same code path.
+x-metadata-env: &metadata-env
+  LLDB_METADATA_HOST: postgres
+  LLDB_METADATA_PORT: "5432"
+  LLDB_METADATA_DATABASE: lldb
+  LLDB_METADATA_USER: lldb
+  LLDB_METADATA_PASSWORD: lldb
+  LLDB_METADATA_SSLMODE: disable
+
 services:
+  # The shared services database: accounts today, the Iceberg SQL catalog and query history next.
+  # One instance for the whole cluster — the entire point is that every role sees the same rows.
+  postgres:
+    image: postgres:18.4-alpine
+    environment:
+      POSTGRES_USER: lldb
+      POSTGRES_PASSWORD: lldb
+      POSTGRES_DB: lldb
+    ports:
+      # Published so `psql -h localhost -p 5432 -U lldb lldb` can inspect the control plane while
+      # the cluster runs. Local-only credentials; nothing here is a production posture.
+      - "5432:5432"
+    volumes:
+      # NOT `/var/lib/postgresql/data` — that is the Postgres <=17 layout. The 18 images moved
+      # PGDATA to a version-scoped subdirectory (`/var/lib/postgresql/18/docker`) and declare
+      # `/var/lib/postgresql` itself as the volume, so mounting the old path both fails to
+      # persist anything and leaves a root-owned directory inside the postgres-owned tree.
+      - pgdata:/var/lib/postgresql
+    healthcheck:
+      # `pg_isready` is the only honest readiness signal: the container prints "ready to accept
+      # connections" once during its own bootstrap, before the real server starts.
+      test: ["CMD-SHELL", "pg_isready -U lldb -d lldb"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # One-shot: apply the embedded migrations and seed the `default` account, then exit. Every
+  # lldb role depends on this *completing successfully*, so nothing queries a schema-less
+  # database and nothing races to create the schema itself.
+  db-migrate:
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
+    command: ["lldb-qe-migrate", "--seed-account", "default"]
+    environment:
+      <<: *metadata-env
+      RUST_LOG: info
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -70,9 +127,15 @@ services:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
-    environment: *s3-env
+    # Workers do not read the services DB yet; they get the config now because the Iceberg SQL
+    # catalog (#8) is the next thing to land, and a worker resolving a table must see the same
+    # catalog rows the coordinator planned against.
+    environment:
+      <<: [*s3-env, *metadata-env]
     depends_on:
       minio-setup:
+        condition: service_completed_successfully
+      db-migrate:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
@@ -84,9 +147,15 @@ services:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
-    environment: *s3-env
+    # Workers do not read the services DB yet; they get the config now because the Iceberg SQL
+    # catalog (#8) is the next thing to land, and a worker resolving a table must see the same
+    # catalog rows the coordinator planned against.
+    environment:
+      <<: [*s3-env, *metadata-env]
     depends_on:
       minio-setup:
+        condition: service_completed_successfully
+      db-migrate:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
@@ -106,7 +175,8 @@ services:
       - "/manifests/empty.toml"
       - "--sql"
       - "SELECT 42 AS answer, 'distributed hello' AS greeting"
-    environment: *s3-env
+    environment:
+      <<: [*s3-env, *metadata-env]
     volumes:
       - ./manifests:/manifests:ro
     depends_on:
@@ -114,3 +184,10 @@ services:
         condition: service_healthy
       worker-2:
         condition: service_healthy
+      db-migrate:
+        condition: service_completed_successfully
+
+# Named so the control plane survives `docker compose down` (but not `down -v`, which is what
+# the cluster smoke test uses to start from a clean slate).
+volumes:
+  pgdata:

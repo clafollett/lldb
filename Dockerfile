@@ -52,8 +52,12 @@ COPY . .
 # the build context, so the SHA must be injected). Defaults keep local `docker build` working.
 ARG GIT_SHA=unknown
 ENV LLDB_GIT_SHA=$GIT_SHA
+# The coordinator package also builds `lldb-qe-migrate`, the one-shot that applies services-DB
+# migrations. It ships in the same image on purpose: migrations are embedded in the binary at
+# compile time, so the thing that migrates must be the *same build* as the thing that queries.
 RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
-    && cp target/release/lldb-qe-coordinator target/release/lldb-qe-worker /usr/local/bin/
+    && cp target/release/lldb-qe-coordinator target/release/lldb-qe-migrate \
+          target/release/lldb-qe-worker /usr/local/bin/
 
 # ---- Runtime -------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -65,6 +69,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /usr/local/bin/lldb-qe-coordinator /usr/local/bin/lldb-qe-coordinator
+COPY --from=builder /usr/local/bin/lldb-qe-migrate /usr/local/bin/lldb-qe-migrate
 COPY --from=builder /usr/local/bin/lldb-qe-worker /usr/local/bin/lldb-qe-worker
 
 # Run as non-root.

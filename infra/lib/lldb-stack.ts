@@ -5,10 +5,17 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as rds from 'aws-cdk-lib/aws-rds';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 
 /** The Flight port every worker listens on (matches `LLDB_WORKER_BIND` in the image). */
 export const WORKER_PORT = 50051;
+
+/** Postgres port for the services database. */
+export const SERVICES_DB_PORT = 5432;
+/** Database and login the engine expects on the services cluster. */
+export const SERVICES_DB_NAME = 'lldb';
+export const SERVICES_DB_USER = 'lldb';
 
 /** Private DNS namespace the fleet registers into, e.g. `worker.lldb.local`. */
 export const NAMESPACE = 'lldb.local';
@@ -32,6 +39,21 @@ export const WORKER_SERVICE_NAME = 'worker';
  * ~$7.30/mo each per AZ.
  */
 export type EgressMode = 'none' | 'nat-instance' | 'nat-gateway';
+
+/**
+ * Whether the stack provisions the shared **services database** — the control plane holding
+ * accounts, the SQL catalog, warehouses and query history.
+ *
+ * - `aurora` (default): an Aurora Serverless v2 PostgreSQL cluster in isolated subnets, with a
+ *   generated password in Secrets Manager and ingress on 5432 restricted to the worker and
+ *   coordinator security groups. Serverless v2 rather than a provisioned instance because a
+ *   control plane's load is bursty and mostly idle — it scales to a fraction of an ACU between
+ *   queries instead of billing for an always-on `db.r6g`.
+ * - `none`: no database at all, and no `LLDB_METADATA_*` on the tasks. The engine treats an
+ *   unconfigured services DB as a legitimate state, so this deploys a query-only fleet — useful
+ *   for a throwaway benchmark stack that should not carry a cluster's cost or blast radius.
+ */
+export type ServicesDbMode = 'aurora' | 'none';
 
 /** fck-nat (https://fck-nat.dev) — a free, purpose-built NAT AMI. Published under this owner. */
 const FCK_NAT_OWNER = '568608671756';
@@ -59,6 +81,8 @@ export interface LldbStackProps extends cdk.StackProps {
   readonly natMachineImage?: ec2.IMachineImage;
   /** Instance type for `nat-instance`. Defaults to `t4g.nano` (arm64, matches the fck-nat AMI). */
   readonly natInstanceType?: ec2.InstanceType;
+  /** Whether to provision the services database. See {@link ServicesDbMode}. Defaults to `aurora`. */
+  readonly servicesDb?: ServicesDbMode;
 }
 
 /**
@@ -76,6 +100,8 @@ export class LldbStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
   public readonly workerService: ecs.FargateService;
   public readonly coordinatorTask: ecs.FargateTaskDefinition;
+  /** The services database, when `servicesDb: 'aurora'`. */
+  public readonly servicesDb?: rds.DatabaseCluster;
 
   constructor(scope: Construct, id: string, props: LldbStackProps) {
     super(scope, id, props);
@@ -121,6 +147,15 @@ export class LldbStack extends cdk.Stack {
     // ---- Network ------------------------------------------------------------------------
     const egress: EgressMode = props.egress ?? 'none';
     const isPrivate = egress !== 'none';
+    const servicesDbMode: ServicesDbMode = props.servicesDb ?? 'aurora';
+
+    // The database gets *isolated* subnets — no route to the internet in either direction — in
+    // every egress mode. Isolated subnets cost nothing (no NAT, no endpoint), and a control
+    // plane that cannot be reached from outside the VPC is the cheapest security win available.
+    const dbSubnets: ec2.SubnetConfiguration[] =
+      servicesDbMode === 'aurora'
+        ? [{ name: 'db', subnetType: ec2.SubnetType.PRIVATE_ISOLATED, cidrMask: 24 }]
+        : [];
 
     // One NAT (instance or gateway) serves both AZs. Paying per-AZ for HA is not a POC concern;
     // raise `natGateways` to `maxAzs` when a NAT outage taking the fleet offline actually costs
@@ -148,8 +183,9 @@ export class LldbStack extends cdk.Stack {
         ? [
             { name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 },
             { name: 'private', subnetType: ec2.SubnetType.PRIVATE_WITH_EGRESS, cidrMask: 24 },
+            ...dbSubnets,
           ]
-        : [{ name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 }],
+        : [{ name: 'public', subnetType: ec2.SubnetType.PUBLIC, cidrMask: 24 }, ...dbSubnets],
     });
     // The NAT forwards traffic originating in the VPC, so it must accept exactly that and
     // nothing else. Without this the instance would be internet-reachable.
@@ -191,6 +227,73 @@ export class LldbStack extends cdk.Stack {
     });
     workerSg.addIngressRule(coordinatorSg, ec2.Port.tcp(WORKER_PORT), 'Arrow Flight from coordinator');
 
+    // ---- Services database (control plane) -----------------------------------------------
+    // Env injected into both roles. Empty in `servicesDb: 'none'` mode, which the engine reads
+    // as "no control plane" and tolerates rather than failing.
+    const metadataEnv: Record<string, string> = {};
+    const metadataSecrets: Record<string, ecs.Secret> = {};
+
+    if (servicesDbMode === 'aurora') {
+      // Same posture as the Flight port: reachable from the app's security groups and nothing
+      // else. `allowAllOutbound: false` because a database has no business initiating traffic.
+      const dbSg = new ec2.SecurityGroup(this, 'ServicesDbSg', {
+        vpc,
+        description: 'lldb services database - control plane',
+        allowAllOutbound: false,
+      });
+      dbSg.addIngressRule(workerSg, ec2.Port.tcp(SERVICES_DB_PORT), 'Postgres from the worker fleet');
+      dbSg.addIngressRule(coordinatorSg, ec2.Port.tcp(SERVICES_DB_PORT), 'Postgres from the coordinator');
+
+      this.servicesDb = new rds.DatabaseCluster(this, 'ServicesDb', {
+        // `.of()` rather than an `AuroraPostgresEngineVersion.VER_*` constant because the CDK
+        // enum lags Aurora releases and does not carry 18.4.
+        //
+        // ⚠️ THE ONE KNOB TO CHECK BEFORE A REAL DEPLOY. Aurora PostgreSQL tracks community
+        // Postgres at a lag, and the CloudFormation spec bundled with this CDK version tops out
+        // at `18.3` — `cdk synth` emits a W/E9006 warning saying so, and a deploy against a
+        // region that does not offer 18.4 will fail at CreateDBCluster. 18.4 is what compose and
+        // CI run, so it is what this pins; confirm with
+        // `aws rds describe-db-engine-versions --engine aurora-postgresql --query
+        // 'DBEngineVersions[].EngineVersion'` and edit this line if your region disagrees.
+        engine: rds.DatabaseClusterEngine.auroraPostgres({
+          version: rds.AuroraPostgresEngineVersion.of('18.4', '18'),
+        }),
+        vpc,
+        vpcSubnets: { subnetType: ec2.SubnetType.PRIVATE_ISOLATED },
+        securityGroups: [dbSg],
+        // Generated into Secrets Manager — the password never appears in the template, in the
+        // repo, or in a task's plain environment.
+        credentials: rds.Credentials.fromGeneratedSecret(SERVICES_DB_USER),
+        defaultDatabaseName: SERVICES_DB_NAME,
+        writer: rds.ClusterInstance.serverlessV2('writer'),
+        // A control plane is bursty and mostly idle; scale down to near-nothing between queries.
+        serverlessV2MinCapacity: 0.5,
+        serverlessV2MaxCapacity: 4,
+        storageEncrypted: true,
+        // Matches the warehouse bucket's POC posture: a `cdk destroy` should actually destroy.
+        // Flip both of these before anyone's data matters.
+        deletionProtection: false,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+
+      metadataEnv.LLDB_METADATA_HOST = this.servicesDb.clusterEndpoint.hostname;
+      metadataEnv.LLDB_METADATA_PORT = cdk.Tokenization.stringifyNumber(this.servicesDb.clusterEndpoint.port);
+      metadataEnv.LLDB_METADATA_DATABASE = SERVICES_DB_NAME;
+      metadataEnv.LLDB_METADATA_USER = SERVICES_DB_USER;
+      // TLS on the wire without pinning a CA bundle into the image. `verify-full` is the next
+      // step up and needs the RDS root shipped with the container.
+      metadataEnv.LLDB_METADATA_SSLMODE = 'require';
+
+      // The ONLY way the password reaches a task: ECS resolves it from Secrets Manager at start
+      // and never writes it into the task definition. Adding this to a container also grants the
+      // execution role read access to the secret.
+      const secret = this.servicesDb.secret;
+      if (!secret) {
+        throw new Error('Aurora cluster did not generate a credentials secret');
+      }
+      metadataSecrets.LLDB_METADATA_PASSWORD = ecs.Secret.fromSecretsManager(secret, 'password');
+    }
+
     // ---- Shared image + logging ---------------------------------------------------------
     // BOTH task definitions resolve this same object: one tag, one build, whole fleet.
     const image = ecs.ContainerImage.fromEcrRepository(this.repository, props.imageTag);
@@ -212,7 +315,8 @@ export class LldbStack extends cdk.Stack {
     workerTask.addContainer('worker', {
       image,
       command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
-      environment: storageEnv,
+      environment: { ...storageEnv, ...metadataEnv },
+      secrets: metadataSecrets,
       portMappings: [{ containerPort: WORKER_PORT }],
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'worker', logGroup }),
       // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port.
@@ -256,8 +360,10 @@ export class LldbStack extends cdk.Stack {
       command: ['lldb-qe-coordinator'],
       environment: {
         ...storageEnv,
+        ...metadataEnv,
         LLDB_WORKERS: `http://${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`,
       },
+      secrets: metadataSecrets,
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'coordinator', logGroup }),
     });
     this.warehouse.grantReadWrite(this.coordinatorTask.taskRole);
@@ -279,5 +385,18 @@ export class LldbStack extends cdk.Stack {
       description: 'assignPublicIp for run-task (DISABLED behind a NAT)',
     });
     new cdk.CfnOutput(this, 'EgressMode', { value: egress });
+    new cdk.CfnOutput(this, 'ServicesDbMode', { value: servicesDbMode });
+    if (this.servicesDb) {
+      new cdk.CfnOutput(this, 'ServicesDbEndpoint', {
+        value: this.servicesDb.clusterEndpoint.socketAddress,
+        description: 'Services-database writer endpoint (reachable only from inside the VPC)',
+      });
+      new cdk.CfnOutput(this, 'ServicesDbSecretArn', {
+        // The ARN, never the value: read it with `aws secretsmanager get-secret-value` when you
+        // need to run `lldb-qe-migrate` by hand.
+        value: this.servicesDb.secret!.secretArn,
+        description: 'Secrets Manager ARN holding the services-database credentials',
+      });
+    }
   }
 }

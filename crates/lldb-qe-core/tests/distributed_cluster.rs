@@ -30,6 +30,20 @@ fn compose(args: &[&str]) -> (String, String, bool) {
     )
 }
 
+/// Everything a failed `compose up` refuses to tell you on its own.
+///
+/// `docker compose up` reports only that a dependency "exited (1)" — never *why*. In CI that
+/// silence costs a full round trip per guess, because the containers are gone by the time anyone
+/// reads the log. So when a cluster assertion fails, attach the per-service logs and the exit
+/// codes to the panic message: the failure explains itself the first time.
+fn diagnostics() -> String {
+    let (ps, ps_err, _) = compose(&["ps", "--all"]);
+    let (logs, logs_err, _) = compose(&["logs", "--no-color", "--tail", "80"]);
+    format!(
+        "\n\n---- docker compose ps ----\n{ps}{ps_err}\n---- docker compose logs ----\n{logs}{logs_err}"
+    )
+}
+
 #[test]
 fn cluster_ships_a_query_across_containers() {
     if std::env::var("LLDB_DOCKER").ok().as_deref() != Some("1") {
@@ -59,13 +73,14 @@ fn cluster_ships_a_query_across_containers() {
     }
     up.extend(["minio", "minio-setup", "worker-1", "worker-2"]);
     let (_o, e, ok) = compose(&up);
-    assert!(ok, "compose up failed:\n{e}");
+    assert!(ok, "compose up failed:\n{e}{}", diagnostics());
 
     // Run the coordinator to completion and capture its printed result table.
     let (stdout, stderr, ok) = compose(&["run", "--rm", "coordinator"]);
     assert!(
         ok,
-        "coordinator run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        "coordinator run failed:\nstdout:\n{stdout}\nstderr:\n{stderr}{}",
+        diagnostics()
     );
 
     // The default query is `SELECT 42 AS answer, 'distributed hello' AS greeting`, shipped to a

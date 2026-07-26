@@ -18,6 +18,7 @@
 //! | [`lakehouse`]    | Iceberg: files → transactional, versioned tables           | 1 |
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
+//! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
@@ -44,6 +45,7 @@ pub mod manifest;
 pub mod remote;
 pub mod retry;
 pub mod scan_split;
+pub mod services;
 pub mod session;
 pub mod stage_cache;
 pub mod staging;
@@ -62,6 +64,7 @@ pub use manifest::{
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
+pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
 pub use session::{build_session, register_tpch_parquet};
 pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
 pub use staging::plan_distributed;

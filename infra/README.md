@@ -1,14 +1,18 @@
 # lldb on AWS (CDK)
 
 Deploys the query engine to **ECS Fargate**: an ECR repo for the one image, an S3 Iceberg
-warehouse, a service-discovered fleet of stateless workers, and a one-shot coordinator task.
+warehouse, an Aurora Serverless v2 Postgres services database, a service-discovered fleet of
+stateless workers, and a one-shot coordinator task.
 
 ```
                  ┌──────────────── VPC (2 AZs, egress: see below) ───────────┐
   aws ecs        │                                                            │
   run-task ─────▶│  coordinator (one-shot)  ──Arrow Flight :50051──▶  worker  │
-                 │         │                                          worker  │
-                 │         └── DNS: worker.lldb.local (Cloud Map) ─────┘      │
+                 │       │ │                                          worker  │
+                 │       │ └── DNS: worker.lldb.local (Cloud Map) ───┘   │    │
+                 │       │                                               │    │
+                 │       └────── :5432 ──▶ Aurora Serverless v2 ◀────────┘    │
+                 │                         (isolated subnets, services DB)    │
                  │                          │                                 │
                  └──────────────────────────┼─────────────────────────────────┘
                                             ▼  S3 gateway endpoint (free)
@@ -44,9 +48,46 @@ aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> 
 ```
 
 Knobs: `-c workerCount=4` sizes the fleet, `-c egress=nat-instance` moves it into private
-subnets (see below); `cpu`/`memoryLimitMiB` are stack props. The `TaskSubnets` and
-`AssignPublicIp` outputs give you the right `run-task` network config for whichever mode you
-deployed.
+subnets (see below), `-c servicesDb=none` drops the control plane (see below); `cpu`/`memoryLimitMiB`
+are stack props. The `TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task`
+network config for whichever mode you deployed.
+
+## Services database (`-c servicesDb=…`)
+
+The control plane — accounts, the Iceberg SQL catalog, virtual warehouses, query history — needs
+one shared, transactional store that every role sees the same view of. That is an **Aurora
+Serverless v2 PostgreSQL** cluster:
+
+| Mode | What you get |
+| - | - |
+| `aurora` *(default)* | A serverless-v2 cluster (0.5–4 ACU) in **isolated** subnets, storage encrypted, a generated password in Secrets Manager, and ingress on 5432 restricted to the worker and coordinator security groups. |
+| `none` | No cluster, no secret, and no `LLDB_METADATA_*` on the tasks. The engine treats an unconfigured services DB as legitimate, so this is a query-only fleet — useful for a throwaway benchmark stack. |
+
+Serverless v2 rather than a provisioned instance because control-plane load is bursty and mostly
+idle; it scales toward zero between queries instead of billing for an always-on instance. The
+subnets are isolated (no NAT, no internet route in either direction) — free, and a control plane
+unreachable from outside the VPC is the cheapest security win on offer.
+
+The tasks receive `LLDB_METADATA_HOST/PORT/DATABASE/USER/SSLMODE` as plain environment and
+`LLDB_METADATA_PASSWORD` as an **ECS secret** resolved from Secrets Manager at task start — the
+password never appears in a task definition, the template, or the repo. That split is exactly why
+the engine accepts the connection settings as discrete parts and not only as a single URL:
+nothing in ECS can interpolate a secret into a URL string.
+
+The engine version is pinned with `AuroraPostgresEngineVersion.of('18.4', '18')` rather than a
+CDK enum constant, because the enum lags Aurora releases — 18.4 matches what compose and CI run,
+so the same schema is exercised everywhere.
+
+> **Check this before a real deploy.** Aurora PostgreSQL trails community Postgres, and the
+> CloudFormation spec bundled with this CDK version only knows up to `18.3` — `cdk synth` prints
+> a `W9006`/`E9006` warning about it, and a region that does not offer 18.4 will fail at
+> `CreateDBCluster`. That call is the one line to change. List what a region actually offers with
+> `aws rds describe-db-engine-versions --engine aurora-postgresql --query 'DBEngineVersions[].EngineVersion'`.
+
+**Migrations are a separate step, on purpose.** Nothing migrates on boot (a fleet rollout would
+have N tasks racing the same DDL). Run the `lldb-qe-migrate` binary from the same image as a
+one-shot ECS task before rolling the services, the way compose's `db-migrate` does. Its
+credentials come from the `ServicesDbSecretArn` output.
 
 ## Tests
 
@@ -57,8 +98,10 @@ npm run synth   # emit CloudFormation to cdk.out/
 
 The tests assert the invariants rather than a snapshot: both roles resolve the *same* image, an
 unpinned tag is refused, the Flight port is reachable only from the coordinator's security group,
-task roles are scoped to the warehouse bucket, each egress mode builds the network it claims to,
-and — in *every* mode — no security group admits `0.0.0.0/0`.
+Postgres is reachable only from the task security groups, the database password is a secret
+reference rather than plain environment, task roles are scoped to the warehouse bucket, each
+egress and `servicesDb` mode builds what it claims to, and — in *every* mode — no security group
+admits `0.0.0.0/0`.
 
 ## Egress: how tasks reach ECR (`-c egress=…`)
 
@@ -93,8 +136,12 @@ egress with it. Raise `natGateways` to `maxAzs` when that matters more than the 
 
 ## Other scope notes
 
-- **`removalPolicy: DESTROY`** on the bucket and ECR repo keeps teardown clean for a POC. Change
-  both before anything real lands in the warehouse.
+- **`removalPolicy: DESTROY`** on the bucket, ECR repo and services database (plus
+  `deletionProtection: false` on the latter) keeps teardown clean for a POC. Change all of them
+  before anything real lands in the warehouse or the control plane.
+- **`cdk synth` warns `W9008` — "RDS instance should have StorageEncrypted set to true"** — on
+  the Aurora *writer*. It is a false positive: for Aurora, storage encryption is a cluster-level
+  property, and `AWS::RDS::DBCluster.StorageEncrypted` is `true` in the synthesized template.
 - **Fan-out is single-worker today.** `worker.lldb.local` resolves to every healthy task IP, but
   the coordinator currently ships its plan to one address. Spreading a query across the fleet
   needs DNS enumeration (or a registry) plus scan-level slicing — tracked with the engine

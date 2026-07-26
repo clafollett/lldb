@@ -24,6 +24,7 @@ squash-merge to `main`. `main` stays releasable at all times. Never push code st
 | iceberg / iceberg-datafusion | 0.10 | latest |
 | arrow / arrow-flight / parquet | 58.4 | datafusion 53.1 → arrow ^58; ONE version tree-wide |
 | object_store | 0.13 | datafusion 53.1 → object_store ^0.13.1 |
+| sqlx | 0.8 | `iceberg-catalog-sql` 0.10 needs `^0.8.1` — ONE sqlx tree-wide. Do NOT go to 0.9 |
 
 Coordinator and workers must run the identical build — serialized DataFusion plans are not
 cross-version compatible. Bumping DataFusion to 54 waits on `iceberg-datafusion` 0.11.
@@ -45,10 +46,13 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
   (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
-  config (`config.rs`)
-- `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries
+  config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`)
+- `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
+  The coordinator package also builds `lldb-qe-migrate` (`src/bin/`), the one-shot that applies
+  the services-DB migrations
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
-- `Dockerfile` / `docker-compose.yml` — one image, both roles; a MinIO + worker-fleet cluster
+- `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
+  worker-fleet cluster
 - `infra/` — AWS CDK (TypeScript): ECS Fargate worker fleet, S3 warehouse, ECR. **CDK, not
   Terraform.** Deploys one pinned `imageTag` to every role; synth fails on `latest`
 - `data/` — generated TPC-H + local Iceberg warehouse (gitignored)
@@ -59,14 +63,37 @@ Do NOT hardcode schemas. Declare tables in a `Manifest` (see `manifest.rs`) and 
 `catalog::apply_manifest`. `tpch_manifest` / `register_tpch_parquet` are thin TPC-H seeds over
 that generic path — add new schemas as manifests, not bespoke loaders.
 
+## Control-plane state lives in Postgres
+
+Data-plane state (bytes in object storage, Arrow in flight, the per-worker stage cache) is
+immutable or deliberately per-process. **Control-plane** state — accounts, the catalog,
+warehouses, query history — is neither, so it lives in the services database (`services.rs`),
+where transactions and constraints arbitrate instead of hope. Two rules:
+
+1. **Schema changes are migrations** in `crates/lldb-qe-core/migrations/`, embedded at compile
+   time by `sqlx::migrate!` and applied only by `lldb-qe-migrate`. Coordinators and workers never
+   migrate — a rolling fleet racing the same DDL is a production footgun.
+2. **An unconfigured services DB is legal.** `ServicesArgs::connect` returns `None`, and
+   single-node/local paths must keep working without Postgres. Never make `cargo run` need a
+   database.
+
+Passwords are never logged: `ServicesArgs` has a hand-written redacting `Debug`, and every
+message naming a connection URL goes through `services::redact_url` first.
+
 ## Commands
 
 ```
 tpchgen-cli -s 1 --format=parquet --output-dir data/sf1   # test data
 cargo test                                                # unit + integration (data-absent tests skip)
 cargo fmt --all && cargo clippy --all-targets
-docker compose up --build                                 # full containerized cluster
+docker compose up --build                                 # full cluster (MinIO + Postgres 18.4 + fleet)
 LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smoke test (needs a daemon)
+
+# Services DB (control plane). Migrations are an explicit one-shot step, NEVER startup magic —
+# a rolling fleet must not race to apply DDL. Compose runs it as the `db-migrate` service.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
+  --metadata-url postgres://lldb@localhost/lldb --seed-account default
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test services_db  # or LLDB_DOCKER=1
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```
