@@ -240,10 +240,12 @@ impl DmlStatement {
         match self.name.as_slice() {
             [ns, table] => Ok((ns.clone(), table.clone())),
             [cat, ns, table] if cat == catalog_name => Ok((ns.clone(), table.clone())),
-            [cat, _, _] => bail!(
-                "`{}` names catalog `{cat}`, but this lakehouse is catalog `{catalog_name}`",
-                self.name.join(".")
-            ),
+            [cat, _, _] => Err(WrongCatalog {
+                named: cat.clone(),
+                lakehouse: catalog_name.to_string(),
+                statement: self.name.join("."),
+            }
+            .into()),
             [table] => bail!(
                 "`{table}` has no namespace — DML needs `<namespace>.<table>` or \
                  `<catalog>.<namespace>.<table>` so the target is unambiguous"
@@ -538,6 +540,24 @@ pub async fn execute_statement(lake: &Lakehouse, stmt: &DmlStatement) -> Result<
     )
 }
 
+/// A three-part name that belongs to a *different* catalog than the lakehouse it was offered to.
+///
+/// A distinct type rather than a message, because a caller has to act on it: the coordinator holds
+/// several lakehouses and asks each in turn whose table this is, so "not mine" must be
+/// distinguishable from "yours, and it went wrong". Matching on the text of an error to decide
+/// control flow means a reworded message silently changes behaviour — and here the failure mode is
+/// a real error being swallowed as "wrong catalog" and reported as a missing table.
+#[derive(Debug, thiserror::Error)]
+#[error("`{statement}` names catalog `{named}`, but this lakehouse is catalog `{lakehouse}`")]
+pub struct WrongCatalog {
+    /// The catalog the statement named.
+    pub named: String,
+    /// The catalog of the lakehouse that was asked.
+    pub lakehouse: String,
+    /// The full table name as written.
+    pub statement: String,
+}
+
 /// A commit assembled and durably written, waiting only on the pointer swap.
 struct Staged {
     /// The metadata location the swap must find in place — the one the plan was built on.
@@ -554,11 +574,7 @@ impl Staged {
     /// statement is about to be retried, and an orphaned file is a tidiness problem while a
     /// spurious error would be a correctness one.
     async fn discard(&self, table: &Table) {
-        for path in self.written.iter().rev() {
-            if let Err(e) = table.file_io().delete(path).await {
-                tracing::debug!(path, error = %e, "could not remove a losing attempt's file");
-            }
-        }
+        discard_paths(table, &self.written).await;
     }
 }
 
@@ -610,6 +626,36 @@ async fn pinned_session(table: &Table) -> Result<(SessionContext, String)> {
 /// Everything here is catalog-agnostic — it only needs `FileIO` — which is what lets it be
 /// exercised end to end against a memory catalog with no database in sight.
 async fn stage(table: &Table, stmt: &DmlStatement) -> Result<Staged> {
+    // `stage_inner` threads everything it writes into `written` as it goes, so a failure *part
+    // way through* — an IO error on the manifest list, a metadata write that fails — can still
+    // clean up after itself. Without this the orphans are invisible: the statement returns an
+    // error, nothing is committed, and the files sit in the warehouse forever. Conflicts already
+    // clean up via `Staged::discard`; this closes the other path into the same litter.
+    let mut written: Vec<String> = Vec::new();
+    match stage_inner(table, stmt, &mut written).await {
+        Ok(staged) => Ok(staged),
+        Err(e) => {
+            discard_paths(table, &written).await;
+            Err(e)
+        }
+    }
+}
+
+/// Best-effort deletion, newest first. Failures are logged, never propagated — the caller already
+/// has an error worth more than this one.
+async fn discard_paths(table: &Table, paths: &[String]) {
+    for path in paths.iter().rev() {
+        if let Err(e) = table.file_io().delete(path).await {
+            tracing::debug!(path, error = %e, "could not remove a staged file");
+        }
+    }
+}
+
+async fn stage_inner(
+    table: &Table,
+    stmt: &DmlStatement,
+    written: &mut Vec<String>,
+) -> Result<Staged> {
     let metadata = table.metadata();
     let base_location = table
         .metadata_location_result()
@@ -698,15 +744,11 @@ async fn stage(table: &Table, stmt: &DmlStatement) -> Result<Staged> {
         .await
         .context("closing the data file writer")?;
 
-    let mut written: Vec<String> = new_files
-        .iter()
-        .map(|f| f.file_path().to_string())
-        .collect();
+    written.extend(new_files.iter().map(|f| f.file_path().to_string()));
 
     // 3. Assemble the snapshot over those files, replacing every previously live one.
     let old_files = live_data_files(table).await?;
-    let manifests =
-        write_manifests(table, snapshot_id, &new_files, &old_files, &mut written).await?;
+    let manifests = write_manifests(table, snapshot_id, &new_files, &old_files, written).await?;
     let manifest_list = format!(
         "{}/metadata/snap-{snapshot_id}-0.avro",
         metadata.location().trim_end_matches('/')
@@ -741,7 +783,7 @@ async fn stage(table: &Table, stmt: &DmlStatement) -> Result<Staged> {
         base_location,
         new_location,
         snapshot_id,
-        written,
+        written: std::mem::take(written),
     })
 }
 

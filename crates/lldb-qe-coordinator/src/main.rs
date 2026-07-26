@@ -387,8 +387,10 @@ async fn run_dml(lakehouses: &[Lakehouse], sql: &str) -> Result<Option<DmlOutcom
 
 /// Whether an error means "wrong catalog for this statement" rather than a genuine failure.
 fn is_wrong_catalog(e: &anyhow::Error) -> bool {
-    e.chain()
-        .any(|c| c.to_string().contains("but this lakehouse is catalog"))
+    // A typed probe, not a substring of the message. This decides control flow — "ask the next
+    // lakehouse" versus "report the failure" — so a reworded error must not be able to change it,
+    // and an unrelated error must not be able to imitate it and be reported as a missing table.
+    e.chain().any(|c| c.is::<dml::WrongCatalog>())
 }
 
 /// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]

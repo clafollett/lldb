@@ -285,18 +285,24 @@ async fn assert_catalog_columns_unchanged(url: &str) -> Result<()> {
     .await
     .context("reading iceberg_tables' columns")?;
     pool.close().await;
-    assert_eq!(
-        names,
-        vec![
-            "catalog_name",
-            "iceberg_type",
-            "metadata_location",
-            "previous_metadata_location",
-            "table_name",
-            "table_namespace",
-        ],
-        "iceberg-catalog-sql changed the catalog table; dml.rs's commit binds these by name"
-    );
+    // Assert the columns the commit *depends on* are present, not that the set is exactly this.
+    // An upstream release that adds a column is backward-compatible and must not fail CI; one that
+    // renames or removes a column this CAS binds by name genuinely breaks the commit, and that is
+    // what this catches. Testing the intersection tests the contract; testing equality tests the
+    // upstream's changelog.
+    for required in [
+        "catalog_name",
+        "table_namespace",
+        "table_name",
+        "metadata_location",
+        "previous_metadata_location",
+    ] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "iceberg-catalog-sql no longer has `{required}` on iceberg_tables; dml.rs's commit \
+             binds it by name. Columns present: {names:?}"
+        );
+    }
     Ok(())
 }
 
