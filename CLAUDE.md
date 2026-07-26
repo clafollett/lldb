@@ -49,12 +49,14 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`),
   virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`),
   the cross-query result cache (`result_cache.rs`), the one-query pipeline both front ends share
-  (`engine.rs`), admission control (`scheduler.rs`), query history (`query_log.rs`) and the
-  long-running coordinator (`server.rs`)
+  (`engine.rs`), admission control (`scheduler.rs`), query history (`query_log.rs`), the
+  long-running coordinator (`server.rs`), and access control — identity and credentials
+  (`auth.rs`) plus grants and the plan-time check (`rbac.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
-  migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse) and
-  `lldb-qe-server` (the long-running query scheduler)
+  migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
+  `lldb-qe-auth` (users, API keys, roles, grants) and `lldb-qe-server` (the long-running query
+  scheduler — the *only* binary here that authenticates)
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
 - `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
   worker-fleet cluster
@@ -119,6 +121,42 @@ where transactions and constraints arbitrate instead of hope. Two rules:
 Passwords are never logged: `ServicesArgs` has a hand-written redacting `Debug`, and every
 message naming a connection URL goes through `services::redact_url` first.
 
+## Access control: proven identity, checked at plan time
+
+`lldb-qe-server` is the front door and the only binary that authenticates. A request carries
+`authorization: Bearer <token>` in the **gRPC metadata, never in the ticket** (a ticket is logged,
+hashed and cached; a secret must be in none of those). The token names a user, the user's roles
+carry grants, and every object the query's *logical* plan touches is checked before it is staged or
+dispatched — and, critically, **before the result cache is consulted**, since a cached row is still
+tenant data. Four rules follow:
+
+1. **The account is derived from the credential, never claimed.** The ticket's `account` field
+   survives only as an assertion: if it disagrees with the token's, the request is denied.
+2. **Auth follows the services DB.** No `--metadata-*` → no accounts, no keys, no grants, so
+   nothing is enforced; that is the supported single-node mode and `cargo run` must never need
+   Postgres. With one, a credential is required unless `--allow-anonymous` is set (it warns on
+   every startup, and it never upgrades a *bad* token to a good one).
+3. **Fail closed on anything we cannot name.** DDL, `COPY TO`, `DESCRIBE` and unknown plan
+   extensions are refused rather than allowed — there is no privilege that describes what
+   `CREATE EXTERNAL TABLE '/etc/'` touches.
+4. **Tokens are SHA-256, deliberately not argon2/bcrypt.** A 256-bit CSPRNG token has nothing to
+   guess, so a KDF buys no security and costs a dependency plus per-request CPU. Constant-time
+   compare, prefix lookup, and the token is stored nowhere — printed once, at creation.
+
+Two boundaries, two claims. The **coordinator** proves "you are user X of tenant Y". A **worker**
+only proves membership of the deployment: `LLDB_FLEET_TOKEN`, constant-time compared, required if
+set and open-with-a-loud-warning if not. Per-request identity at the worker boundary is a follow-on,
+not something this already does.
+
+Be honest about the limit: `iceberg_tables` is owned by `iceberg-catalog-sql` and is **not**
+partitioned by account, so tenant isolation over table data is what the grant check enforces and
+nothing else. Physically separate per-account catalogs are their own issue.
+
+The other operator binaries — `lldb-qe-coordinator`, `lldb-qe-warehouse`, `lldb-qe-auth`,
+`lldb-qe-migrate` — are **not** access-controlled and cannot usefully be: their credential is the
+services database's own, and whoever holds that can grant themselves anything. Do not expose them
+as a multi-tenant entry point; expose `lldb-qe-server`.
+
 ## The result cache is keyed, never invalidated
 
 `result_cache.rs` answers a repeat query from Postgres instead of the fleet. Its key is
@@ -171,6 +209,22 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test dml_snap
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test query_scheduler
+# Accounts, API keys, roles, grants. Same operator-tool posture as `lldb-qe-warehouse`: its
+# credential IS the Postgres password, so treat that as the deployment's root credential. The token
+# `key create` prints is shown exactly once and stored nowhere.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb@localhost/lldb user create --name alice
+cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb@localhost/lldb key create --user alice --name cli
+cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb@localhost/lldb \
+  grant --role analyst --privilege SELECT --object-type namespace --object-name lldb.sales
+cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb@localhost/lldb show
+
+# Authentication, RBAC and tenant isolation end-to-end: the issue's three "done when" bullets as
+# actual assertions, plus the worker fleet-secret boundary. Same three-way gating.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test auth_rbac
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```

@@ -52,8 +52,17 @@
 //! startup and logs its id. That is the hook every later control-plane feature hangs off: a
 //! warehouse, a query-history row and a grant all need to know *whose* they are, and resolving
 //! it once at startup means the rest of the process can carry an id rather than re-deriving a
-//! name. Enforcement — refusing to touch another tenant's data — lands with accounts/RBAC
-//! (#19); this only establishes the identity.
+//! name.
+//!
+//! **This binary is deliberately not access-controlled**, and that is worth being explicit about
+//! now that access control exists. `--account` still names any tenant, and no API key is required.
+//! The reason is that it cannot meaningfully be otherwise: reaching the control plane at all
+//! requires `--metadata-url`, i.e. the services database's own credentials, and anyone holding
+//! those can issue themselves a key with every grant in one command. So it is classed with
+//! `lldb-qe-warehouse` and `lldb-qe-auth` — an operator tool whose credential is the database
+//! password — rather than with `lldb-qe-server`, which is the authenticated, per-user,
+//! grant-checked front door (see [`lldb_qe_core::server`]). Do not expose this binary as a
+//! multi-tenant entry point; expose the server.
 //!
 //! With **no** services database configured the coordinator behaves exactly as it always has.
 //! A checkout, a laptop, and a single-node demo have no control plane to talk to, and requiring
@@ -298,11 +307,17 @@ async fn main() -> Result<()> {
     // Answer from the result cache when every input is unchanged; otherwise plan, distribute and
     // run. Both the policy and the cache live in `engine`, so this binary and `lldb-qe-server`
     // cannot drift apart on either one.
+    // `None` for the authorization: this binary is an *operator tool*, not a multi-tenant entry
+    // point. It already needs the services-database credentials to resolve `--account` at all, so
+    // whoever runs it can grant themselves anything anyway — checking grants here would be theatre.
+    // The authenticated, access-controlled front door is `lldb-qe-server`; see
+    // [`lldb_qe_core::server`] and the `Tenancy` section above.
     let batches = execute_query_cached(
         &ctx,
         result_cache.as_ref(),
         &lakehouses,
         account_id,
+        None,
         &cli.sql,
         &fleet,
     )

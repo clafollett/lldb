@@ -19,3 +19,5 @@ tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
+# `lldb-qe-auth` turns `--expires-in-days` into a timestamp.
+chrono.workspace = true

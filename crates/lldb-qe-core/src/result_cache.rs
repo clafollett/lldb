@@ -158,6 +158,7 @@ use datafusion::sql::sqlparser::ast::Statement as SqlStatement;
 
 use crate::BUILD_VERSION;
 use crate::lakehouse::Lakehouse;
+use crate::rbac::QueryAuthorization;
 use crate::services::ServicesDb;
 
 /// Key-format version. Bumped if the *layout* of the key material ever changes, so entries
@@ -824,8 +825,8 @@ fn decode_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
 // The entry point
 // ---------------------------------------------------------------------------
 
-/// Plan `sql`, answer it from the cache if the inputs are unchanged, otherwise run `execute` and
-/// cache what it produced.
+/// Plan `sql`, authorize it, answer it from the cache if the inputs are unchanged, otherwise run
+/// `execute` and cache what it produced.
 ///
 /// This is the coordinator's query entry point. `execute` receives the logical plan and owns
 /// everything expensive — physical planning, the staging rewrite, fleet dispatch — so a cache hit
@@ -835,11 +836,22 @@ fn decode_batches(bytes: &[u8]) -> Result<Vec<RecordBatch>> {
 /// resolved, an uncacheable statement, an input we cannot version, a database that will not
 /// answer. The engine's behaviour without a services database is bit-for-bit what it was before
 /// this module existed.
+///
+/// # Why the authorization check lives in the *cache* module
+///
+/// It does not, really — [`crate::rbac`] owns the policy and this line only invokes it. But it has
+/// to be invoked *here*, and that is the interesting part: this function is the only place that
+/// holds a logical plan before anything else happens to it, and the check must **dominate the cache
+/// lookup**. A cached result is still that tenant's data; serving one to a caller whose grants were
+/// revoked yesterday would be exactly the leak the whole issue exists to close. So: plan,
+/// authorize, and only then look anything up. `authorization` is `None` when there is no services
+/// database — the single-node path, where there are no grants to consult.
 pub async fn execute_cached<F, Fut>(
     ctx: &SessionContext,
     cache: Option<&ResultCache>,
     lakehouses: &[Lakehouse],
     account_id: Option<i64>,
+    authorization: Option<&QueryAuthorization>,
     sql: &str,
     execute: F,
 ) -> Result<Vec<RecordBatch>>
@@ -861,6 +873,16 @@ where
         .statement_to_plan(statement.clone())
         .await
         .context("planning the query")?;
+
+    // Before the cache, before physical planning, before a single byte leaves this process.
+    if let Some(authorization) = authorization {
+        let options = state.config_options();
+        authorization.check_plan(
+            &plan,
+            &options.catalog.default_catalog,
+            &options.catalog.default_schema,
+        )?;
+    }
 
     let Some((cache, account_id)) = cache.zip(account_id) else {
         return execute(plan).await;

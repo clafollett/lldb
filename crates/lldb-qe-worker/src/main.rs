@@ -6,6 +6,16 @@
 //!   deployment the worker registers the object store so serialized plans whose scans use
 //!   `s3://…` resolve locally; for the default `local` backend nothing needs registering
 //!   (DataFusion's built-in `file://` store handles the embedded absolute paths).
+//!
+//! # Who may talk to this port
+//!
+//! A worker executes whatever physical plan it is handed, with whatever storage credentials it
+//! holds. `LLDB_FLEET_TOKEN` is what stops that being available to anyone who can route a packet
+//! here: set it to the same value on every coordinator and every worker and this port requires it,
+//! constant-time compared. Leave it unset and the port is open — which is what makes `cargo run -p
+//! lldb-qe-worker` work with no configuration, and which is warned about, loudly, on every startup.
+//! See [`lldb_qe_core::auth::FleetAuth`] for the scope of the claim a shared secret makes (it
+//! proves membership of a deployment, not the identity of a user).
 
 use std::net::SocketAddr;
 

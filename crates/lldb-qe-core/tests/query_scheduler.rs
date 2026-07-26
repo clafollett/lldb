@@ -20,6 +20,11 @@
 //! the distributed execution across in-process workers, the services database, every SQL
 //! statement, every state transition and every timestamp.
 //!
+//! Real, and new since #19: the server authenticates. The harness issues a real API key against a
+//! real `api_keys` row and every submission below presents it, because a coordinator with a
+//! services database refuses anything else — so this file also happens to prove that the scheduler
+//! and access control compose rather than fight.
+//!
 //! Faked: exactly one link — DNS. `analytics.lldb.local` does not resolve on a laptop, so the
 //! coordinator is given the same injected resolver `warehouse_routing.rs` uses, answering the
 //! warehouse's name with the addresses of the workers standing in for its tasks. That is
@@ -54,8 +59,9 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use lldb_qe_core::distributed::{GroupCount, extract_group_counts};
 use lldb_qe_core::engine::BoxResolver;
 use lldb_qe_core::query_log::{QueryRecord, QueryState, peak_concurrency};
+use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
 use lldb_qe_core::server::{
-    Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query,
+    Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query_as,
 };
 use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::{Warehouse, WarehouseState};
@@ -154,6 +160,9 @@ struct Harness {
     warehouse: String,
     url: String,
     coordinator: Arc<Coordinator>,
+    /// The API key every submission presents. Held once here rather than re-issued per query,
+    /// exactly as a real client would.
+    token: String,
     /// Kept alive so the seeded parquet outlives the queries reading it.
     _tmp: tempfile::TempDir,
 }
@@ -166,6 +175,32 @@ impl Harness {
 
         let account = db.create_account(&unique_name(tag)).await?;
         let warehouse_name = unique_name(&format!("wh-{tag}"));
+
+        // Identity, before anything else needs it. A user, a role that can read the test table and
+        // use the test warehouse, and one key. The grants are deliberately the *narrow* ones a real
+        // operator would write — `ALL ON CATALOG` would work too and would prove less.
+        let user = db.create_user(account.id, "scheduler-test").await?;
+        let role = db.create_role(account.id, "scheduler-test").await?;
+        db.assign_role(account.id, user.id, role.id).await?;
+        db.grant(
+            account.id,
+            role.id,
+            Privilege::Select,
+            &ObjectRef::table("datafusion", "public", "rows"),
+        )
+        .await?;
+        db.grant(
+            account.id,
+            role.id,
+            Privilege::Usage,
+            &ObjectRef::new(ObjectType::Warehouse, warehouse_name.clone())?,
+        )
+        .await?;
+        let (_key, token) = db
+            .create_api_key(account.id, user.id, "scheduler-test", None)
+            .await?;
+        let token = token.into_secret();
+
         let warehouse: Warehouse = db
             .create_warehouse(
                 account.id,
@@ -205,6 +240,9 @@ impl Harness {
                     max_concurrent_queries: None,
                     max_queued_queries: 64,
                     coordinator_id: format!("test-{}", addr),
+                    // Not `true`: this file's submissions all present a real key, so the
+                    // scheduler is exercised through the same authenticated path production uses.
+                    allow_anonymous: false,
                 },
             )
             .with_resolver(resolver),
@@ -223,6 +261,7 @@ impl Harness {
             warehouse: warehouse_name,
             url: format!("http://{addr}"),
             coordinator,
+            token,
             _tmp: tmp,
         })
     }
@@ -304,9 +343,12 @@ async fn concurrency_body(harness: &Harness) -> Result<()> {
     for i in 0..SUBMISSIONS {
         let url = harness.url.clone();
         let warehouse = harness.warehouse.clone();
+        let token = harness.token.clone();
         submissions.push(tokio::spawn(async move {
             let request = QueryRequest::new(workload(i)).on_warehouse(warehouse);
-            submit_query(&url, &request).await.map(|s| (i, s))
+            submit_query_as(&url, &request, Some(&token))
+                .await
+                .map(|s| (i, s))
         }));
     }
 
@@ -477,7 +519,10 @@ async fn failure_body(harness: &Harness) -> Result<()> {
     for i in 0..8usize {
         let url = harness.url.clone();
         let warehouse = harness.warehouse.clone();
-        // Two poisoned queries, enough to exhaust a limit-2 gate if slots leaked.
+        let token = harness.token.clone();
+        // Two poisoned queries, enough to exhaust a limit-2 gate if slots leaked. They fail in
+        // *planning* (the table does not exist), which is before authorization can have an opinion
+        // — so this still tests the queue rather than the grant check.
         let sql = if i == 2 || i == 5 {
             "SELECT * FROM no_such_table".to_string()
         } else {
@@ -485,7 +530,7 @@ async fn failure_body(harness: &Harness) -> Result<()> {
         };
         submissions.push(tokio::spawn(async move {
             let request = QueryRequest::new(sql).on_warehouse(warehouse);
-            (i, submit_query(&url, &request).await)
+            (i, submit_query_as(&url, &request, Some(&token)).await)
         }));
     }
 
@@ -520,7 +565,7 @@ async fn failure_body(harness: &Harness) -> Result<()> {
     // …and one more query goes straight through, which is the operational version of the same
     // claim: the server is still serving after the failures.
     let request = QueryRequest::new(workload(0)).on_warehouse(harness.warehouse.clone());
-    let after = submit_query(&harness.url, &request)
+    let after = submit_query_as(&harness.url, &request, Some(&harness.token))
         .await
         .context("the server must still serve after a failure")?;
     assert_eq!(rows_of(&after.batches)?, expected);
@@ -588,7 +633,7 @@ async fn shutdown_body(harness: &Harness) -> Result<()> {
     harness.coordinator.begin_shutdown();
 
     let request = QueryRequest::new(workload(0)).on_warehouse(harness.warehouse.clone());
-    let error = submit_query(&harness.url, &request)
+    let error = submit_query_as(&harness.url, &request, Some(&harness.token))
         .await
         .expect_err("a shutting-down coordinator must not start new work");
     let message = format!("{error:#}");
@@ -660,7 +705,7 @@ async fn abandonment_body(harness: &Harness) -> Result<()> {
 
     let request = QueryRequest::new(workload(0)).on_warehouse(harness.warehouse.clone());
     let query_id = {
-        let mut running = Box::pin(harness.coordinator.run_query(request));
+        let mut running = Box::pin(harness.coordinator.run_query(request, Some(&harness.token)));
         // Drive it until it is **parked in the line**, and wait for that specific signal rather
         // than for the history row to appear.
         //

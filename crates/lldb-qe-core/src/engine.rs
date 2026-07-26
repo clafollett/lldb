@@ -72,6 +72,7 @@ use crate::discovery::{discover_workers, discover_workers_with};
 use crate::flight::fetch_with_failover;
 use crate::lakehouse::Lakehouse;
 use crate::manifest::Manifest;
+use crate::rbac::QueryAuthorization;
 use crate::remote::FlightReaderExec;
 use crate::result_cache::{ResultCache, execute_cached};
 use crate::session::{build_session, register_tpch_parquet};
@@ -203,23 +204,29 @@ pub async fn execute_query(
     sql: &str,
     fleet: &[String],
 ) -> Result<Vec<RecordBatch>> {
-    execute_query_cached(ctx, None, &[], None, sql, fleet).await
+    execute_query_cached(ctx, None, &[], None, None, sql, fleet).await
 }
 
-/// Plan `sql`, answer it from `cache` when every input is unchanged, and otherwise distribute it
-/// across `fleet` and run it.
+/// Plan `sql`, refuse it if `authorization` does not cover what it touches, answer it from `cache`
+/// when every input is unchanged, and otherwise distribute it across `fleet` and run it.
 ///
 /// See the module docs for the distribute-vs-offload policy. This is the function both binaries
 /// call, and the only place that policy is written down in code.
 ///
-/// Every argument the cache needs is optional, and every "no" falls through to a normal execution:
-/// no cache configured, no account resolved, an uncacheable statement, an input with no snapshot.
-/// With `None`/`&[]`/`None` the behaviour is bit-for-bit what it was before the cache existed.
+/// Every argument the control plane supplies is optional, and every "no" falls through to a normal
+/// execution: no cache configured, no account resolved, no authorization to enforce, an uncacheable
+/// statement, an input with no snapshot. With `None`/`&[]`/`None`/`None` the behaviour is
+/// bit-for-bit what it was before either the cache or access control existed — which is what keeps
+/// the single-node, no-Postgres path alive.
+///
+/// The authorization check happens inside [`execute_cached`], not here, because it must run between
+/// planning and the cache lookup; see that function's docs for why that ordering is the whole point.
 pub async fn execute_query_cached(
     ctx: &SessionContext,
     cache: Option<&ResultCache>,
     lakehouses: &[Lakehouse],
     account_id: Option<i64>,
+    authorization: Option<&QueryAuthorization>,
     sql: &str,
     fleet: &[String],
 ) -> Result<Vec<RecordBatch>> {
@@ -228,37 +235,46 @@ pub async fn execute_query_cached(
     if fleet.is_empty() {
         bail!("cannot run a query with no workers");
     }
-    execute_cached(ctx, cache, lakehouses, account_id, sql, |logical| async {
-        // `INSERT` is a write, and it must not leave this process. It arrives here rather than
-        // through [`crate::dml`] because appends go through DataFusion (`IcebergTableProvider`
-        // implements `insert_into`), so it is an ordinary logical plan — just one that cannot be
-        // offloaded: the commit node `iceberg-datafusion` puts at its root carries a live catalog
-        // handle and a connection pool no codec can serialize, and shipping a commit to a worker
-        // would move the write's serialization point off the machine that owns the statement. It
-        // sits inside the cache closure because a write is never cacheable, so this is the one
-        // place it can be caught without planning the statement a second time.
-        if matches!(logical, LogicalPlan::Dml(_)) {
-            return ctx
-                .execute_logical_plan(logical)
-                .await?
-                .collect()
-                .await
-                .context("running the write");
-        }
+    execute_cached(
+        ctx,
+        cache,
+        lakehouses,
+        account_id,
+        authorization,
+        sql,
+        |logical| async {
+            // `INSERT` is a write, and it must not leave this process. It arrives here rather than
+            // through [`crate::dml`] because appends go through DataFusion
+            // (`IcebergTableProvider` implements `insert_into`), so it is an ordinary logical plan
+            // — just one that cannot be offloaded: the commit node `iceberg-datafusion` puts at its
+            // root carries a live catalog handle and a connection pool no codec can serialize, and
+            // shipping a commit to a worker would move the write's serialization point off the
+            // machine that owns the statement. It sits inside the cache closure because a write is
+            // never cacheable, so this is the one place it can be caught without planning the
+            // statement a second time.
+            if matches!(logical, LogicalPlan::Dml(_)) {
+                return ctx
+                    .execute_logical_plan(logical)
+                    .await?
+                    .collect()
+                    .await
+                    .context("running the write");
+            }
 
-        // `execute_logical_plan` rather than `create_physical_plan` straight off the logical plan:
-        // it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted through
-        // `--sql` still take effect. Those statements are never cacheable, so they reach here
-        // unchanged.
-        let plan = ctx
-            .execute_logical_plan(logical)
-            .await
-            .context("planning the query")?
-            .create_physical_plan()
-            .await
-            .context("building the physical plan")?;
-        run_on_fleet(ctx, plan, fleet).await
-    })
+            // `execute_logical_plan` rather than `create_physical_plan` straight off the logical
+            // plan: it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted
+            // through `--sql` still take effect. Those statements are never cacheable, so they
+            // reach here unchanged.
+            let plan = ctx
+                .execute_logical_plan(logical)
+                .await
+                .context("planning the query")?
+                .create_physical_plan()
+                .await
+                .context("building the physical plan")?;
+            run_on_fleet(ctx, plan, fleet).await
+        },
+    )
     .await
 }
 
