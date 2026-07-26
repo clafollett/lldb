@@ -5,11 +5,13 @@
 //! The pull shuffle ([`crate::flight`], [`crate::remote::FlightReaderExec`]) has every consumer
 //! open its own `do_get` against a producer, handing over the producer's serialized plan. The
 //! naive worker deserializes that plan and calls `plan.execute(partition, ..)` *per request*. So
-//! a partitioned hash join that fans a single map producer into `R` reduce stages — the
-//! [`crate::staging::distribute_hash_join`] shape, where all `R` reducers pull from one
-//! `Arc`-shared `left_map` / `right_map` wrapped in `FlightReaderExec`s that differ only in their
-//! `remote_partition` — makes that producer re-run its scan + partial aggregate `R` times. With
-//! `M` such producers the fleet pays an `M×R` blowup for what is logically one scan.
+//! a partitioned hash join that fans a single map producer into `R` reduce stages — the shuffle-seam
+//! shape [`crate::staging`] cuts, where all `R` reducers pull from one `Arc`-shared left/right map
+//! producer wrapped in `FlightReaderExec`s that differ only in their `remote_partition` — makes that
+//! producer re-run its scan + partial aggregate `R` times. With `M` such producers the fleet pays an
+//! `M×R` blowup for what is logically one scan. A broadcast join leans on the same mechanism from
+//! the other direction: its small build side is one stage that *every* join stage pulls, so
+//! replication costs one execution and `n` streams rather than `n` executions.
 //!
 //! # The fix: a per-stage materialization cache
 //!
@@ -46,6 +48,15 @@
 //! keeps a long-lived worker from accumulating every shuffle it has ever served in memory. This is
 //! deliberately the simplest policy that satisfies option (1) of the issue — no size accounting, no
 //! TTL; a reviewer weighing memory pressure should see [`StageCache::capacity`] as the single knob.
+//!
+//! ## What the counters are for
+//!
+//! [`StageCache::execution_count`] answers "did the producer run once?"; [`StageCache::rows_served`]
+//! answers "how much did we ship?". The second exists because a planner change can be *correct* and
+//! still move an order of magnitude more data — a broadcast join and a shuffled join produce the
+//! same rows and differ entirely in what crosses the wire. Both are worker-side facts, so tests
+//! that want to assert on data movement hold an `Arc<StageCache>` shared with the worker and read
+//! them after driving a query.
 
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;
@@ -117,6 +128,9 @@ pub struct StageCache {
     /// after a stage's `init` completes, inside the single-flight closure — so concurrent first-pulls
     /// of one stage bump it exactly once, and a failed materialization is not counted.
     materializations: AtomicUsize,
+    /// Rows this worker has actually streamed out to consumers, summed over every `do_get`.
+    /// See [`StageCache::rows_served`].
+    rows_served: AtomicUsize,
 }
 
 impl StageCache {
@@ -138,6 +152,7 @@ impl StageCache {
             }),
             capacity: capacity.max(1),
             materializations: AtomicUsize::new(0),
+            rows_served: AtomicUsize::new(0),
         }
     }
 
@@ -150,6 +165,27 @@ impl StageCache {
     /// "producer runs once" tests assert: `N` consumers of one stage leave this at `1`.
     pub fn execution_count(&self) -> usize {
         self.materializations.load(Ordering::SeqCst)
+    }
+
+    /// Rows this worker has streamed to consumers so far, across every stage and every `do_get`.
+    ///
+    /// This is the fleet's **data-movement** meter, and it answers a question `execution_count`
+    /// cannot: *how much did we actually ship?* Two plans for the same query can both execute one
+    /// stage per producer and still differ by orders of magnitude in bytes on the wire — a shuffled
+    /// join moves both sides, a broadcast join moves only the small one. Counting rows as they
+    /// leave the cache is the cheapest honest proxy for that, and it is what the broadcast-join test
+    /// asserts on: the large side never crosses the network at all.
+    ///
+    /// Counted at the point of streaming, so a stage that is materialized once but pulled `N` times
+    /// contributes `N` times — which is exactly right, since each pull is a real transfer.
+    pub fn rows_served(&self) -> usize {
+        self.rows_served.load(Ordering::SeqCst)
+    }
+
+    /// Record that `rows` rows were streamed to a consumer. Called by the Flight service as it
+    /// encodes each batch.
+    pub fn record_rows_served(&self, rows: usize) {
+        self.rows_served.fetch_add(rows, Ordering::SeqCst);
     }
 
     /// Number of stages currently cached (after any eviction). Exposed for tests of the eviction
@@ -345,6 +381,24 @@ mod tests {
             .get_or_materialize(1, || async { Ok(sample_stage()) })
             .await
             .unwrap();
+        assert_eq!(cache.execution_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn rows_served_accumulates_per_pull_not_per_materialization() {
+        let cache = StageCache::new();
+        assert_eq!(cache.rows_served(), 0);
+        cache
+            .get_or_materialize(1, || async { Ok(sample_stage()) })
+            .await
+            .unwrap();
+        // Materializing moves nothing on its own — only streaming does.
+        assert_eq!(cache.rows_served(), 0);
+
+        // Two consumers pull the same (single) materialization; both transfers are counted.
+        cache.record_rows_served(2);
+        cache.record_rows_served(3);
+        assert_eq!(cache.rows_served(), 5);
         assert_eq!(cache.execution_count(), 1);
     }
 

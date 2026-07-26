@@ -80,10 +80,22 @@ impl FlightReaderExec {
         inner: Arc<dyn ExecutionPlan>,
     ) -> Self {
         let schema = inner.schema();
+        // A remote read hands back the producer's partition batch-for-batch, in order — Flight is a
+        // stream, not a set — so whatever ordering the remote plan guarantees *within* a partition
+        // survives the hop. Carrying that ordering across keeps a consumer like
+        // `SortPreservingMergeExec` honest about what it is merging: without it a distributed sort
+        // would report its output as unordered even though every input stream is sorted. Only the
+        // ordering is carried, not partitioning — see below.
+        let eq = match inner.properties().output_ordering() {
+            Some(ordering) => {
+                EquivalenceProperties::new_with_orderings(schema, [ordering.iter().cloned()])
+            }
+            None => EquivalenceProperties::new(schema),
+        };
         // We surface exactly one partition: the single remote partition we were asked to read.
         // Batches arrive as the worker produces them, and a remote stream is finite.
         let properties = Arc::new(PlanProperties::new(
-            EquivalenceProperties::new(schema),
+            eq,
             Partitioning::UnknownPartitioning(1),
             EmissionType::Incremental,
             Boundedness::Bounded,
@@ -315,6 +327,45 @@ mod tests {
         );
         assert_eq!(reader.schema(), inner.schema());
         assert_eq!(reader.properties().partitioning.partition_count(), 1);
+    }
+
+    /// Order survives the hop, so the reader advertises it. A distributed sort leans on this: the
+    /// coordinator's `SortPreservingMergeExec` merges remote sorted runs, and a reader that claimed
+    /// no ordering would make the merged plan look unordered to anything inspecting it.
+    #[tokio::test]
+    async fn a_remote_read_carries_the_inner_plans_ordering() {
+        let ctx = SessionContext::new();
+        let unsorted = sample_plan(&ctx).await;
+        assert!(
+            unsorted.properties().output_ordering().is_none(),
+            "test setup: a bare scan has no ordering"
+        );
+        assert!(
+            FlightReaderExec::new("http://w:50051", 0, unsorted)
+                .properties()
+                .output_ordering()
+                .is_none(),
+            "no ordering to carry, none claimed"
+        );
+
+        let sorted = ctx
+            .sql("SELECT n FROM t ORDER BY n")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap();
+        let expected = sorted
+            .properties()
+            .output_ordering()
+            .expect("test setup: an ORDER BY plan is ordered")
+            .clone();
+        let reader = FlightReaderExec::new("http://w:50051", 0, sorted);
+        assert_eq!(
+            reader.properties().output_ordering(),
+            Some(&expected),
+            "the reader must advertise the producer's ordering"
+        );
     }
 
     #[tokio::test]
