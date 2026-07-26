@@ -232,9 +232,15 @@ async fn run_query(
         cache,
         lakehouses,
         account_id,
-        // No authorization to enforce: this file is about the cache, and the interaction between
-        // the two (the check must dominate the lookup) is asserted in `auth_rbac.rs`, where there
-        // are real grants to revoke.
+        // No authorization to enforce: this file is about the cache in isolation.
+        //
+        // The interaction between the two — that the grant check must dominate the cache lookup,
+        // so a revoked caller cannot be served a stored result — is **not** covered by any test,
+        // here or in `auth_rbac.rs`. It holds by construction (`execute_cached` checks before it
+        // looks up, see that function) and by review, which is weaker than a test and should be
+        // read as such. Proving it needs a cacheable query, which needs an Iceberg snapshot to
+        // version the inputs against; the tables in `auth_rbac.rs` are plain parquet and so
+        // nothing there is cacheable at all.
         None,
         sql,
         |logical| async move {
