@@ -47,12 +47,14 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
   (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
   config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`),
-  virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`)
-  the cross-query result cache (`result_cache.rs`)
+  virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`),
+  the cross-query result cache (`result_cache.rs`), the one-query pipeline both front ends share
+  (`engine.rs`), admission control (`scheduler.rs`), query history (`query_log.rs`) and the
+  long-running coordinator (`server.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
-  The coordinator package also builds the control-plane one-shots (`src/bin/`):
-  `lldb-qe-migrate` (applies the services-DB migrations) and `lldb-qe-warehouse`
-  (create/list/resize/suspend/resume a warehouse)
+  The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
+  migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse) and
+  `lldb-qe-server` (the long-running query scheduler)
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
 - `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
   worker-fleet cluster
@@ -155,10 +157,20 @@ cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   #
 # Result cache (`result_cache.rs`): proves a repeat query over unchanged tables executes nothing,
 # and that an Iceberg commit invalidates it. Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test result_cache_db
+
 # DML (`DELETE`/`UPDATE`) + the concurrent-writer race. Same three-way gating. The race test
 # asserts on the *data* (four writers, `qty = qty + 1`, final value must be exactly 4), so a lost
 # or double-applied commit fails it as a wrong number rather than as an error.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test dml_snapshots
+
+# Query scheduler. `lldb-qe-coordinator` runs ONE query and exits (compose and the cluster smoke
+# test depend on that, unchanged). `lldb-qe-server` is the long-running shape: concurrent
+# submissions over Arrow Flight, a bounded number running per warehouse, the rest queued, every
+# query recorded in `queries`. Admission control is per COORDINATOR PROCESS, not fleet-wide —
+# two servers on one warehouse each enforce their own limit (crates/lldb-qe-core/src/scheduler.rs).
+cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
+  --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test query_scheduler
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```

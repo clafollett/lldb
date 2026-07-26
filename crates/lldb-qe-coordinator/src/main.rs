@@ -18,20 +18,19 @@
 //! # Distribute vs. offload
 //!
 //! Once the fleet is known the coordinator builds the physical plan and hands it to
-//! [`plan_distributed`], which cuts *every* distribution boundary it recognizes — a `GROUP BY`, a
+//! `plan_distributed`, which cuts *every* distribution boundary it recognizes — a `GROUP BY`, a
 //! partitioned or broadcast join, a sort, a partitioned window — into a DAG of stages fanned across
-//! the fleet. One query can hold several: a join feeding an aggregate becomes join stages with
-//! aggregate stages layered on top. The policy: **distribute what can be distributed
-//! and reduce locally; offload a boundary-less plan whole to one worker.** Concretely — if the
-//! rewrite inserted any [`FlightReaderExec`] leaves, the plan is genuinely distributed and the
-//! coordinator runs it locally with `collect` (the leaves make the remote calls). If it did not
-//! (a constant query, a bare scan — nothing to shuffle), there is nothing to fan out, so the whole
-//! plan is shipped to one worker over Flight. That keeps simple queries exercising a real worker,
-//! which is exactly what the cross-container cluster smoke test relies on.
+//! the fleet. The policy — **distribute what can be distributed and reduce locally; offload a
+//! boundary-less plan whole to one worker** — and the failover behaviour of both paths live in
+//! [`lldb_qe_core::engine`], because there are now two front ends running queries and they must
+//! not drift: this one-shot binary and the long-running `lldb-qe-server`.
 //!
-//! Both paths tolerate losing a worker: the distributed one reassigns each stage through the
-//! fallbacks its [`FlightReaderExec`] leaves carry, and the offload path walks the fleet with
-//! `fetch_with_failover`. A query fails only once every healthy target has been tried.
+//! # One query, then exit
+//!
+//! That is this binary's whole contract, and it is deliberately unchanged. It needs no scheduler,
+//! writes no query history, and requires no services database — a checkout, a laptop and the
+//! cross-container smoke test all depend on that. Concurrency, admission control and query history
+//! are `lldb-qe-server`'s job; see [`lldb_qe_core::server`].
 //!
 //! # Writes are not distributed
 //!
@@ -42,6 +41,9 @@
 //! whereas a write fanned out would move a statement's commit off the machine that owns it — and
 //! for `INSERT` it does not even serialize, since `iceberg-datafusion`'s commit node holds a live
 //! catalog handle and connection pool. One statement, one committer. Reads are unchanged.
+//!
+//! The `INSERT` guard itself lives in [`lldb_qe_core::engine`], not here, so `lldb-qe-server`
+//! treats a write exactly the way this binary does.
 //!
 //! # Tenancy
 //!
@@ -88,21 +90,15 @@
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-use datafusion::logical_expr::LogicalPlan;
-use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
-use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::lakehouse::Lakehouse;
-use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    DEFAULT_WAREHOUSE_ENDPOINT, DmlOutcome, FlightReaderExec, ResultCacheArgs, ServicesArgs,
-    StorageArgs, StorageConfig, apply_manifest, build_session, discover_workers, dml,
-    execute_cached, fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
+    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, DmlOutcome, ResultCacheArgs, ServicesArgs,
+    StorageArgs, build_query_session, dml, execute_query_cached, init_tracing,
+    reject_inmemory_storage, resolve_fleet,
 };
 
 #[derive(Debug, Parser)]
@@ -183,13 +179,7 @@ async fn main() -> Result<()> {
     // The coordinator always ships plans to a separate worker process. The in-memory object
     // store lives in *this* process, so a remote worker can never see data written to it —
     // reject the combination up front instead of failing deep in a scan with an empty result.
-    if matches!(config, StorageConfig::InMemory) {
-        bail!(
-            "--storage memory can't be used with remote workers: the in-memory object store is \
-             per-process, so workers can't see the coordinator's data. Use `--storage local` \
-             (a shared filesystem) or `--storage s3`."
-        );
-    }
+    reject_inmemory_storage(&config)?;
 
     // Which endpoints to discover the fleet behind. `--workers` unless a warehouse says otherwise.
     let mut endpoints = cli.workers.clone();
@@ -266,27 +256,22 @@ async fn main() -> Result<()> {
         );
     }
 
-    let (ctx, storage) = build_session(config).await?;
-
     // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
     //
-    // The lakehouse handles are kept, not dropped, and now for two independent reasons — either
-    // alone is sufficient, so deleting one must not take the other with it. A DML statement
-    // commits *through the catalog* rather than through the DataFusion session, so it needs one.
-    // And they are the only thing that can answer "what snapshot is this table at", which is what
-    // makes a result-cache key safe to trust. The TPC-H seed registers plain-parquet listing
-    // tables, which have no snapshot — so that path yields no lakehouses, and nothing it can query
-    // is cacheable. That is the intended behaviour, not a gap.
-    let lakehouses = match &cli.manifest {
-        Some(path) => {
-            let manifest = Manifest::from_path(path)?;
-            apply_manifest(&ctx, &storage, &manifest).await?
-        }
-        None => {
-            register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?;
-            Vec::new()
-        }
+    // The lakehouse handles come back with the session, not dropped, and now for two independent
+    // reasons — either alone is sufficient, so deleting one must not take the other with it. A DML
+    // statement commits *through the catalog* rather than through the DataFusion session, so it
+    // needs one. And they are the only thing that can answer "what snapshot is this table at",
+    // which is what makes a result-cache key safe to trust. The TPC-H seed registers plain-parquet
+    // listing tables, which have no snapshot — so that path yields no lakehouses, and nothing it
+    // can query is cacheable. That is the intended behaviour, not a gap.
+    let catalog = match &cli.manifest {
+        Some(path) => CatalogSource::Manifest(path.clone()),
+        None => CatalogSource::Tpch {
+            subdir: cli.tpch_subdir.clone(),
+        },
     };
+    let (ctx, lakehouses) = build_query_session(config, &catalog).await?;
 
     // DELETE/UPDATE are answered here and return, before any worker is discovered. Distributing a
     // write would mean N processes racing to commit the same snapshot for one statement, which is
@@ -306,105 +291,20 @@ async fn main() -> Result<()> {
     }
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
-    // level is the operator-visible signal that scaling the ECS service actually changed the fleet.
-    let fleet = discover_workers(&endpoints)
-        .await
-        .context("discovering the worker fleet")?;
-    if fleet.is_empty() {
-        bail!("no workers discovered from {endpoints:?}: every endpoint resolved to nothing",);
-    }
-    tracing::info!(
-        fleet_size = fleet.len(),
-        workers = ?fleet,
-        "discovered worker fleet"
-    );
-    // Desired state (the warehouse row) versus observed state (what DNS answered). They diverge
-    // while a resize is rolling out, and — more importantly — they stay diverged forever if
-    // nobody applied the change, so an operator who resized and saw no speedup gets told why.
-    if let Some(size) = declared_size
-        && fleet.len() != size as usize
-    {
-        tracing::warn!(
-            declared_size = size,
-            fleet_size = fleet.len(),
-            "warehouse size does not match the fleet actually answering: the resize/resume may \
-             not have been applied to the compute yet"
-        );
-    }
+    // level is the operator-visible signal that scaling the ECS service actually changed the fleet,
+    // and `resolve_fleet` is also what warns when the warehouse row and the fleet disagree.
+    let fleet = resolve_fleet(&endpoints, declared_size, None).await?;
 
-    // Answer from the result cache when every input is unchanged; otherwise plan and run. The
-    // closure is everything a hit skips — physical planning, the staging rewrite, and every byte
-    // that would have crossed the wire.
-    let batches = execute_cached(
+    // Answer from the result cache when every input is unchanged; otherwise plan, distribute and
+    // run. Both the policy and the cache live in `engine`, so this binary and `lldb-qe-server`
+    // cannot drift apart on either one.
+    let batches = execute_query_cached(
         &ctx,
         result_cache.as_ref(),
         &lakehouses,
         account_id,
         &cli.sql,
-        |logical| async {
-            // `INSERT` is a write, and it must not leave this process. It arrives here rather
-            // than through `run_dml` because appends go through DataFusion
-            // (`IcebergTableProvider` implements `insert_into`), so it is an ordinary logical
-            // plan — just one that cannot be offloaded: the commit node `iceberg-datafusion`
-            // puts at its root carries a live catalog handle and a connection pool no codec can
-            // serialize, and shipping a commit to a worker would move the write's serialization
-            // point off the machine that owns the statement. It sits inside the cache closure
-            // because a write is never cacheable, so this is the one place it can be caught
-            // without planning the statement a second time.
-            if matches!(logical, LogicalPlan::Dml(_)) {
-                return ctx
-                    .execute_logical_plan(logical)
-                    .await?
-                    .collect()
-                    .await
-                    .context("running the write");
-            }
-
-            // `execute_logical_plan` rather than `create_physical_plan` straight off the logical
-            // plan: it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted
-            // through `--sql` still take effect. Those statements are never cacheable, so they
-            // reach here unchanged.
-            let plan = ctx
-                .execute_logical_plan(logical)
-                .await?
-                .create_physical_plan()
-                .await?;
-            // Rewrite the plan's distribution boundaries across the whole fleet.
-            let coordinated = plan_distributed(Arc::clone(&plan), &fleet)?;
-
-            // Policy: distribute what can be distributed and reduce locally; offload a
-            // boundary-less plan whole to one worker. `plan_distributed` returns the plan
-            // *unchanged* when there is no distribution boundary (a constant query, a bare scan),
-            // so detect "did it actually distribute" by looking for the FlightReaderExec leaves
-            // the rewrite inserts.
-            if contains_flight_reader(&coordinated) {
-                // Genuinely distributed: the coordinator runs the reduce side locally and its
-                // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight.
-                collect(coordinated, ctx.task_ctx())
-                    .await
-                    .context("running the distributed query across the fleet")
-            } else {
-                // Boundary-less: nothing to fan out. Collapse to a single output partition and
-                // ship the whole plan to one worker — this still exercises a real worker over
-                // Flight (what the cross-container cluster smoke test proves) instead of running
-                // everything locally.
-                //
-                // "One worker" is a placement, not a commitment: the plan is self-contained and
-                // the worker materializes it once by content hash, so any member of the fleet
-                // produces the same answer. `fetch_with_failover` therefore walks the fleet in
-                // order — a dead `fleet[0]` no longer fails a query that N-1 healthy workers
-                // could have served.
-                let plan = Arc::new(CoalescePartitionsExec::new(plan));
-                tracing::info!(
-                    worker = %fleet[0],
-                    fleet_size = fleet.len(),
-                    "no distribution boundary; offloading the whole plan to one worker (failing over across the fleet if it is lost)"
-                );
-                fetch_with_failover(&fleet, 0, plan)
-                    .await
-                    .context("running the query on a single worker")
-            }
-        },
+        &fleet,
     )
     .await?;
 
@@ -448,22 +348,4 @@ fn is_wrong_catalog(e: &anyhow::Error) -> bool {
     // lakehouse" versus "report the failure" — so a reworded error must not be able to change it,
     // and an unrelated error must not be able to imitate it and be reported as a missing table.
     e.chain().any(|c| c.is::<dml::WrongCatalog>())
-}
-
-/// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]
-/// actually cut a distribution boundary and inserted remote reads, rather than returning the plan
-/// unchanged.
-fn contains_flight_reader(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let mut found = false;
-    // `apply` is infallible here (the closure never errors), so the expect cannot fire.
-    plan.apply(|node| {
-        if node.as_any().downcast_ref::<FlightReaderExec>().is_some() {
-            found = true;
-            Ok(TreeNodeRecursion::Stop)
-        } else {
-            Ok(TreeNodeRecursion::Continue)
-        }
-    })
-    .expect("walking the plan for FlightReaderExec does not error");
-    found
 }
