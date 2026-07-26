@@ -64,6 +64,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -616,6 +617,28 @@ impl Coordinator {
 /// What a client sees in `queries.error` when it hung up before its query finished.
 const ABANDONED: &str = "the client disconnected before the query finished";
 
+/// Abandoned queries this process has successfully closed out, and the ones it could not.
+///
+/// A best-effort write issued from a destructor is the least observable thing in this module:
+/// nobody awaits it, no request fails when it does not happen, and the only trace it leaves is a
+/// log line. These make it countable — for an operator who wants to know whether clients are
+/// hanging up, and for the test that proves the guard actually fires. Process-wide rather than
+/// per-coordinator because that is the scope a destructor can reach.
+static ABANDONED_CLOSED: AtomicUsize = AtomicUsize::new(0);
+static ABANDONED_UNCLOSED: AtomicUsize = AtomicUsize::new(0);
+
+/// Abandoned queries whose history row this process managed to close out.
+pub fn abandoned_closed() -> usize {
+    ABANDONED_CLOSED.load(AtomicOrdering::Acquire)
+}
+
+/// Abandoned queries this process could **not** close out — no runtime left, or the write failed.
+/// A non-zero value here means history has rows stuck in `queued`/`running` that only a reaper
+/// will resolve.
+pub fn abandoned_unclosed() -> usize {
+    ABANDONED_UNCLOSED.load(AtomicOrdering::Acquire)
+}
+
 /// Closes out a query's history row if the request is dropped before it reaches a terminal state.
 ///
 /// A client that hangs up — Ctrl-C, a timeout, a closed tab — makes tonic drop the request future
@@ -661,6 +684,7 @@ impl Drop for ActiveQuery {
         }
         let (db, id) = (self.db.clone(), self.query_id);
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            ABANDONED_UNCLOSED.fetch_add(1, AtomicOrdering::AcqRel);
             tracing::warn!(
                 query_id = id,
                 "no runtime left to close out an abandoned query; the row stays active"
@@ -669,12 +693,18 @@ impl Drop for ActiveQuery {
         };
         tracing::info!(query_id = id, "query abandoned by its client; recording it");
         handle.spawn(async move {
-            if let Err(error) = db.mark_query_failed(id, ABANDONED).await {
-                tracing::warn!(
-                    query_id = id,
-                    error = %format!("{error:#}"),
-                    "could not record an abandoned query"
-                );
+            match db.mark_query_failed(id, ABANDONED).await {
+                Ok(_) => {
+                    ABANDONED_CLOSED.fetch_add(1, AtomicOrdering::AcqRel);
+                }
+                Err(error) => {
+                    ABANDONED_UNCLOSED.fetch_add(1, AtomicOrdering::AcqRel);
+                    tracing::warn!(
+                        query_id = id,
+                        error = %format!("{error:#}"),
+                        "could not record an abandoned query"
+                    );
+                }
             }
         });
     }

@@ -682,7 +682,9 @@ async fn abandonment_body(harness: &Harness) -> Result<()> {
     }; // <- the future is dropped here: exactly what tonic does when a client disconnects.
 
     // The terminal write is handed to the runtime by the guard's `Drop`, so it lands shortly after
-    // rather than synchronously. Poll for it rather than sleeping a guessed interval.
+    // rather than synchronously. Wait on the guard's own counters, not just on the row: if this
+    // ever fails, the counters say *which* half broke — a guard that never fired, versus a guard
+    // that fired and could not write — and that distinction is the whole diagnosis.
     let mut final_state = None;
     let deadline = std::time::Instant::now() + PATIENCE;
     while std::time::Instant::now() < deadline {
@@ -696,7 +698,15 @@ async fn abandonment_body(harness: &Harness) -> Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 
-    let record = final_state.context("the abandoned query was never closed out")?;
+    let record = final_state.with_context(|| {
+        format!(
+            "the abandoned query was never closed out (guard closed {}, failed to close {}) — \
+             if both are zero the guard never fired; if the second is non-zero it fired and the \
+             write failed",
+            lldb_qe_core::server::abandoned_closed(),
+            lldb_qe_core::server::abandoned_unclosed(),
+        )
+    })?;
     assert_eq!(
         record.state,
         QueryState::Failed,
