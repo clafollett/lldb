@@ -73,6 +73,30 @@ pub fn split_scan(
         .collect()
 }
 
+/// How many file-scan leaves `plan` contains.
+///
+/// [`split_scan`] slices exactly one scan, so a caller that wants to *choose* whether slicing
+/// applies — rather than call it and interpret the error — needs to ask first. The staging planner
+/// does exactly that: a multi-boundary plan has several scans, and only the sub-plans with exactly
+/// one are eligible for byte-range slicing (the rest are distributed by other means, or left
+/// local). Keeping the question here, next to the answer, stops that predicate from drifting away
+/// from what [`split_scan`] actually accepts.
+///
+/// Note this counts scans *in the local plan tree*: a [`crate::remote::FlightReaderExec`] is a
+/// leaf, so scans inside a remote stage are invisible — which is the right answer, since they are
+/// not this plan's IO to slice.
+pub fn file_scan_count(plan: &Arc<dyn ExecutionPlan>) -> usize {
+    let mut n = 0;
+    plan.apply(|node| {
+        if file_scan_config(node).is_some() {
+            n += 1;
+        }
+        Ok(TreeNodeRecursion::Continue)
+    })
+    .expect("counting walk does not error");
+    n
+}
+
 /// Collect the file groups of the plan's single scan leaf, erroring on zero or many scans.
 fn find_scan_file_groups(plan: &Arc<dyn ExecutionPlan>) -> Result<Vec<FileGroup>> {
     let mut scans: Vec<Vec<FileGroup>> = Vec::new();
@@ -307,8 +331,37 @@ mod tests {
             .await?;
 
         let plan = scan_plan(&ctx, "SELECT a.n FROM a JOIN b ON a.n = b.n").await;
-        let err = split_scan(plan, 2).expect_err("two scans is unsupported");
+        let err = split_scan(Arc::clone(&plan), 2).expect_err("two scans is unsupported");
         assert!(err.to_string().contains("file-scan leaves"), "got: {err}");
+        // The same fact, asked as a question instead of caught as an error — this is how the
+        // staging planner decides *not* to try slicing.
+        assert_eq!(file_scan_count(&plan), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_scan_count_sees_one_scan_and_no_scan() -> Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let path = seed_parquet(tmp.path(), 64)?;
+        let ctx = SessionContext::new();
+        ctx.register_parquet(
+            "nums",
+            path.to_str().unwrap(),
+            ParquetReadOptions::default(),
+        )
+        .await?;
+        let plan = scan_plan(&ctx, "SELECT n FROM nums").await;
+        assert_eq!(file_scan_count(&plan), 1);
+
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )?;
+        let table = MemTable::try_new(schema, vec![vec![batch]])?;
+        ctx.register_table("mem", Arc::new(table))?;
+        let mem = scan_plan(&ctx, "SELECT n FROM mem").await;
+        assert_eq!(file_scan_count(&mem), 0, "a MemTable is not a file scan");
         Ok(())
     }
 }

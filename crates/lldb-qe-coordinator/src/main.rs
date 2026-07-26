@@ -18,8 +18,10 @@
 //! # Distribute vs. offload
 //!
 //! Once the fleet is known the coordinator builds the physical plan and hands it to
-//! [`plan_distributed`], which rewrites distribution boundaries (a `GROUP BY`, a partitioned join)
-//! into map/reduce stages fanned across the fleet. The policy: **distribute what can be distributed
+//! [`plan_distributed`], which cuts *every* distribution boundary it recognizes — a `GROUP BY`, a
+//! partitioned or broadcast join, a sort, a partitioned window — into a DAG of stages fanned across
+//! the fleet. One query can hold several: a join feeding an aggregate becomes join stages with
+//! aggregate stages layered on top. The policy: **distribute what can be distributed
 //! and reduce locally; offload a boundary-less plan whole to one worker.** Concretely — if the
 //! rewrite inserted any [`FlightReaderExec`] leaves, the plan is genuinely distributed and the
 //! coordinator runs it locally with `collect` (the leaves make the remote calls). If it did not
