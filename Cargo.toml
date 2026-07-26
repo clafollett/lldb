@@ -50,6 +50,11 @@ tokio-stream = { version = "0.1", features = ["net"] }
 tonic = "0.14"
 futures = "0.3"
 
+# --- Services DB (metadata/catalog/accounts): pinned to sqlx 0.8 because
+# `iceberg-catalog-sql` 0.10 (issue #8) depends on sqlx ^0.8.1 — one sqlx tree-wide.
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "chrono"] }
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+
 # --- Errors, logging, small utils ---
 anyhow = "1"
 thiserror = "2"

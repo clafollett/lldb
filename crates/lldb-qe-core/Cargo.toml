@@ -27,6 +27,8 @@ url.workspace = true
 serde.workspace = true
 toml.workspace = true
 clap.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
