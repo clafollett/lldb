@@ -90,15 +90,6 @@ use tokio::sync::OnceCell;
 use crate::manifest::CatalogBackend;
 use crate::services::{ServicesArgs, redact_url};
 
-/// How many times [`Lakehouse::open_sql`] will try before reporting a failure.
-///
-/// Bounded, and deliberately blind: the only failure it exists to absorb — two processes racing
-/// `CREATE TABLE IF NOT EXISTS` on a fresh database — arrives as an error with no message to
-/// match on, and sniffing a dependency's error text for a Postgres SQLSTATE would be a worse bug
-/// than the one it fixes. Opening a catalog is a connect plus two DDL statements, so a genuine
-/// bad-URL or bad-credentials failure pays 150ms before reporting itself unchanged.
-const BOOTSTRAP_ATTEMPTS: u32 = 3;
-
 /// An Iceberg catalog plus the glue to create tables and expose them to DataFusion.
 ///
 /// Generic over the DataFusion catalog name; namespaces and tables are passed per call, so a
@@ -173,46 +164,62 @@ impl Lakehouse {
     /// which is worth knowing when a worker reports a table that "does not exist".
     pub async fn open_sql(catalog_name: &str, catalog_uri: &str, warehouse: &str) -> Result<Self> {
         let warehouse_uri = normalize_warehouse_uri(warehouse);
-        // Validated up front so a bad dialect fails immediately rather than three times over;
-        // recomputed per attempt below because `SqlBindStyle` is neither `Copy` nor `Clone`.
+        // Validated up front so a bad URI fails before any connection attempt; recomputed per
+        // attempt below because `SqlBindStyle` is neither `Clone` nor `Copy` and the function is a
+        // cheap pure mapping over the scheme.
         sql_bind_style_for(catalog_uri)?;
         ensure_sql_driver_compiled(catalog_uri)?;
         let storage = storage_factory_for(&warehouse_uri)?;
 
-        let mut last_error = None;
-        let mut catalog = None;
-        for attempt in 0..BOOTSTRAP_ATTEMPTS {
-            match SqlCatalogBuilder::default()
-                .with_storage_factory(storage.clone())
+        // Opening is retried, and the reason is subtle enough to be worth stating: `SqlCatalog::new`
+        // bootstraps its schema with `CREATE TABLE IF NOT EXISTS` on *every* open, and in
+        // PostgreSQL that statement is **not atomic** against a concurrent copy of itself. Two
+        // processes opening the same catalog at the same moment on a fresh database can both pass
+        // the existence check, and the loser fails inserting the table's row type:
+        //
+        //     duplicate key value violates unique constraint "pg_type_typname_nsp_index"
+        //
+        // This is exactly the shape a fleet produces — compose starts a coordinator and its workers
+        // together, and each opens the catalog — so leaving it would mean a cluster that comes up
+        // fine most of the time and fails to start occasionally, which is the worst kind of bug to
+        // debug from a log. The bootstrap is idempotent, so retrying is safe and the second attempt
+        // finds the tables already there.
+        //
+        // Only *this* error is retried. Everything else (bad URI, auth, unreachable host) fails on
+        // the first attempt with its own message, because retrying those would just delay a clear
+        // answer three times over.
+        let mut attempt = 0;
+        let catalog = loop {
+            let result = SqlCatalogBuilder::default()
+                .with_storage_factory(Arc::clone(&storage))
                 .uri(catalog_uri)
                 .warehouse_location(warehouse_uri.clone())
                 .sql_bind_style(sql_bind_style_for(catalog_uri)?)
                 .load(catalog_name, HashMap::new())
-                .await
-            {
-                Ok(c) => {
-                    catalog = Some(c);
-                    break;
+                .await;
+            match result {
+                Ok(catalog) => break catalog,
+                Err(err)
+                    if attempt < CATALOG_BOOTSTRAP_ATTEMPTS && is_concurrent_bootstrap(&err) =>
+                {
+                    attempt += 1;
+                    tracing::debug!(
+                        catalog = catalog_name,
+                        attempt,
+                        "another process was bootstrapping the catalog schema; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
                 }
-                Err(e) => {
-                    last_error = Some(e);
-                    if attempt + 1 < BOOTSTRAP_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_millis(50) * (attempt + 1)).await;
-                    }
-                }
-            }
-        }
-        let catalog = match catalog {
-            Some(c) => c,
-            None => {
                 // The URI is redacted for the same reason every services-DB message redacts it: a
                 // connection failure is the error most likely to be pasted into a ticket.
-                let err = last_error.expect("a failed loop leaves an error");
-                return Err(anyhow::Error::new(err).context(format!(
-                    "opening sql catalog `{catalog_name}` at {} (warehouse {warehouse_uri}) \
-                     after {BOOTSTRAP_ATTEMPTS} attempts",
-                    redact_url(catalog_uri)
-                )));
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "opening sql catalog `{catalog_name}` at {} (warehouse {warehouse_uri})",
+                            redact_url(catalog_uri)
+                        )
+                    });
+                }
             }
         };
         Ok(Self {
@@ -415,6 +422,26 @@ fn table_creation(name: &str, arrow_schema: &ArrowSchema) -> Result<TableCreatio
         .schema(ice_schema)
         .properties(HashMap::new())
         .build())
+}
+
+/// How many times to re-attempt a catalog open that lost the `CREATE TABLE IF NOT EXISTS` race.
+///
+/// Small on purpose: the race is resolved the instant the winner commits, so one retry almost
+/// always suffices and a large budget would only slow down a genuine failure.
+const CATALOG_BOOTSTRAP_ATTEMPTS: u32 = 3;
+
+/// True if this error is the non-atomic `CREATE TABLE IF NOT EXISTS` race described in
+/// [`Lakehouse::open_sql`], rather than something worth surfacing.
+///
+/// Matched on the message because that is the only thing available: the failure arrives as an
+/// `iceberg::Error` that has already rendered its sqlx cause to a string, so there is no SQLSTATE
+/// left to inspect. The trade is acceptable here in a way it would not be for classifying
+/// behaviour permanently — the operation being retried is idempotent, the budget is three, and the
+/// worst case of a missed match is the same error the caller would have seen anyway.
+fn is_concurrent_bootstrap(err: &iceberg::Error) -> bool {
+    let message = err.to_string();
+    message.contains("duplicate key value violates unique constraint")
+        && (message.contains("pg_type") || message.contains("pg_class"))
 }
 
 /// The scheme of a URI, lowercased — `postgres://a/b` → `postgres`, `sqlite:x.db` → `sqlite`,

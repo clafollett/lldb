@@ -45,6 +45,7 @@ pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
 pub mod remote;
+pub mod result_cache;
 pub mod retry;
 pub mod scan_split;
 pub mod services;
@@ -69,6 +70,9 @@ pub use manifest::{
     TableSource,
 };
 pub use remote::{FlightReaderExec, LldbCodec};
+pub use result_cache::{
+    ResultCache, ResultCacheArgs, ResultCacheConfig, ResultCacheKey, TableInput, execute_cached,
+};
 pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
