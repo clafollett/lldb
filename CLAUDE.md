@@ -1,7 +1,18 @@
 # lldb — build notes for Claude
 
-Distributed analytical query engine: DataFusion + Arrow Flight + Iceberg on object storage.
-Learning-grade POC. Trunk-based — commit working milestones straight to `main`.
+Distributed analytical query engine: DataFusion + Arrow Flight + Iceberg on object storage — a
+rudimentary cloud data warehouse. It **began** as a learning-grade POC and is now maturing into a
+real system: the distributed-execution core (scan slicing, a staging planner, a materialize-once
+shuffle, fleet discovery) is in place, and the roadmap ahead is production-track — a Postgres
+services DB (metadata/catalog/accounts), virtual warehouses, RBAC, a query scheduler, fault
+tolerance, DML. Treat the code as production-track, not throwaway; the "POC" label describes where
+it started, not where it is.
+
+## Workflow — branch and PR, keep `main` releasable
+
+Development is **not** trunk-direct anymore. Every change lands through: a feature branch
+(`claude/issue-<n>-<slug>`) → a pull request → review (Copilot at minimum) → green CI →
+squash-merge to `main`. `main` stays releasable at all times. Never push code straight to `main`.
 
 ## Version pins — do NOT bump independently
 
@@ -16,6 +27,14 @@ Learning-grade POC. Trunk-based — commit working milestones straight to `main`
 
 Coordinator and workers must run the identical build — serialized DataFusion plans are not
 cross-version compatible. Bumping DataFusion to 54 waits on `iceberg-datafusion` 0.11.
+
+This cap is a standing **strategic constraint**, not a passing note: several roadmap items live
+under it. Do NOT add a dependency that pulls in a second `arrow` / `object_store` / `datafusion`
+version — vet every new crate with `cargo tree -d` before committing. One version tree-wide is what
+keeps the Flight plan-serialization boundary working. The path past the wall is `iceberg-datafusion`
+0.11 (which unlocks DataFusion 54); until then, prefer designs that don't require it, and if a
+must-have crate would force a second version, stop and treat it as its own scoped decision rather
+than bumping.
 
 Every binary is stamped with `version+git-sha` (workspace version + the commit, injected by
 `lldb-qe-core/build.rs`): both binaries report it via `--version` and a startup log line, so an
