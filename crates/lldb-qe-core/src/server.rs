@@ -1028,16 +1028,32 @@ impl FlightService for CoordinatorFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        // The credential is read from the metadata and never from the ticket. A header this server
-        // cannot parse is treated as *absent* rather than rejected here, so that "you sent no
-        // credential" and "you sent a malformed one" produce the same single refusal from
-        // [`Coordinator::authenticate`] instead of two differently-shaped ones.
-        let credential = request
-            .metadata()
-            .get(AUTHORIZATION_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| bearer_token(value).ok())
-            .map(str::to_string);
+        // The credential is read from the metadata and never from the ticket.
+        //
+        // A header that is *present but unparseable* is refused here rather than folded into
+        // `None`. Folding looks harmless — under the default posture both end in the same
+        // `UNAUTHENTICATED` — but under `--allow-anonymous` `None` means "run as nobody, with
+        // nothing checked", so a corrupted or mistyped token would silently stop being a
+        // credential and its caller would be served as anonymous while believing it was
+        // authenticated and scoped. Losing an identity quietly is worse than being told the
+        // token is bad.
+        let credential = match request.metadata().get(AUTHORIZATION_HEADER) {
+            None => None,
+            Some(value) => Some(
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| bearer_token(value).ok())
+                    .ok_or_else(|| {
+                        Status::unauthenticated(
+                            "unauthenticated: the `authorization` header is not a usable \
+                             `Bearer <token>` value. Send a valid API key, or send no header at \
+                             all — a credential this server cannot read is never treated as one",
+                        )
+                    })?
+                    .to_string(),
+            ),
+        };
 
         let ticket = request.into_inner();
         let query = decode_query_ticket(&ticket.ticket)

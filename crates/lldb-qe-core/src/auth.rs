@@ -597,9 +597,12 @@ impl ServicesDb {
             return Err(AuthError::Invalid);
         };
 
-        // One statement rather than three round trips: the caller needs the key, the user and the
-        // account, and splitting them would open a window in which the key is valid and the user
-        // has since been disabled.
+        // **One statement, and that is a correctness requirement rather than an optimization.**
+        // The digest and the revoked/expired/disabled flags must come from the same snapshot: read
+        // the status first and the digest second, and a key revoked between the two reads is
+        // authenticated against a stale "not revoked" — the request is accepted precisely because
+        // it raced the revocation that was meant to stop it. One row, one point in time, one
+        // decision.
         let row = sqlx::query_as::<
             _,
             (
@@ -609,12 +612,13 @@ impl ServicesDb {
                 String,
                 i64,
                 String,
+                String,
                 Option<DateTime<Utc>>,
                 Option<DateTime<Utc>>,
                 Option<DateTime<Utc>>,
             ),
         >(
-            "SELECT k.id, k.name, k.user_id, u.name, a.id, a.name, \
+            "SELECT k.id, k.name, k.user_id, u.name, a.id, a.name, k.token_hash, \
                     k.revoked_at, k.expires_at, u.disabled_at \
                FROM api_keys k \
                JOIN users u ON u.id = k.user_id \
@@ -635,6 +639,7 @@ impl ServicesDb {
             user_name,
             account_id,
             account_name,
+            token_hash,
             revoked_at,
             expires_at,
             disabled_at,
@@ -643,16 +648,9 @@ impl ServicesDb {
             return Err(AuthError::Invalid);
         };
 
-        // The digest fetched separately and compared in constant time. Selected on its own so the
-        // hash never travels alongside the identity fields into a log line built from that tuple.
-        let stored: (String,) = sqlx::query_as("SELECT token_hash FROM api_keys WHERE id = $1")
-            .bind(key_id)
-            .fetch_one(self.pool())
-            .await
-            .map_err(|e| {
-                AuthError::Unavailable(anyhow::Error::new(e).context("reading the API key digest"))
-            })?;
-        if !verify_token(presented, &stored.0) {
+        // Prove possession first, in constant time, and only then look at status — so the reasons
+        // below are only ever disclosed to someone who actually holds the key.
+        if !verify_token(presented, &token_hash) {
             return Err(AuthError::Invalid);
         }
 

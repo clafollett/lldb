@@ -299,6 +299,28 @@ fn query(tenant: &Tenant, table: &str) -> QueryRequest {
 /// "ask for a grant" (`PERMISSION_DENIED`) and "file a bug" (`INTERNAL`) are three different
 /// actions, and a test that reads only the message text cannot tell them apart — so it would keep
 /// passing if every refusal silently became an internal error.
+/// Submit with an arbitrary raw `authorization` value, bypassing `bearer_header`.
+///
+/// The point is to send things a cooperating client never would — a wrong scheme, an empty
+/// bearer, a stray header — because that is precisely what the folding bug accepted.
+async fn raw_status_of(url: &str, request: &QueryRequest, raw: &str) -> tonic::Status {
+    let channel = tonic::transport::Channel::from_shared(url.to_string())
+        .expect("valid url")
+        .connect()
+        .await
+        .expect("connect");
+    let mut client = FlightServiceClient::new(channel);
+    let mut grpc = tonic::Request::new(Ticket {
+        ticket: encode_query_ticket(request).into(),
+    });
+    grpc.metadata_mut()
+        .insert(AUTHORIZATION_HEADER, raw.parse().expect("header value"));
+    match client.do_get(grpc).await {
+        Ok(_) => tonic::Status::ok("the request succeeded"),
+        Err(status) => status,
+    }
+}
+
 async fn status_of(url: &str, request: &QueryRequest, token: Option<&str>) -> tonic::Status {
     let channel = tonic::transport::Channel::from_shared(url.to_string())
         .expect("valid url")
@@ -878,5 +900,74 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
         matches!(secret.check(None), Err(AuthError::Missing)),
         "a closed worker reports an absent credential as `Missing`, which maps to UNAUTHENTICATED"
     );
+    Ok(())
+}
+
+/// Under `--allow-anonymous`, a header that is present but unusable must still be refused.
+///
+/// This is the one case where folding "cannot parse it" into "did not send one" actually costs
+/// something. With anonymous access permitted, `None` means *run with nothing checked* — so a
+/// mistyped or truncated token would quietly stop being a credential and its caller would be
+/// served as anonymous while believing it was authenticated and scoped to its account. It is not
+/// an escalation (that caller could have sent no header at all and got the same access); it is
+/// the silent loss of an identity someone intended to present, which is harder to notice and
+/// harder to debug.
+///
+/// The catalog here is deliberately empty, so an *accepted* request fails later in planning. That
+/// makes the assertion sharp: `UNAUTHENTICATED` means the credential was judged, anything else
+/// means it got past identity.
+#[tokio::test]
+async fn a_malformed_credential_is_refused_even_when_anonymous_is_allowed() -> Result<()> {
+    let Some((db, _target)) = db_or_skip("anonymous").await? else {
+        return Ok(());
+    };
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let coordinator = Arc::new(Coordinator::new(
+        SessionContext::new(),
+        Some(db.clone()),
+        CoordinatorConfig {
+            workers: vec!["http://127.0.0.1:1".to_string()],
+            allow_anonymous: true,
+            coordinator_id: format!("anon-test-{addr}"),
+            ..CoordinatorConfig::default()
+        },
+    ));
+    assert!(
+        !coordinator.requires_authentication(),
+        "the flag is the whole point of this test"
+    );
+    tokio::spawn(async move {
+        serve_coordinator(listener, coordinator, std::future::pending::<()>())
+            .await
+            .expect("coordinator serve");
+    });
+    let url = format!("http://{addr}");
+    let request = QueryRequest::new("SELECT * FROM rows");
+
+    // Sending nothing is allowed, so it must get *past* identity and fail on the query itself.
+    let anonymous = status_of(&url, &request, None).await.code();
+    assert_ne!(
+        anonymous,
+        tonic::Code::Unauthenticated,
+        "with --allow-anonymous, a request carrying no credential must not be refused for identity"
+    );
+
+    // Sending something unusable must not be quietly downgraded to that.
+    for raw in [
+        "Bearer",                     // scheme, no token
+        "Bearer ",                    // scheme, empty token
+        "Basic dXNlcjpwYXNzd29yZA==", // the wrong scheme entirely
+        "lldb_looks_like_a_token_but_has_no_scheme",
+        "  ",
+    ] {
+        let code = raw_status_of(&url, &request, raw).await.code();
+        assert_eq!(
+            code,
+            tonic::Code::Unauthenticated,
+            "`{raw}` was accepted as anonymous instead of being refused (got {code:?})"
+        );
+    }
     Ok(())
 }
