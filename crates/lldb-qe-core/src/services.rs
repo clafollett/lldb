@@ -24,10 +24,14 @@
 //! everything else hangs off. The migration also creates `users`, `warehouses` and `queries` as
 //! deliberately thin stubs, because their foreign keys to `accounts` are what make "an account
 //! scopes a warehouse" a schema-enforced fact rather than a convention. Later issues own their
-//! columns — the Iceberg SQL catalog (#8) brings its own tables through
-//! `iceberg-catalog-sql`, virtual warehouses (#16) fill in `warehouses`, query history (#18)
-//! fills in `queries`, and accounts/RBAC (#19) fills in `users` and starts *enforcing* the
-//! tenancy this issue only records.
+//! columns — virtual warehouses (#16) fill in `warehouses`, query history (#18) fills in
+//! `queries`, and accounts/RBAC (#19) fills in `users` and starts *enforcing* the tenancy this
+//! issue only records.
+//!
+//! The Iceberg SQL catalog (#8) also lives in this database, but **not** in this schema:
+//! `iceberg-catalog-sql` creates and owns `iceberg_tables` and `iceberg_namespace_properties`
+//! itself, so they are deliberately absent from `migrations/`. Two owners for one table is how
+//! a schema ends up half-migrated — see [`crate::lakehouse`].
 //!
 //! # Migrations are an explicit step, never startup magic
 //!
@@ -211,6 +215,29 @@ impl ServicesArgs {
         url.query_pairs_mut()
             .append_pair("sslmode", &self.metadata_sslmode);
         Ok(Some(url.into()))
+    }
+
+    /// Build these args from the process environment alone, with no command line in sight.
+    ///
+    /// Every field already carries an `env =` fallback, so this is just clap applying them —
+    /// which means the environment is read *exactly* the way the binaries read it, defaults and
+    /// all, instead of a second hand-rolled copy of the same rules that could drift.
+    ///
+    /// This exists for the one caller that is not a CLI: a manifest declaring a `sql` catalog
+    /// with no `uri` (see [`crate::manifest::CatalogBackend::Sql`]). A manifest is
+    /// config-as-data that lives in git, so it must not carry a password; the fleet's already
+    /// configured `LLDB_METADATA_*` is where that credential belongs.
+    pub fn from_env() -> Result<Self> {
+        /// A throwaway [`clap::Parser`] whose only job is to give the flattened args an
+        /// argv to be absent from, so only the `env =` fallbacks and defaults apply.
+        #[derive(clap::Parser)]
+        struct EnvOnly {
+            #[command(flatten)]
+            services: ServicesArgs,
+        }
+        let parsed = <EnvOnly as clap::Parser>::try_parse_from(["lldb"])
+            .context("reading services-database settings (LLDB_METADATA_*) from the environment")?;
+        Ok(parsed.services)
     }
 
     /// Connect to the configured services database, or `Ok(None)` when there isn't one.
@@ -563,6 +590,22 @@ mod tests {
         assert!(rendered.contains(REDACTED), "{rendered}");
         // Still useful for diagnosis: the non-secret parts survive.
         assert!(rendered.contains("db.internal"), "{rendered}");
+    }
+
+    #[test]
+    fn from_env_reads_the_same_variables_the_binaries_do() -> Result<()> {
+        // Deliberately no env mutation: `set_var` is `unsafe` in edition 2024 and would race the
+        // other tests sharing this process. So assert the invariant that holds either way —
+        // reading the environment always parses — plus, when the environment really is clean,
+        // that it resolves to the legal "no services database" state.
+        let args = ServicesArgs::from_env()?;
+        let configured = ["LLDB_METADATA_URL", "LLDB_METADATA_HOST"]
+            .iter()
+            .any(|key| std::env::var(key).is_ok_and(|v| !v.trim().is_empty()));
+        if !configured {
+            assert_eq!(args.resolve_url()?, None);
+        }
+        Ok(())
     }
 
     #[test]
