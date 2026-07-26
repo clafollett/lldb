@@ -384,8 +384,21 @@ impl Coordinator {
             }
         };
         let query_id = record.as_ref().map(|r| r.id);
+        // From here on the row is active, and everything below is awaited — so everything below is
+        // a point at which this whole future can be dropped, taking the terminal write with it.
+        // The guard is what closes that hole; see [`ActiveQuery`].
+        let active = self
+            .db
+            .clone()
+            .zip(query_id)
+            .map(|(db, id)| ActiveQuery::new(db, id));
 
         let result = self.run_admitted(&target, &request.sql, query_id).await;
+        // Reached only if we were not cancelled, and every path inside `run_admitted` has already
+        // written a terminal state — so the guard has nothing left to do.
+        if let Some(active) = active {
+            active.finished();
+        }
         if let Err(error) = &result {
             tracing::warn!(
                 query_id = ?query_id,
@@ -597,6 +610,73 @@ impl Coordinator {
                 "could not record the query's failure"
             );
         }
+    }
+}
+
+/// What a client sees in `queries.error` when it hung up before its query finished.
+const ABANDONED: &str = "the client disconnected before the query finished";
+
+/// Closes out a query's history row if the request is dropped before it reaches a terminal state.
+///
+/// A client that hangs up — Ctrl-C, a timeout, a closed tab — makes tonic drop the request future
+/// wherever it happens to be awaiting. Without this, the `queued` or `running` row written on the
+/// way in is simply never updated: `list_active_queries` accumulates rows that will never finish,
+/// and the sweep-line over history that this server's concurrency is *verified* with starts
+/// counting phantom queries. The instrument would drift precisely under the conditions you most
+/// want to trust it.
+///
+/// `Drop` cannot await and the terminal write is a database round trip, so the write is handed to
+/// the runtime instead. That makes it best effort — exactly like every other history write after
+/// acceptance, for the same reason: a database hiccup must not be able to take the server with it.
+/// `Handle::try_current` rather than a bare `tokio::spawn` because dropping after the runtime has
+/// gone (shutdown, a test) would otherwise panic in a destructor.
+///
+/// Rows abandoned by a *coordinator that dies outright* are still not covered — nothing in-process
+/// can be. That is what the `coordinator` column is for, and a reaper remains future work.
+struct ActiveQuery {
+    db: ServicesDb,
+    query_id: i64,
+    finished: bool,
+}
+
+impl ActiveQuery {
+    fn new(db: ServicesDb, query_id: i64) -> Self {
+        Self {
+            db,
+            query_id,
+            finished: false,
+        }
+    }
+
+    /// The query reached a terminal state under its own power; stand down.
+    fn finished(mut self) {
+        self.finished = true;
+    }
+}
+
+impl Drop for ActiveQuery {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+        let (db, id) = (self.db.clone(), self.query_id);
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            tracing::warn!(
+                query_id = id,
+                "no runtime left to close out an abandoned query; the row stays active"
+            );
+            return;
+        };
+        tracing::info!(query_id = id, "query abandoned by its client; recording it");
+        handle.spawn(async move {
+            if let Err(error) = db.mark_query_failed(id, ABANDONED).await {
+                tracing::warn!(
+                    query_id = id,
+                    error = %format!("{error:#}"),
+                    "could not record an abandoned query"
+                );
+            }
+        });
     }
 }
 

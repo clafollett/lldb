@@ -221,10 +221,13 @@ impl Admission {
             Err(TryAcquireError::NoPermits) => {}
         }
 
-        // Full. Take a place in line, or be turned away.
-        self.reserve_queue_slot()?;
+        // Full. Take a place in line, or be turned away. The place is a guard for exactly the
+        // reason the slot is — the await below is a cancellation point. See [`QueuePlace`].
+        let place = self.reserve_queue_slot()?;
         let permit = Arc::clone(&self.permits).acquire_owned().await;
-        self.queued.fetch_sub(1, Ordering::AcqRel);
+        // Given back explicitly rather than at end of scope, so a snapshot taken between here and
+        // `occupy` can never count one query as queued *and* running.
+        drop(place);
         match permit {
             Ok(permit) => Ok(self.occupy(permit)),
             // `close()` was called while we waited: the coordinator is going away.
@@ -264,7 +267,7 @@ impl Admission {
     /// Take a place in the queue, or refuse. The compare-and-swap is what keeps the cap exact
     /// under a simultaneous burst — a plain `load` then `store` would let `N` submitters all read
     /// `max_queued - 1` and all decide there was room.
-    fn reserve_queue_slot(self: &Arc<Self>) -> Result<(), AdmissionError> {
+    fn reserve_queue_slot(self: &Arc<Self>) -> Result<QueuePlace, AdmissionError> {
         let previous = self
             .queued
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
@@ -273,7 +276,9 @@ impl Admission {
         match previous {
             Ok(previous) => {
                 self.peak_queued.fetch_max(previous + 1, Ordering::AcqRel);
-                Ok(())
+                Ok(QueuePlace {
+                    admission: Arc::clone(self),
+                })
             }
             Err(_) => {
                 self.refused.fetch_add(1, Ordering::AcqRel);
@@ -301,6 +306,31 @@ impl Admission {
         AdmissionError::ShuttingDown {
             warehouse: self.warehouse.clone(),
         }
+    }
+}
+
+/// A place in a warehouse's queue, given back when this is dropped.
+///
+/// The counterpart to [`QuerySlot`], and it exists for the same reason at a different point in the
+/// query's life. Waiting for a permit is an await, and an await is a cancellation point: a client
+/// that hangs up while its query is queued causes tonic to drop the request future exactly there.
+/// A bare `queued -= 1` written after that await would simply never run.
+///
+/// The consequence would be unusually nasty for a counter. `queued` never decreases back, so the
+/// cap in [`Admission::reserve_queue_slot`] refuses more and more submissions with `QueueFull`
+/// while the line is genuinely empty — a server that gets progressively less useful and finally
+/// refuses everything, with no failing test, nothing in the logs, and an admission snapshot that
+/// says it is busy while it does nothing at all.
+///
+/// Like [`QuerySlot`], it deliberately has no `release()`: dropping is the only way to give a
+/// place back, so there is no path on which a caller can forget.
+struct QueuePlace {
+    admission: Arc<Admission>,
+}
+
+impl Drop for QueuePlace {
+    fn drop(&mut self) {
+        self.admission.queued.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -744,5 +774,46 @@ mod tests {
             late.acquire().await,
             Err(AdmissionError::ShuttingDown { .. })
         ));
+    }
+
+    /// A client that hangs up while queued must give its place in line back.
+    ///
+    /// This is the queue's version of the permit leak, and it is the more insidious of the two,
+    /// because nothing observable goes wrong at the moment it happens — the counter is simply one
+    /// too high forever. Repeat it and the cap refuses live traffic while the line is empty.
+    #[tokio::test]
+    async fn a_waiter_that_goes_away_gives_its_place_in_line_back() {
+        let admission = Admission::new("analytics", limits(1, 2));
+        // Fill the only slot, so anything else has to queue.
+        let _running = admission
+            .acquire()
+            .await
+            .expect("the first query is admitted");
+
+        {
+            let mut waiting = Box::pin(admission.acquire());
+            // Poll once so it gets past `try_acquire` and takes a place in line.
+            assert!(
+                futures::poll!(&mut waiting).is_pending(),
+                "the only permit is held, so this must queue"
+            );
+            assert_eq!(admission.snapshot().queued, 1);
+        } // <- dropped here: exactly what tonic does to a request whose client disconnected.
+
+        assert_eq!(
+            admission.snapshot().queued,
+            0,
+            "a cancelled waiter's place must be given back"
+        );
+        // The peak is history and stays: it records that someone *did* wait.
+        assert_eq!(admission.snapshot().peak_queued, 1);
+
+        // And the cap is intact rather than permanently one shorter — the whole point. Two fresh
+        // waiters must still both fit, which they could not if the place had leaked.
+        let mut first = Box::pin(admission.acquire());
+        let mut second = Box::pin(admission.acquire());
+        assert!(futures::poll!(&mut first).is_pending());
+        assert!(futures::poll!(&mut second).is_pending());
+        assert_eq!(admission.snapshot().queued, 2);
     }
 }
