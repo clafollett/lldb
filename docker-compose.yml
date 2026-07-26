@@ -1,11 +1,12 @@
 # A whole lldb cluster on one host, to prove the distributed communication path end-to-end:
-# a MinIO object store (the S3 warehouse), a Postgres services database (the control plane), a
-# fleet of stateless workers, and a coordinator that ships a physical plan to a worker over
-# Arrow Flight and prints the result.
+# a MinIO object store (the S3 warehouse), a Postgres services database (the control plane), two
+# *virtual warehouses* worth of stateless workers, and a coordinator that ships a physical plan
+# over Arrow Flight and prints the result.
 #
-# Startup order is a chain of conditions, not sleeps: minio → minio-setup, postgres → db-migrate,
-# and every lldb role waits for db-migrate to *exit successfully*. Migrations are a one-shot step
-# on purpose — see the docs on `lldb-qe-migrate` for why a fleet must not migrate itself.
+# Startup order is a chain of conditions, not sleeps: minio → minio-setup, postgres → db-migrate
+# → warehouse-setup, and every lldb role waits for those one-shots to *exit successfully*.
+# Migrations are a one-shot step on purpose — see the docs on `lldb-qe-migrate` for why a fleet
+# must not migrate itself.
 #
 #   docker compose up --build            # bring the cluster up; coordinator prints a result
 #   docker compose run --rm coordinator lldb-qe-coordinator --workers http://worker-1:50051 \
@@ -14,6 +15,30 @@
 #
 # The default coordinator query is a constant, so the cluster proves cross-container transport
 # without needing seeded data; point --manifest at real S3 data to run real queries.
+#
+# ---- Virtual warehouses, locally -----------------------------------------------------------
+#
+# Two named pools of compute over the *same* MinIO warehouse and the same catalog: `analytics`
+# (worker-1 + worker-2) and `etl` (worker-etl). Each is registered under a Docker **network
+# alias** equal to its name, which is the local stand-in for Cloud Map: resolving `analytics`
+# returns every container carrying that alias, exactly as `analytics.lldb.local` returns every
+# task in that ECS service. So the coordinator's routing code is identical in both places — only
+# the endpoint template differs (`http://{warehouse}:50051` here, `<name>.lldb.local` on ECS).
+#
+#   # route a query to a specific warehouse (resolved in Postgres, then discovered by DNS)
+#   docker compose run --rm coordinator lldb-qe-coordinator --warehouse etl \
+#     --manifest /manifests/empty.toml --sql "SELECT 42"
+#
+#   # the lifecycle: the CLI writes desired state, compose applies it
+#   docker compose run --rm warehouse-setup lldb-qe-warehouse list
+#   docker compose run --rm warehouse-setup lldb-qe-warehouse resize --name etl --size 3
+#   docker compose up -d --scale worker-etl=3          # ← apply it; parallelism changes, no rebuild
+#   docker compose run --rm warehouse-setup lldb-qe-warehouse suspend --name etl
+#   docker compose up -d --scale worker-etl=0          # ← apply it; the compute is freed
+#
+# That two-step is the design, not an omission: the services database holds *desired* state and
+# something else actuates it (compose here, `aws ecs update-service` or a deploy on AWS). The
+# engine carries no orchestrator SDK — see crates/lldb-qe-core/src/warehouse.rs for why.
 #
 # Image/version knobs (both optional):
 #   LLDB_IMAGE  — tag every service runs (default lldb:latest). CI prebuilds a cached, versioned
@@ -53,6 +78,12 @@ x-metadata-env: &metadata-env
   LLDB_METADATA_USER: lldb
   LLDB_METADATA_PASSWORD: lldb
   LLDB_METADATA_SSLMODE: disable
+
+# How `--warehouse <name>` becomes an address here. Compose's DNS serves bare network aliases
+# with no namespace suffix, so the template has no `.lldb.local` — the CDK stack sets
+# `http://{warehouse}.lldb.local:50051` for the same flag. One template, two spellings of DNS.
+x-warehouse-env: &warehouse-env
+  LLDB_WAREHOUSE_ENDPOINT: http://{warehouse}:50051
 
 services:
   # The shared services database: accounts today, the Iceberg SQL catalog and query history next.
@@ -95,6 +126,29 @@ services:
       postgres:
         condition: service_healthy
 
+  # One-shot: declare the two demo warehouses in the control plane, then exit.
+  #
+  # `--if-not-exists` is what makes this safe on every `up`: it returns the existing warehouse
+  # *unchanged*, so a rerun cannot undo a resize or resume something an operator suspended. The
+  # sizes here must match the container counts below — that correspondence is the thing an
+  # operator maintains by hand, and the coordinator logs a warning when they drift.
+  warehouse-setup:
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        lldb-qe-warehouse create --name analytics --size 2 --if-not-exists &&
+        lldb-qe-warehouse create --name etl --size 1 --if-not-exists &&
+        lldb-qe-warehouse list
+    environment:
+      <<: *metadata-env
+      RUST_LOG: info
+    depends_on:
+      db-migrate:
+        condition: service_completed_successfully
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -123,6 +177,11 @@ services:
       echo 'bucket ready';
       "
 
+  # ---- Warehouse `analytics`: two workers -----------------------------------------------------
+  # Both carry the network alias `analytics`, so Docker's DNS answers that name with *both*
+  # container IPs — one A-record per "task", which is what `discover_workers` fans a plan across.
+  # They keep their own service names too, because addressing one worker directly is still how
+  # the cross-container smoke test proves the transport.
   worker-1:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
@@ -132,6 +191,9 @@ services:
     # catalog rows the coordinator planned against.
     environment:
       <<: [*s3-env, *metadata-env]
+    networks:
+      default:
+        aliases: [analytics]
     depends_on:
       minio-setup:
         condition: service_completed_successfully
@@ -152,10 +214,38 @@ services:
     # catalog rows the coordinator planned against.
     environment:
       <<: [*s3-env, *metadata-env]
+    networks:
+      default:
+        aliases: [analytics]
     depends_on:
       minio-setup:
         condition: service_completed_successfully
       db-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  # ---- Warehouse `etl`: one worker, independently sized ---------------------------------------
+  # Deliberately a *scalable* service (no fixed container_name, no published port), so
+  # `docker compose up -d --scale worker-etl=3` is the local equivalent of an ECS desired-count
+  # change: three containers, all aliased `etl`, and the next query fans across all three with no
+  # rebuild and no restart of anything else. That is "resizing changes parallelism" on a laptop.
+  worker-etl:
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
+    command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
+    environment:
+      <<: [*s3-env, *metadata-env]
+    networks:
+      default:
+        aliases: [etl]
+    depends_on:
+      minio-setup:
+        condition: service_completed_successfully
+      warehouse-setup:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "50051"]
@@ -176,7 +266,7 @@ services:
       - "--sql"
       - "SELECT 42 AS answer, 'distributed hello' AS greeting"
     environment:
-      <<: [*s3-env, *metadata-env]
+      <<: [*s3-env, *metadata-env, *warehouse-env]
     volumes:
       - ./manifests:/manifests:ro
     depends_on:
@@ -185,6 +275,10 @@ services:
       worker-2:
         condition: service_healthy
       db-migrate:
+        condition: service_completed_successfully
+      # So that `docker compose run --rm coordinator lldb-qe-coordinator --warehouse etl …`
+      # always finds the warehouse rows already declared.
+      warehouse-setup:
         condition: service_completed_successfully
 
 # Named so the control plane survives `docker compose down` (but not `down -v`, which is what

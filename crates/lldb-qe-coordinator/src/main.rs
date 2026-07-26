@@ -41,6 +41,22 @@
 //! A checkout, a laptop, and a single-node demo have no control plane to talk to, and requiring
 //! one would mean `cargo run` needs Postgres.
 //!
+//! # Warehouse routing
+//!
+//! `--warehouse <NAME>` (`LLDB_WAREHOUSE`) runs the query on a named [virtual
+//! warehouse](lldb_qe_core::warehouse) instead of on whatever `--workers` points at. The
+//! coordinator resolves `(account, name)` in the services database, refuses a **suspended**
+//! warehouse with an error naming the resume command, and renders that warehouse's own endpoint
+//! from `--warehouse-endpoint` (default `http://{warehouse}.lldb.local:50051`) — one fan-out
+//! point per warehouse, discovered exactly like any other. Routing to the wrong pool is therefore
+//! impossible without a DNS answer that lies.
+//!
+//! The flag is **opt-in and unset by default**, which is the whole compatibility story: without
+//! it — and in particular with no services database at all — `--workers` is used verbatim and
+//! nothing here needs Postgres. Passing `--warehouse` without a services database is an error
+//! rather than a fallback, because there is nowhere to look the warehouse up and silently
+//! querying *some* fleet would be worse than stopping.
+//!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
 use std::path::PathBuf;
@@ -54,8 +70,9 @@ use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig, apply_manifest, build_session,
-    discover_workers, fetch, init_tracing, plan_distributed, register_tpch_parquet,
+    DEFAULT_WAREHOUSE_ENDPOINT, FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig,
+    apply_manifest, build_session, discover_workers, fetch, init_tracing, plan_distributed,
+    register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -94,6 +111,25 @@ struct Cli {
     #[arg(long, env = "LLDB_ACCOUNT", default_value = "default")]
     account: String,
 
+    /// Virtual warehouse to run on. When set, it is resolved in the services database (under
+    /// `--account`) and *replaces* `--workers`: the query fans across that warehouse's fleet and
+    /// no other. A suspended warehouse is refused. Unset — the default — means "use `--workers`",
+    /// which is how every pre-warehouse deployment keeps working.
+    #[arg(long, env = "LLDB_WAREHOUSE")]
+    warehouse: Option<String>,
+
+    /// Template for a warehouse's Flight endpoint; `{warehouse}` is replaced with its name.
+    /// Comma-separated for a warehouse reachable under several names. Only used with
+    /// `--warehouse`. Cloud Map spells this `<name>.lldb.local`; a compose network alias is a
+    /// bare `<name>`, hence a template rather than a hard-coded pattern.
+    #[arg(
+        long,
+        env = "LLDB_WAREHOUSE_ENDPOINT",
+        value_delimiter = ',',
+        default_value = DEFAULT_WAREHOUSE_ENDPOINT
+    )]
+    warehouse_endpoint: Vec<String>,
+
     #[command(flatten)]
     storage: StorageArgs,
 
@@ -122,6 +158,13 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Which endpoints to discover the fleet behind. `--workers` unless a warehouse says otherwise.
+    let mut endpoints = cli.workers.clone();
+    // The warehouse's declared size, kept so the discovered fleet can be compared against it — a
+    // mismatch means the desired state in Postgres has not been applied to the compute yet, which
+    // is the one failure mode this "database is desired state" design can produce.
+    let mut declared_size: Option<i32> = None;
+
     // Resolve the tenant, if there is a control plane to resolve it against. A missing account is
     // an error naming the tool that creates one — a silent fallback would let a typo run a query
     // under nobody's identity, which is precisely the bug #19's enforcement has to rule out.
@@ -138,7 +181,47 @@ async fn main() -> Result<()> {
             account_id = account.id,
             "resolved tenant"
         );
+
+        // Then the warehouse, if one was asked for. Resolution is scoped by the account id, so
+        // another tenant's identically-named warehouse is simply not visible from here.
+        if let Some(name) = &cli.warehouse {
+            let warehouse = db
+                .warehouse_by_name(account.id, name)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "warehouse `{name}` does not exist for account `{}`; create it with \
+                         `lldb-qe-warehouse create --account {} --name {name} --size 2`",
+                        account.name, account.name
+                    )
+                })?;
+            // `endpoint` is what refuses a suspended warehouse — the guard lives on the type, so
+            // it cannot be forgotten by a second caller.
+            endpoints = cli
+                .warehouse_endpoint
+                .iter()
+                .map(|template| warehouse.endpoint(template))
+                .collect::<Result<Vec<_>>>()?;
+            declared_size = Some(warehouse.size);
+            tracing::info!(
+                warehouse = %warehouse.name,
+                warehouse_id = warehouse.id,
+                size = warehouse.size,
+                state = %warehouse.state,
+                endpoints = ?endpoints,
+                "routing to warehouse"
+            );
+        }
+
         db.close().await;
+    } else if let Some(name) = &cli.warehouse {
+        // No control plane, so there is nothing that knows what `name` means. Say that, rather
+        // than falling back to `--workers` and running the query on a fleet nobody chose.
+        bail!(
+            "--warehouse {name} needs a services database to resolve the warehouse in: set \
+             --metadata-url (LLDB_METADATA_URL), or --metadata-host (LLDB_METADATA_HOST) plus \
+             the other --metadata-* parts. Without one, use --workers directly."
+        );
     }
 
     let (ctx, storage) = build_session(config).await?;
@@ -154,20 +237,30 @@ async fn main() -> Result<()> {
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
     // level is the operator-visible signal that scaling the ECS service actually changed the fleet.
-    let fleet = discover_workers(&cli.workers)
+    let fleet = discover_workers(&endpoints)
         .await
         .context("discovering the worker fleet")?;
     if fleet.is_empty() {
-        bail!(
-            "no workers discovered from --workers {:?}: every endpoint resolved to nothing",
-            cli.workers
-        );
+        bail!("no workers discovered from {endpoints:?}: every endpoint resolved to nothing",);
     }
     tracing::info!(
         fleet_size = fleet.len(),
         workers = ?fleet,
         "discovered worker fleet"
     );
+    // Desired state (the warehouse row) versus observed state (what DNS answered). They diverge
+    // while a resize is rolling out, and — more importantly — they stay diverged forever if
+    // nobody applied the change, so an operator who resized and saw no speedup gets told why.
+    if let Some(size) = declared_size
+        && fleet.len() != size as usize
+    {
+        tracing::warn!(
+            declared_size = size,
+            fleet_size = fleet.len(),
+            "warehouse size does not match the fleet actually answering: the resize/resume may \
+             not have been applied to the compute yet"
+        );
+    }
 
     // Build the physical plan, then rewrite its distribution boundaries across the whole fleet.
     let plan = ctx.sql(&cli.sql).await?.create_physical_plan().await?;
