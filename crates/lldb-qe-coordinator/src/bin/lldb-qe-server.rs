@@ -28,6 +28,20 @@
 //!
 //! With no `--metadata-*` it still runs; it just has no accounts, no warehouses and no history —
 //! the same bargain every other binary here strikes (see CLAUDE.md).
+//!
+//! # Security posture
+//!
+//! This is the one binary in the repo that is meant to face people who are not operators, so it is
+//! the one that authenticates. With a services database configured, every submission needs
+//! `authorization: Bearer <token>` and is checked against its account's grants before it is
+//! dispatched; the design is on [`lldb_qe_core::auth`] and [`lldb_qe_core::rbac`]. Without one, it
+//! is wide open by construction — there are no accounts to be. Whichever it is, it says so at
+//! startup, because a posture nobody logged is a posture nobody chose.
+//!
+//! Two things this does *not* do, and a deployment must: terminate TLS in front of this port (a
+//! bearer token on a plaintext channel is replayable by anyone on the path), and set
+//! `LLDB_FLEET_TOKEN` to the same value here and on every worker, so the workers this server
+//! dispatches to refuse plans from anyone else.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -112,6 +126,15 @@ struct Cli {
     #[arg(long, env = "LLDB_COORDINATOR_ID")]
     coordinator_id: Option<String>,
 
+    /// Serve requests that carry **no API key**, even though a services database is configured.
+    ///
+    /// The migration hatch, and nothing more: adding a control plane and issuing the first key are
+    /// two deploys, and a cluster that is unqueryable in between is a cluster nobody upgrades. A
+    /// server started with this warns on every startup. A request that *does* carry a key is still
+    /// verified — a permissive flag must never turn a bad credential into a good one.
+    #[arg(long, env = "LLDB_ALLOW_ANONYMOUS")]
+    allow_anonymous: bool,
+
     #[command(flatten)]
     storage: StorageArgs,
 
@@ -183,6 +206,7 @@ async fn main() -> Result<()> {
             max_concurrent_queries: cli.max_concurrent_queries,
             max_queued_queries: cli.max_queued_queries,
             coordinator_id: coordinator_id.clone(),
+            allow_anonymous: cli.allow_anonymous,
         },
     );
     // The result cache is shared by every query this process serves, keyed by the account resolved
@@ -195,6 +219,8 @@ async fn main() -> Result<()> {
         coordinator = coordinator.with_result_cache(cache, lakehouses);
     }
     let coordinator = Arc::new(coordinator);
+    // Before the port is served, and unconditionally: whichever posture this is, it is stated.
+    coordinator.log_posture();
     tracing::info!(
         addr = %addr,
         coordinator_id = %coordinator_id,

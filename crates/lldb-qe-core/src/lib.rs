@@ -19,6 +19,8 @@
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
+//! | [`auth`]         | Who is asking: API keys, users, principals — and the fleet secret     | 5 |
+//! | [`rbac`]         | What they may touch: grants, checked on the logical plan before dispatch | 5 |
 //! | [`warehouse`]    | Virtual warehouses: named, resizable, suspend/resume compute pools    | 5 |
 //! | [`engine`]       | Running one query: plan → distribute → collect, shared by both front ends | 5 |
 //! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
@@ -40,6 +42,7 @@ pub const GIT_SHA: &str = env!("LLDB_GIT_SHA");
 /// identical build — the precondition for shipping serialized DataFusion plans between them.
 pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
 
+pub mod auth;
 pub mod catalog;
 pub mod config;
 pub mod discovery;
@@ -50,6 +53,7 @@ pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
 pub mod query_log;
+pub mod rbac;
 pub mod remote;
 pub mod result_cache;
 pub mod retry;
@@ -64,6 +68,7 @@ pub mod storage;
 pub mod tpch;
 pub mod warehouse;
 
+pub use auth::{ApiKey, AuthError, FleetAuth, NewToken, Principal, Role, User};
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
 pub use discovery::{
@@ -75,13 +80,16 @@ pub use engine::{
     CatalogSource, build_query_session, contains_flight_reader, execute_query,
     execute_query_cached, reject_inmemory_storage, resolve_fleet,
 };
-pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
+pub use flight::{
+    fetch, fetch_with_failover, serve_worker, serve_worker_with_auth, serve_worker_with_cache,
+};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
 };
 pub use query_log::{QueryRecord, QueryState};
+pub use rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization, Requirement};
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use result_cache::{
     ResultCache, ResultCacheArgs, ResultCacheConfig, ResultCacheKey, TableInput, execute_cached,
@@ -89,7 +97,9 @@ pub use result_cache::{
 pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use scheduler::{Admission, AdmissionError, AdmissionLimits, QuerySlot, Scheduler};
-pub use server::{Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query};
+pub use server::{
+    Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query, submit_query_as,
+};
 pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
 pub use session::{build_session, register_tpch_parquet};
 pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};

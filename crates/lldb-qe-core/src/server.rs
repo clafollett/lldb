@@ -35,6 +35,28 @@
 //! The assigned query id comes back in the gRPC response metadata as `lldb-query-id`, on success
 //! **and** on failure, so a client always has the handle it needs to look the query up in history.
 //!
+//! # Identity: proven, not claimed
+//!
+//! This used to be the hole in the design. The ticket's `account` field was believed verbatim, so
+//! anyone who could reach the port could name any tenant, read whatever that tenant could read, and
+//! have the query filed under their history. Issue #19 closes it:
+//!
+//! 1. The credential is an API key in the request **metadata** (`authorization: Bearer <token>`),
+//!    never in the ticket — a ticket is logged and stored, and a secret must not be.
+//! 2. The tenant is derived from the credential. A ticket that *also* names an account must name
+//!    the same one, or the request is `PERMISSION_DENIED`; the ticket's field is now a redundant
+//!    assertion the server can check, not an input it obeys.
+//! 3. Every object the query's logical plan touches is checked against the caller's grants before
+//!    the plan is staged, dispatched, or answered from the result cache. See [`crate::rbac`].
+//!
+//! **Whether authentication is enforced follows the services database**, because that is where
+//! accounts, users, keys and grants live. With no `--metadata-*` there is nothing to authenticate
+//! against and everything runs — the documented single-node mode (CLAUDE.md: `cargo run` must never
+//! need Postgres). With one, a credential is required unless an operator explicitly sets
+//! [`CoordinatorConfig::allow_anonymous`], which exists for the deployment that adds a control
+//! plane before it has issued its first key, and which logs a warning on every startup for exactly
+//! as long as it is set.
+//!
 //! # What this does NOT do
 //!
 //! - **Admission is per coordinator process.** Two servers pointed at one warehouse do not share a
@@ -46,9 +68,12 @@
 //!   and it means cancellation is "hang up", which works. A detached submit — `do_action("submit")`
 //!   returning a id, then `do_get` on a ticket naming it — is expressible in Flight and would need
 //!   a place to park results; it is not needed to serve concurrent queries, so it is not here.
-//! - **No authentication.** Anyone who can reach the port can name any account. Enforcement lands
-//!   with accounts/RBAC (#19); until then this belongs on a private network, exactly like the
-//!   worker port.
+//! - **No transport security.** The credential above crosses the wire in plaintext unless the
+//!   deployment terminates TLS in front of this port. A bearer token on an unencrypted channel is a
+//!   token anyone on the path can replay; tonic supports TLS and wiring it is a deployment
+//!   decision, not a code one, but nothing here forces it.
+//! - **No per-request identity at the worker boundary.** Workers authenticate the *fleet*, not the
+//!   user (see [`crate::auth`]). A compromised coordinator can still ask a worker for anything.
 //! - **No cancellation of a running query.** Dropping the client's stream removes a *queued* query
 //!   from the line (the future awaiting admission is dropped), but a query that already started
 //!   runs to completion.
@@ -83,9 +108,11 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::{AUTHORIZATION_HEADER, AuthError, Principal, bearer_header, bearer_token};
 use crate::engine::{BoxResolver, execute_query_cached, resolve_fleet, total_rows};
 use crate::lakehouse::Lakehouse;
 use crate::query_log::QueryRecord;
+use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
 use crate::scheduler::{Admission, AdmissionError, AdmissionLimits, DEFAULT_FLEET_KEY, Scheduler};
 use crate::services::ServicesDb;
@@ -201,6 +228,13 @@ pub enum QueryError {
     /// Retriable by the client, unlike everything else here.
     #[error(transparent)]
     Admission(#[from] AdmissionError),
+    /// The credential was missing, malformed, revoked, expired, or simply wrong — or the control
+    /// plane could not be asked. Nothing about the query was even looked at.
+    #[error("{0}")]
+    Unauthenticated(AuthError),
+    /// Authenticated, but not entitled: a missing grant, or a ticket claiming another tenant.
+    #[error("{0:#}")]
+    Denied(anyhow::Error),
     /// The request itself is wrong — an unknown account or warehouse, a suspended warehouse, a
     /// malformed ticket. Retrying verbatim will fail identically.
     #[error("{0:#}")]
@@ -213,6 +247,11 @@ pub enum QueryError {
 impl QueryError {
     /// The gRPC status this maps to. The codes are the contract a client retries against:
     /// `RESOURCE_EXHAUSTED` and `UNAVAILABLE` say "try again", `INVALID_ARGUMENT` says "do not".
+    ///
+    /// `UNAUTHENTICATED` and `PERMISSION_DENIED` are kept distinct because they call for different
+    /// actions: the first means "get a credential", the second means "get a grant". Collapsing them
+    /// into one code is a common and unhelpful habit — it leaks nothing, since a caller who reached
+    /// `PERMISSION_DENIED` has already proven who they are.
     pub fn to_status(&self) -> Status {
         match self {
             QueryError::Admission(AdmissionError::QueueFull { .. }) => {
@@ -221,6 +260,13 @@ impl QueryError {
             QueryError::Admission(AdmissionError::ShuttingDown { .. }) => {
                 Status::unavailable(self.to_string())
             }
+            // A control plane that will not answer is our fault and is worth retrying; a bad
+            // credential is the caller's and is not.
+            QueryError::Unauthenticated(AuthError::Unavailable(_)) => {
+                Status::unavailable(self.to_string())
+            }
+            QueryError::Unauthenticated(_) => Status::unauthenticated(self.to_string()),
+            QueryError::Denied(_) => Status::permission_denied(self.to_string()),
             QueryError::Request(_) => Status::invalid_argument(self.to_string()),
             QueryError::Execution(_) => Status::internal(self.to_string()),
         }
@@ -252,6 +298,17 @@ pub struct CoordinatorConfig {
     pub max_queued_queries: usize,
     /// How this process identifies itself in `queries.coordinator`.
     pub coordinator_id: String,
+    /// Serve unauthenticated requests *even though* a services database is configured.
+    ///
+    /// The escape hatch, and it is `false` by default on purpose: security that has to be turned on
+    /// is security that is off. It exists because adding a control plane and issuing the first API
+    /// key are two deploys, not one, and a cluster that becomes unqueryable in between is a cluster
+    /// nobody adds a control plane to. A server with this set logs a warning at startup naming the
+    /// flag, every time, for as long as it is set.
+    ///
+    /// It has no effect without a services database — there is nothing to authenticate against
+    /// there, so anonymous is already the only mode.
+    pub allow_anonymous: bool,
 }
 
 impl Default for CoordinatorConfig {
@@ -263,6 +320,7 @@ impl Default for CoordinatorConfig {
             max_concurrent_queries: None,
             max_queued_queries: crate::scheduler::DEFAULT_MAX_QUEUED_QUERIES,
             coordinator_id: DEFAULT_SERVER_BIND.to_string(),
+            allow_anonymous: false,
         }
     }
 }
@@ -340,6 +398,35 @@ impl Coordinator {
         &self.config
     }
 
+    /// Whether this server requires a credential. See [`CoordinatorConfig::allow_anonymous`].
+    pub fn requires_authentication(&self) -> bool {
+        self.db.is_some() && !self.config.allow_anonymous
+    }
+
+    /// Say the security posture out loud, once, at startup. Called by `lldb-qe-server`; a posture
+    /// nobody logged is a posture nobody chose.
+    pub fn log_posture(&self) {
+        if self.db.is_none() {
+            tracing::warn!(
+                "no services database: this coordinator is UNAUTHENTICATED and enforces no access \
+                 control — every query runs as the configured default account. That is the \
+                 supported single-node mode; configure --metadata-url to turn accounts, API keys \
+                 and grants on."
+            );
+        } else if self.config.allow_anonymous {
+            tracing::warn!(
+                "--allow-anonymous is set: requests WITHOUT an API key are served and are not \
+                 access-checked, even though a services database is configured. Issue a key with \
+                 `lldb-qe-auth key create` and drop the flag."
+            );
+        } else {
+            tracing::info!(
+                "authentication is on: every query needs `authorization: Bearer <token>` and is \
+                 authorized against its account's grants before dispatch"
+            );
+        }
+    }
+
     /// Stop admitting new work. Queued queries wake refused; running ones finish.
     pub fn begin_shutdown(&self) {
         tracing::info!("shutting down: no new queries will be admitted");
@@ -350,26 +437,50 @@ impl Coordinator {
     ///
     /// The order of operations is the design:
     ///
+    /// 0. **Authenticate** — turn `credential` into a [`Principal`], and load its grants. Before
+    ///    anything else, because everything else is scoped by the answer, and because an
+    ///    unauthenticated caller must not be able to make this process do work.
     /// 1. **Resolve the target** — account, warehouse, endpoints. Before any row is written,
-    ///    because a query whose tenant cannot be resolved has nothing to be attributed to.
+    ///    because a query whose tenant cannot be resolved has nothing to be attributed to. This is
+    ///    also where `USAGE` on the named warehouse is checked, so an unauthorized warehouse never
+    ///    reaches history or the admission queue.
     /// 2. **Record it `queued`** — before admission, so a query that waits ten minutes for a slot
     ///    is visible for those ten minutes rather than appearing only once it runs.
     /// 3. **Acquire a slot** — this is where queueing happens, and where a refusal is turned into
     ///    a `failed` row rather than a silent drop.
     /// 4. **Mark it `running`, execute, mark it terminal.** The slot is an RAII guard held across
-    ///    all of it, so every exit path returns it.
+    ///    all of it, so every exit path returns it. The *object*-level authorization check happens
+    ///    inside execution rather than here, because it needs the logical plan — see
+    ///    [`crate::rbac`] for why the logical plan is the last place it can happen.
     ///
     /// History writes after step 2 are **best effort**: a query that is already executing must not
     /// be killed because the services database hiccuped, and the terminal write will correct the
     /// row anyway. Step 2 itself is *not* best effort — if the control plane is configured and
     /// cannot record an accepted query, accepting it would be a lie.
-    pub async fn run_query(&self, request: QueryRequest) -> QueryOutcome {
-        let target = match self.resolve_target(&request).await {
+    ///
+    /// `credential` is the bearer token from the request metadata, if the client sent one. It is a
+    /// separate parameter rather than a field on [`QueryRequest`] on purpose: the request is what
+    /// gets encoded into a ticket, logged and stored, and a secret belongs in none of that.
+    pub async fn run_query(&self, request: QueryRequest, credential: Option<&str>) -> QueryOutcome {
+        let (principal, authorization) = match self.authenticate(credential).await {
+            Ok(pair) => pair,
+            Err(error) => {
+                return QueryOutcome {
+                    query_id: None,
+                    result: Err(error),
+                };
+            }
+        };
+
+        let target = match self
+            .resolve_target(&request, principal.as_ref(), authorization.as_ref())
+            .await
+        {
             Ok(target) => target,
             Err(error) => {
                 return QueryOutcome {
                     query_id: None,
-                    result: Err(QueryError::Request(error)),
+                    result: Err(error),
                 };
             }
         };
@@ -385,16 +496,59 @@ impl Coordinator {
         };
         let query_id = record.as_ref().map(|r| r.id);
 
-        let result = self.run_admitted(&target, &request.sql, query_id).await;
+        let result = self
+            .run_admitted(&target, &request.sql, query_id, authorization.as_ref())
+            .await;
         if let Err(error) = &result {
             tracing::warn!(
                 query_id = ?query_id,
                 warehouse = %target.admission_key,
+                user = principal.as_ref().map(|p| p.to_string()),
                 error = %error,
                 "query failed"
             );
         }
         QueryOutcome { query_id, result }
+    }
+
+    /// Step 0: prove the credential and load what it may do.
+    ///
+    /// Returns `(None, None)` for a server with no control plane, and for one running with
+    /// [`CoordinatorConfig::allow_anonymous`] against a caller that sent nothing — both mean "there
+    /// is no identity here", and every downstream check is skipped rather than defaulted.
+    ///
+    /// A caller that *does* present a credential is always verified, even under `allow_anonymous`.
+    /// Anything else would let a bad token be quietly upgraded to full access, which is the worst
+    /// possible reading of a permissive flag.
+    async fn authenticate(
+        &self,
+        credential: Option<&str>,
+    ) -> Result<(Option<Principal>, Option<QueryAuthorization>), QueryError> {
+        let Some(db) = &self.db else {
+            return Ok((None, None));
+        };
+        let Some(token) = credential else {
+            if self.config.allow_anonymous {
+                return Ok((None, None));
+            }
+            return Err(QueryError::Unauthenticated(AuthError::Missing));
+        };
+
+        let principal = db
+            .authenticate(token)
+            .await
+            .map_err(QueryError::Unauthenticated)?;
+        let authorization = db
+            .authorization_for(&principal)
+            .await
+            .map_err(|e| QueryError::Unauthenticated(AuthError::Unavailable(e)))?;
+        tracing::debug!(
+            user = %principal,
+            api_key = %principal.api_key_name,
+            grants = authorization.grants.len(),
+            "authenticated"
+        );
+        Ok((Some(principal), Some(authorization)))
     }
 
     /// Steps 3 and 4: queue for a slot, then run under it.
@@ -403,6 +557,7 @@ impl Coordinator {
         target: &Target,
         sql: &str,
         query_id: Option<i64>,
+        authorization: Option<&QueryAuthorization>,
     ) -> Result<Vec<RecordBatch>, QueryError> {
         let admission = self.admission_for(target);
         // The guard. Everything below this line runs holding one permit, and every path out of it
@@ -428,7 +583,7 @@ impl Coordinator {
             tracing::warn!(query_id = id, error = %format!("{error:#}"), "could not mark the query running");
         }
 
-        let outcome = self.execute(target, sql).await;
+        let outcome = self.execute(target, sql, authorization).await;
         match &outcome {
             Ok(batches) => {
                 let rows = total_rows(batches);
@@ -441,12 +596,26 @@ impl Coordinator {
             }
             Err(error) => self.mark_failed(query_id, &format!("{error:#}")).await,
         }
-        outcome.map_err(QueryError::Execution)
+        // A refusal is *not* an internal error, and a client has to be able to tell them apart —
+        // one means "ask for a grant", the other means "file a bug". The probe is on the type, not
+        // on the message; see [`crate::rbac::Denied`].
+        outcome.map_err(|error| {
+            if crate::rbac::is_denial(&error) {
+                QueryError::Denied(error)
+            } else {
+                QueryError::Execution(error)
+            }
+        })
     }
 
     /// Discover the fleet and run the query on it. Separated so the slot-holding path above reads
     /// as bookkeeping and this reads as execution.
-    async fn execute(&self, target: &Target, sql: &str) -> Result<Vec<RecordBatch>> {
+    async fn execute(
+        &self,
+        target: &Target,
+        sql: &str,
+        authorization: Option<&QueryAuthorization>,
+    ) -> Result<Vec<RecordBatch>> {
         // Discovery runs per query, exactly as it does in the one-shot: a warehouse resized while
         // this server has been up is picked up by the next query, with no restart.
         let fleet = resolve_fleet(
@@ -455,13 +624,15 @@ impl Coordinator {
             self.resolver.as_ref(),
         )
         .await?;
-        // The tenant is `target.account_id` — the one resolved from the services database, never
-        // the one the ticket claimed — so one account can never be served another's cached rows.
+        // The tenant is `target.account_id` — the one resolved from the credential, never the one
+        // the ticket claimed — so one account can never be served another's cached rows. The
+        // object-level grant check happens inside, between planning and the cache lookup.
         execute_query_cached(
             &self.ctx,
             self.result_cache.as_ref(),
             &self.lakehouses,
             target.account_id,
+            authorization,
             sql,
             &fleet,
         )
@@ -474,27 +645,56 @@ impl Coordinator {
             .admission_for(&target.admission_key, target.max_concurrent)
     }
 
-    /// Turn a request into everything execution needs, refusing anything unroutable.
+    /// Turn a request into everything execution needs, refusing anything unroutable — or anything
+    /// the caller is not entitled to.
     ///
     /// Mirrors the one-shot coordinator's startup exactly — same lookups, same errors, same
     /// suspended-warehouse guard — except that it runs per query rather than per process, because
     /// a long-running server must see an account created, or a warehouse resumed, without a
     /// restart.
-    async fn resolve_target(&self, request: &QueryRequest) -> Result<Target> {
-        let account_name = request
-            .account
-            .clone()
-            .unwrap_or_else(|| self.config.default_account.clone());
+    ///
+    /// **The tenant comes from `principal`, never from the ticket.** That inversion is the whole
+    /// point of the issue this method was rewritten for. The ticket's `account` field survives only
+    /// as an assertion: if it names a *different* account than the credential does, the request is
+    /// denied rather than quietly reinterpreted, because a client that believes it is talking to
+    /// tenant B while the server serves tenant A is a bug worth surfacing loudly on both sides.
+    async fn resolve_target(
+        &self,
+        request: &QueryRequest,
+        principal: Option<&Principal>,
+        authorization: Option<&QueryAuthorization>,
+    ) -> Result<Target, QueryError> {
+        // Precedence: the proven identity, then the ticket's claim (only legal when there is no
+        // identity to contradict it), then the server's default.
+        let account_name = match principal {
+            Some(principal) => {
+                if let Some(claimed) = &request.account
+                    && claimed != &principal.account_name
+                {
+                    return Err(QueryError::Denied(anyhow!(
+                        "this API key belongs to account `{}`, but the request asks to run as \
+                         `{claimed}`. An account is derived from the credential and cannot be \
+                         chosen by the caller.",
+                        principal.account_name
+                    )));
+                }
+                principal.account_name.clone()
+            }
+            None => request
+                .account
+                .clone()
+                .unwrap_or_else(|| self.config.default_account.clone()),
+        };
 
         let Some(db) = &self.db else {
             // No control plane, so nothing knows what a warehouse name means. Say that rather than
             // falling back to `--workers` and running the query on a fleet nobody chose.
             if let Some(name) = &request.warehouse {
-                bail!(
+                return Err(QueryError::Request(anyhow!(
                     "--warehouse {name} needs a services database to resolve the warehouse in: \
                      start the server with --metadata-url (LLDB_METADATA_URL), or --metadata-host \
                      (LLDB_METADATA_HOST) plus the other --metadata-* parts"
-                );
+                )));
             }
             return Ok(Target {
                 account_id: None,
@@ -509,12 +709,17 @@ impl Coordinator {
             });
         };
 
-        let account = db.account_by_name(&account_name).await?.with_context(|| {
-            format!(
-                "account `{account_name}` does not exist in the services database; create it \
+        let account = db
+            .account_by_name(&account_name)
+            .await
+            .map_err(QueryError::Request)?
+            .with_context(|| {
+                format!(
+                    "account `{account_name}` does not exist in the services database; create it \
                      with `lldb-qe-migrate --seed-account {account_name}`"
-            )
-        })?;
+                )
+            })
+            .map_err(QueryError::Request)?;
 
         let Some(name) = &request.warehouse else {
             return Ok(Target {
@@ -530,18 +735,36 @@ impl Coordinator {
             });
         };
 
+        // `USAGE` on the warehouse, checked *before* it is looked up.
+        //
+        // Before, not after, and that ordering is deliberate: a caller with no grant on `analytics`
+        // must not be able to learn whether `analytics` exists in this account by comparing "no
+        // such warehouse" against "permission denied". The privilege check is a pure function of
+        // the name they typed, so it costs nothing to run it first, and running it first makes the
+        // two outcomes indistinguishable from outside.
+        if let Some(authorization) = authorization {
+            authorization
+                .check(&Requirement::new(
+                    Privilege::Usage,
+                    ObjectRef::warehouse(name.clone()),
+                ))
+                .map_err(QueryError::Denied)?;
+        }
+
         // Scoped by the account id, so another tenant's identically-named warehouse is simply not
         // visible from here.
-        let warehouse: Warehouse =
-            db.warehouse_by_name(account.id, name)
-                .await?
-                .with_context(|| {
-                    format!(
-                        "warehouse `{name}` does not exist for account `{}`; create it with \
+        let warehouse: Warehouse = db
+            .warehouse_by_name(account.id, name)
+            .await
+            .map_err(QueryError::Request)?
+            .with_context(|| {
+                format!(
+                    "warehouse `{name}` does not exist for account `{}`; create it with \
                      `lldb-qe-warehouse create --account {} --name {name} --size 2`",
-                        account.name, account.name
-                    )
-                })?;
+                    account.name, account.name
+                )
+            })
+            .map_err(QueryError::Request)?;
         // `endpoint` is what refuses a suspended warehouse — the guard lives on the type, so it
         // cannot be forgotten by a second caller.
         let endpoints = self
@@ -549,7 +772,8 @@ impl Coordinator {
             .warehouse_endpoint
             .iter()
             .map(|template| warehouse.endpoint(template))
-            .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()
+            .map_err(QueryError::Request)?;
 
         Ok(Target {
             account_id: Some(account.id),
@@ -682,11 +906,25 @@ impl FlightService for CoordinatorFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // The credential is read from the metadata and never from the ticket. A header this server
+        // cannot parse is treated as *absent* rather than rejected here, so that "you sent no
+        // credential" and "you sent a malformed one" produce the same single refusal from
+        // [`Coordinator::authenticate`] instead of two differently-shaped ones.
+        let credential = request
+            .metadata()
+            .get(AUTHORIZATION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| bearer_token(value).ok())
+            .map(str::to_string);
+
         let ticket = request.into_inner();
         let query = decode_query_ticket(&ticket.ticket)
             .map_err(|e| Status::invalid_argument(format!("bad query ticket: {e:#}")))?;
 
-        let outcome = self.coordinator.run_query(query).await;
+        let outcome = self
+            .coordinator
+            .run_query(query, credential.as_deref())
+            .await;
         let batches = match outcome.result {
             Ok(batches) => batches,
             Err(error) => {
@@ -789,12 +1027,29 @@ pub struct SubmittedQuery {
     pub batches: Vec<RecordBatch>,
 }
 
-/// Submit `request` to the query server at `server_url` and collect the whole answer.
+/// Submit `request` to the query server at `server_url`, unauthenticated.
+///
+/// Kept as its own function rather than folded into [`submit_query_as`] with a `None` at every call
+/// site, because "this call carries no credential" should be a thing a reader can see. Against a
+/// server with a services database it will be refused — which is the correct outcome and exactly
+/// what the acceptance test asserts.
+pub async fn submit_query(server_url: &str, request: &QueryRequest) -> Result<SubmittedQuery> {
+    submit_query_as(server_url, request, None).await
+}
+
+/// Submit `request` to the query server at `server_url`, presenting `token`, and collect the whole
+/// answer.
 ///
 /// The reference client, and the one the tests use. It is deliberately tiny: a ticket, a `do_get`,
 /// and a decode — which is the point of choosing Flight, since any Arrow Flight client in any
-/// language can do the same three things without a line of lldb-specific code.
-pub async fn submit_query(server_url: &str, request: &QueryRequest) -> Result<SubmittedQuery> {
+/// language can do the same three things without a line of lldb-specific code. The credential is an
+/// ordinary `authorization: Bearer` header, so "any language" includes languages that have never
+/// heard of lldb.
+pub async fn submit_query_as(
+    server_url: &str,
+    request: &QueryRequest,
+    token: Option<&str>,
+) -> Result<SubmittedQuery> {
     let channel = Channel::from_shared(server_url.to_string())
         .with_context(|| format!("invalid coordinator url {server_url}"))?
         .connect()
@@ -802,10 +1057,19 @@ pub async fn submit_query(server_url: &str, request: &QueryRequest) -> Result<Su
         .with_context(|| format!("connecting to coordinator {server_url}"))?;
     let mut client = FlightServiceClient::new(channel);
 
-    let ticket = Ticket {
+    let mut grpc_request = Request::new(Ticket {
         ticket: encode_query_ticket(request).into(),
-    };
-    let response = client.do_get(ticket).await.map_err(|status| {
+    });
+    if let Some(token) = token {
+        let value = bearer_header(token)
+            .parse()
+            .context("the API key is not usable as an HTTP header value")?;
+        grpc_request
+            .metadata_mut()
+            .insert(AUTHORIZATION_HEADER, value);
+    }
+
+    let response = client.do_get(grpc_request).await.map_err(|status| {
         // Keep the id from the failure metadata in the message: it is the handle to the history
         // row that explains what went wrong.
         match query_id_from(status.metadata()) {
@@ -928,6 +1192,55 @@ mod tests {
         assert!(boom.to_status().message().contains("table not found"));
     }
 
+    #[test]
+    fn identity_failures_are_three_distinguishable_things() {
+        // "Get a credential", "get a grant", and "our control plane is down" call for three
+        // different actions by the client, so they get three different codes.
+        let missing = QueryError::Unauthenticated(AuthError::Missing);
+        assert_eq!(missing.to_status().code(), tonic::Code::Unauthenticated);
+        assert!(
+            missing.to_string().contains("lldb-qe-auth key create"),
+            "{missing}"
+        );
+
+        let denied = QueryError::Denied(anyhow!("missing SELECT on table lldb.sales.orders"));
+        assert_eq!(denied.to_status().code(), tonic::Code::PermissionDenied);
+        assert!(denied.to_status().message().contains("lldb.sales.orders"));
+
+        // A services database that will not answer is *our* fault. Reporting it as
+        // UNAUTHENTICATED would tell an operator to go re-issue perfectly good API keys.
+        let down = QueryError::Unauthenticated(AuthError::Unavailable(anyhow!("pool timed out")));
+        assert_eq!(down.to_status().code(), tonic::Code::Unavailable);
+    }
+
+    /// With no services database there is no identity to prove, so a query runs and a credential
+    /// is irrelevant. This is the documented single-node mode, and it is the one property here
+    /// that a regression would break silently for every developer in a checkout.
+    #[tokio::test]
+    async fn without_a_control_plane_nothing_is_authenticated() {
+        let coordinator = Coordinator::new(
+            SessionContext::new(),
+            None,
+            CoordinatorConfig {
+                workers: vec!["http://127.0.0.1:1".to_string()],
+                ..CoordinatorConfig::default()
+            },
+        );
+        assert!(!coordinator.requires_authentication());
+        // Port 1 has no worker, so this fails — but it must fail in *execution*, having got past
+        // identity entirely, rather than being refused for want of a credential.
+        for credential in [None, Some("lldb_whatever")] {
+            let outcome = coordinator
+                .run_query(QueryRequest::new("SELECT 1"), credential)
+                .await;
+            let error = outcome.result.expect_err("port 1 has no worker");
+            assert!(
+                matches!(error, QueryError::Execution(_)),
+                "credential {credential:?} produced {error:?}"
+            );
+        }
+    }
+
     /// With no services database a query still runs — it just has no history. Same bargain as
     /// everywhere else in this codebase.
     #[tokio::test]
@@ -941,7 +1254,10 @@ mod tests {
             },
         );
         let outcome = coordinator
-            .run_query(QueryRequest::new("SELECT 1").on_warehouse("analytics"))
+            .run_query(
+                QueryRequest::new("SELECT 1").on_warehouse("analytics"),
+                None,
+            )
             .await;
         assert_eq!(outcome.query_id, None, "no control plane, no history row");
         let error = outcome.result.expect_err("no warehouse can be resolved");
@@ -967,7 +1283,9 @@ mod tests {
             },
         );
         for _ in 0..3 {
-            let outcome = coordinator.run_query(QueryRequest::new("SELECT 1")).await;
+            let outcome = coordinator
+                .run_query(QueryRequest::new("SELECT 1"), None)
+                .await;
             assert!(outcome.result.is_err(), "port 1 has no worker");
         }
         let snapshot = coordinator.scheduler().snapshot();
@@ -993,7 +1311,9 @@ mod tests {
             },
         );
         coordinator.begin_shutdown();
-        let outcome = coordinator.run_query(QueryRequest::new("SELECT 1")).await;
+        let outcome = coordinator
+            .run_query(QueryRequest::new("SELECT 1"), None)
+            .await;
         let error = outcome.result.expect_err("the server is going away");
         assert_eq!(error.to_status().code(), tonic::Code::Unavailable);
         assert!(error.to_string().contains("shutting down"), "{error}");

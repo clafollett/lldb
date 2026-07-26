@@ -232,6 +232,10 @@ async fn run_query(
         cache,
         lakehouses,
         account_id,
+        // No authorization to enforce: this file is about the cache, and the interaction between
+        // the two (the check must dominate the lookup) is asserted in `auth_rbac.rs`, where there
+        // are real grants to revoke.
+        None,
         sql,
         |logical| async move {
             executions.fetch_add(1, Ordering::SeqCst);

@@ -101,6 +101,21 @@ x-metadata-env: &metadata-env
   LLDB_METADATA_PASSWORD: lldb
   LLDB_METADATA_SSLMODE: disable
 
+# The shared fleet secret (issue #19). Every worker below requires it and every coordinator
+# presents it, so a process that is not part of this cluster cannot reach a worker's Flight port and
+# have an arbitrary physical plan executed with the worker's S3 credentials.
+#
+# The value checked in here is a **demo** value and is worth nothing as a secret — it is in git. A
+# real deployment injects one from a secret store (`LLDB_FLEET_TOKEN=$(...)`), and the variable is
+# overridable here precisely so that is a one-line change. Leaving it unset leaves the worker ports
+# open, which is the supported no-configuration default and which every worker warns about, loudly,
+# on startup.
+#
+# Note what it is and is not: it proves "you are part of this deployment", not "you are user X".
+# Per-request identity at the worker boundary is a follow-on — see crates/lldb-qe-core/src/auth.rs.
+x-fleet-env: &fleet-env
+  LLDB_FLEET_TOKEN: ${LLDB_FLEET_TOKEN:-compose-demo-fleet-secret}
+
 # How `--warehouse <name>` becomes an address here. Compose's DNS serves bare network aliases
 # with no namespace suffix, so the template has no `.lldb.local` — the CDK stack sets
 # `http://{warehouse}.lldb.local:50051` for the same flag. One template, two spellings of DNS.
@@ -173,6 +188,41 @@ services:
       db-migrate:
         condition: service_completed_successfully
 
+  # One-shot: declare the demo tenant's identity — a user, a role, and the grants that role needs
+  # to read the shared catalog and use both warehouses. It does NOT issue an API key, because a key
+  # can only be shown once and a token printed into a compose log is not a credential, it is a
+  # published secret. Issue one yourself when you want to talk to `query-server` for real:
+  #
+  #   docker compose run --rm auth-setup lldb-qe-auth key create --user demo --name cli
+  #   docker compose run --rm auth-setup lldb-qe-auth show
+  #
+  # Everything here is idempotent (`grant` and `role assign` are upserts), except `user create` and
+  # `role create` — hence the `|| true`, which keeps a second `up` from failing on rows that are
+  # already correct. That is the one place in this file where an error is deliberately ignored.
+  auth-setup:
+    build: *lldb-build
+    image: ${LLDB_IMAGE:-lldb:latest}
+    entrypoint:
+      - /bin/sh
+      - -c
+      - >
+        (lldb-qe-auth user create --name demo || true) &&
+        (lldb-qe-auth role create --name analyst || true) &&
+        lldb-qe-auth role assign --role analyst --user demo &&
+        lldb-qe-auth grant --role analyst --privilege ALL
+          --object-type catalog --object-name shared &&
+        lldb-qe-auth grant --role analyst --privilege USAGE
+          --object-type warehouse --object-name analytics &&
+        lldb-qe-auth grant --role analyst --privilege USAGE
+          --object-type warehouse --object-name etl &&
+        lldb-qe-auth show
+    environment:
+      <<: *metadata-env
+      RUST_LOG: info
+    depends_on:
+      warehouse-setup:
+        condition: service_completed_successfully
+
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -215,7 +265,7 @@ services:
     # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
     # and the same metadata files — the coordinator planned against.
     environment:
-      <<: [*s3-env, *metadata-env]
+      <<: [*s3-env, *metadata-env, *fleet-env]
     volumes:
       - warehouse:/var/lib/lldb/warehouse
     networks:
@@ -241,7 +291,7 @@ services:
     # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
     # and the same metadata files — the coordinator planned against.
     environment:
-      <<: [*s3-env, *metadata-env]
+      <<: [*s3-env, *metadata-env, *fleet-env]
     volumes:
       - warehouse:/var/lib/lldb/warehouse
     networks:
@@ -268,7 +318,7 @@ services:
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
     environment:
-      <<: [*s3-env, *metadata-env]
+      <<: [*s3-env, *metadata-env, *fleet-env]
     volumes:
       # Same shared Iceberg metadata as every other role. A warehouse is a separate pool of
       # *compute*, not of storage — the whole point is that `analytics` and `etl` read one
@@ -316,10 +366,17 @@ services:
       - "http://worker-1:50051,http://worker-2:50051"
       - "--manifest"
       - "/manifests/empty.toml"
+      # This cluster is a demo you are expected to be able to query the moment it comes up, and an
+      # API key can only be shown once — so it cannot be baked into a compose file without being
+      # published. `--allow-anonymous` keeps that working. It is NOT how you run this in anger:
+      # drop the flag, issue a key with `docker compose run --rm auth-setup lldb-qe-auth key
+      # create --user demo --name cli`, and send it as `authorization: Bearer <token>`. A server
+      # started this way warns about it on every startup, on purpose.
+      - "--allow-anonymous"
     ports:
       - "50050:50050"
     environment:
-      <<: [*s3-env, *metadata-env, *warehouse-env]
+      <<: [*s3-env, *metadata-env, *warehouse-env, *fleet-env]
     volumes:
       - ./manifests:/manifests:ro
       - warehouse:/var/lib/lldb/warehouse
@@ -329,6 +386,8 @@ services:
       worker-2:
         condition: service_healthy
       warehouse-setup:
+        condition: service_completed_successfully
+      auth-setup:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "nc", "-z", "127.0.0.1", "50050"]
@@ -349,7 +408,7 @@ services:
       - "--sql"
       - "SELECT 42 AS answer, 'distributed hello' AS greeting"
     environment:
-      <<: [*s3-env, *metadata-env, *warehouse-env]
+      <<: [*s3-env, *metadata-env, *warehouse-env, *fleet-env]
     volumes:
       - ./manifests:/manifests:ro
       # The Iceberg metadata a `sql` catalog writes. A named volume rather than MinIO because

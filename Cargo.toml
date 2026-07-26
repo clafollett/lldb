@@ -68,6 +68,21 @@ futures = "0.3"
 sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "any", "migrate", "macros", "chrono"] }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
+# --- Credentials & access control (issue #19) ---
+# Every one of these is ALREADY in the dependency tree via datafusion / iceberg / sqlx, so
+# declaring them directly adds no new version of anything — verified by diffing `cargo tree -d`
+# before and after. That check is the rule, not a courtesy: this workspace's whole build story is
+# "one arrow / object_store / datafusion tree-wide" (see CLAUDE.md), and a credential crate is
+# exactly the kind of small, tempting dependency that quietly drags in a second one.
+#
+# rand is pinned to 0.9 deliberately: 0.8 and 0.10 are both in the tree transitively, and picking
+# the one datafusion/iceberg already resolve to is what keeps the duplicate count unchanged.
+sha2 = "0.10"      # hash an API token (NOT a KDF — see crates/lldb-qe-core/src/auth.rs)
+subtle = "2.6"     # constant-time comparison of digests and of the fleet secret
+hex = "0.4"        # render the digest for storage
+rand = "0.9"       # 32 bytes of CSPRNG per token
+base64 = "0.22"    # URL-safe token encoding
+
 # --- Errors, logging, small utils ---
 anyhow = "1"
 thiserror = "2"

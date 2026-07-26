@@ -372,6 +372,15 @@ export class LldbStack extends cdk.Stack {
     // routing work — its own Cloud Map name. `analytics.lldb.local` resolves to the analytics
     // warehouse's tasks and to nothing else, so a coordinator handed a warehouse name cannot
     // reach another warehouse's compute even by accident.
+    //
+    // KNOWN GAP (issue #19): `LLDB_FLEET_TOKEN` is NOT set here, so worker Flight ports on ECS are
+    // reachable by anything inside the VPC that can resolve `<warehouse>.lldb.local` — a worker
+    // will execute any physical plan it is handed, with this task role's S3 credentials. Compose
+    // sets the variable; this stack deliberately does not, because doing it properly means a
+    // generated Secrets Manager secret injected into *both* the worker and coordinator task
+    // definitions, and that is a change worth reviewing on its own rather than riding along. Until
+    // then the mitigation is the security group (workers are not internet-facing) and the loud
+    // warning every worker logs at startup. See crates/lldb-qe-core/src/auth.rs::FleetAuth.
     for (const definition of warehouses) {
       const id = `Warehouse${pascalCase(definition.name)}`;
       const task = new ecs.FargateTaskDefinition(this, `${id}Task`, { cpu, memoryLimitMiB });

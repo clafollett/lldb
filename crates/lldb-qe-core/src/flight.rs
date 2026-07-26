@@ -38,11 +38,32 @@
 //! — the two faults `do_get` raises about itself) is surfaced immediately, because an identical
 //! fleet would only reproduce it. See [`crate::retry`] for the classification contract.
 //!
+//! # Who may call a worker
+//!
+//! Everything above describes a port that, until issue #19, had no lock on it at all: any process
+//! that could reach a worker's Flight port could ship it an arbitrary physical plan and have it
+//! executed with that worker's storage credentials. [`FleetAuth`] closes that minimally — a shared
+//! secret in the `authorization` metadata, constant-time compared, `UNAUTHENTICATED` without it.
+//!
+//! The credential is **ambient**, read once from `LLDB_FLEET_TOKEN` by [`ambient_fleet_auth`], and
+//! that is a deliberate choice rather than laziness. The alternative — threading a token through
+//! [`fetch`], [`fetch_with_failover`], [`fetch_partition_with_failover`] and into
+//! [`FlightReaderExec`] — founders on the fact that a `FlightReaderExec` is *serialized into a
+//! plan* and re-executed on a worker for worker-to-worker exchange. A per-call token would either
+//! have to travel inside those plan bytes (a credential in a cached, content-hashed payload: no) or
+//! be absent exactly where worker-to-worker pulls need it. A process-wide deployment secret read
+//! from the process's own environment is what it actually is.
+//!
+//! What this proves is "you are part of this deployment", *not* "you are user X" — see
+//! [`crate::auth`] for the scope of that claim and for what per-request worker identity would take.
+//!
+//! [`FlightReaderExec`]: crate::remote::FlightReaderExec
+//!
 //! Note: coordinator and worker MUST run the identical DataFusion build — serialized plans
 //! are not cross-version compatible.
 
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow_flight::decode::FlightRecordBatchStream;
@@ -63,11 +84,37 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::auth::{AUTHORIZATION_HEADER, AuthError, FleetAuth, bearer_header, bearer_token};
 use crate::retry::{Retriability, RetryPolicy, classify};
 use crate::stage_cache::{MaterializedStage, StageCache, stage_id_of};
 
 /// Boxed tonic response stream.
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
+
+/// This process's fleet credential, read from the environment exactly once.
+///
+/// Both sides use it: a worker built with [`WorkerFlightService::new`] requires it, and every
+/// outgoing [`fetch_stream`] presents it. Reading it once rather than per call is what makes the
+/// coordinator's and the worker's view of the deployment provably the same within a process — and
+/// `std::env::var` is not free on a hot path anyway.
+pub fn ambient_fleet_auth() -> &'static FleetAuth {
+    static AMBIENT: OnceLock<FleetAuth> = OnceLock::new();
+    AMBIENT.get_or_init(FleetAuth::from_env)
+}
+
+/// Map a fleet-credential refusal onto the gRPC status a client retries (or does not) against.
+///
+/// `UNAUTHENTICATED` rather than `INVALID_ARGUMENT` matters: [`classify`] treats a request fault as
+/// fatal and a transport fault as retriable, and a fleet misconfiguration is neither of those — it
+/// would fail identically on every worker, so it must *not* walk the fleet pretending each node
+/// might answer. See [`crate::retry`].
+fn fleet_status(error: AuthError) -> Status {
+    Status::unauthenticated(format!(
+        "worker refused the request: {error}. Every coordinator and worker must share the same \
+         {} value.",
+        crate::auth::FLEET_TOKEN_ENV
+    ))
+}
 
 /// Number of fixed header bytes in a ticket: `stage_id` (u64) + `partition` (u32).
 const TICKET_HEADER_LEN: usize = 8 + 4;
@@ -134,10 +181,13 @@ pub fn deserialize_plan(bytes: &[u8], ctx: &SessionContext) -> Result<Arc<dyn Ex
 pub struct WorkerFlightService {
     ctx: SessionContext,
     cache: Arc<StageCache>,
+    /// What this worker requires of whoever connects. [`FleetAuth::Open`] is the no-configuration
+    /// default and is warned about at startup; see [`crate::auth`].
+    auth: FleetAuth,
 }
 
 impl WorkerFlightService {
-    /// A worker with a fresh, empty stage cache.
+    /// A worker with a fresh, empty stage cache, using this process's ambient fleet credential.
     pub fn new(ctx: SessionContext) -> Self {
         Self::new_with_cache(ctx, Arc::new(StageCache::new()))
     }
@@ -145,12 +195,34 @@ impl WorkerFlightService {
     /// A worker sharing the given stage cache. Tests use this to retain a handle to the cache and
     /// assert [`StageCache::execution_count`] after driving consumers.
     pub fn new_with_cache(ctx: SessionContext, cache: Arc<StageCache>) -> Self {
-        Self { ctx, cache }
+        Self::new_with_auth(ctx, cache, ambient_fleet_auth().clone())
+    }
+
+    /// A worker with an explicit fleet credential. The seam a test uses to stand up a *closed*
+    /// worker without mutating the process environment — `set_var` is `unsafe` in edition 2024 and
+    /// would race every other test sharing the process.
+    pub fn new_with_auth(ctx: SessionContext, cache: Arc<StageCache>, auth: FleetAuth) -> Self {
+        Self { ctx, cache, auth }
     }
 
     /// The stage cache this worker serves from.
     pub fn stage_cache(&self) -> &Arc<StageCache> {
         &self.cache
+    }
+
+    /// Check an incoming request's fleet credential.
+    fn check_credential<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        // Read only when a credential is actually required, so an open worker does no metadata
+        // work at all and the no-configuration path stays exactly as fast as it was.
+        if !self.auth.is_required() {
+            return Ok(());
+        }
+        let presented = request
+            .metadata()
+            .get(AUTHORIZATION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| bearer_token(value).ok());
+        self.auth.check(presented).map_err(fleet_status)
     }
 }
 
@@ -169,7 +241,22 @@ pub async fn serve_worker_with_cache(
     ctx: SessionContext,
     cache: Arc<StageCache>,
 ) -> Result<()> {
-    let service = FlightServiceServer::new(WorkerFlightService::new_with_cache(ctx, cache));
+    serve_worker_with_auth(listener, ctx, cache, ambient_fleet_auth().clone()).await
+}
+
+/// Like [`serve_worker_with_cache`] but with an explicit fleet credential.
+///
+/// The posture is logged here rather than in the worker binary so that an in-process test worker
+/// and the real `lldb-qe-worker` report the identical line — the warning about an open port is the
+/// only thing standing between "we never configured a fleet secret" and "we did not notice".
+pub async fn serve_worker_with_auth(
+    listener: TcpListener,
+    ctx: SessionContext,
+    cache: Arc<StageCache>,
+    auth: FleetAuth,
+) -> Result<()> {
+    auth.log_posture();
+    let service = FlightServiceServer::new(WorkerFlightService::new_with_auth(ctx, cache, auth));
     Server::builder()
         .add_service(service)
         .serve_with_incoming(TcpListenerStream::new(listener))
@@ -193,6 +280,10 @@ impl FlightService for WorkerFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
+        // Before the ticket is even decoded: an unauthenticated caller must not be able to make
+        // this process deserialize bytes it chose.
+        self.check_credential(&request)?;
+
         let ticket = request.into_inner();
         let (ticket_stage_id, partition, plan_bytes) = decode_ticket(&ticket.ticket)
             .map_err(|e| Status::invalid_argument(format!("bad ticket: {e}")))?;
@@ -476,6 +567,21 @@ pub async fn fetch_stream(
     partition: u32,
     plan_bytes: Vec<u8>,
 ) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
+    fetch_stream_with_auth(worker_url, partition, plan_bytes, ambient_fleet_auth()).await
+}
+
+/// [`fetch_stream`] with an explicit fleet credential instead of the process's ambient one.
+///
+/// Exists for the same reason [`WorkerFlightService::new_with_auth`] does: proving that a *closed*
+/// worker serves a correctly-credentialled caller requires setting the credential without touching
+/// the process environment, which is `unsafe` in edition 2024 and races every concurrent test.
+/// Production always goes through [`fetch_stream`].
+pub async fn fetch_stream_with_auth(
+    worker_url: String,
+    partition: u32,
+    plan_bytes: Vec<u8>,
+    auth: &FleetAuth,
+) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
     // Derive the stage id from the plan bytes themselves: every consumer of one producer ships
     // byte-identical bytes (only `partition` differs), so they all name the same cache entry on the
     // worker without any coordinator-side stage assignment.
@@ -491,8 +597,21 @@ pub async fn fetch_stream(
         .with_context(|| format!("connecting to worker {worker_url}"))?;
     let mut client = FlightServiceClient::new(channel);
 
+    // The credential rides in the request metadata, never in the ticket: a ticket is hashed into a
+    // stage id, cached on the worker and logged, and a secret must be in none of those.
+    let mut request = Request::new(ticket);
+    if let Some(token) = auth.token() {
+        let value = bearer_header(token).parse().with_context(|| {
+            format!(
+                "{} is not usable as an HTTP header value",
+                crate::auth::FLEET_TOKEN_ENV
+            )
+        })?;
+        request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+    }
+
     let flight_data = client
-        .do_get(ticket)
+        .do_get(request)
         .await
         .with_context(|| format!("do_get request to worker {worker_url}"))?
         .into_inner()
