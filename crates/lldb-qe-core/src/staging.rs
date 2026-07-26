@@ -120,6 +120,15 @@
 //! the rest from that buffer (the pull-shuffle hazard documented on [`FlightReaderExec`]). That is
 //! what makes broadcasting the small side of a join nearly free.
 //!
+//! # Placement and failover are separate questions
+//!
+//! Every leaf this planner builds names one **primary** worker — the assignment rules above are
+//! unchanged — and carries the rest of the fleet as ordered **failover targets** (see
+//! [`failover_targets`]). Placement decides where work goes; failover decides where it goes *again*
+//! if that node is lost. Keeping them separate is what lets fault tolerance apply to every rule
+//! here without any of them reasoning about it: they all build leaves through [`remote`], so a rule
+//! added tomorrow inherits reassignment for free.
+//!
 //! [`RepartitionExec`]: datafusion::physical_plan::repartition::RepartitionExec
 
 use std::sync::Arc;
@@ -303,10 +312,10 @@ fn distribute_shuffle_seam(
         let worker = &workers[i % workers.len()];
         let inputs = children
             .iter()
-            .map(|child| remote(worker, i as u32, Arc::clone(child)))
+            .map(|child| remote(workers, worker, i as u32, Arc::clone(child)))
             .collect();
         let stage = Arc::clone(node).with_new_children(inputs)?;
-        leaves.push(remote(worker, 0, single_partition(stage)));
+        leaves.push(remote(workers, worker, 0, single_partition(stage)));
     }
     Ok(Some(UnionExec::try_new(leaves)?))
 }
@@ -384,13 +393,13 @@ fn distribute_broadcast_join(
     };
 
     // One `Arc`, shared by every join stage: identical bytes, one stage id, one materialization.
-    let build_leaf = remote(&workers[0], 0, single_partition(build));
+    let build_leaf = remote(workers, &workers[0], 0, single_partition(build));
 
     let mut leaves = Vec::with_capacity(probe_stages.len());
     for (worker, probe_slice) in probe_stages {
         let stage =
             Arc::clone(node).with_new_children(vec![Arc::clone(&build_leaf), probe_slice])?;
-        leaves.push(remote(&worker, 0, single_partition(stage)));
+        leaves.push(remote(workers, &worker, 0, single_partition(stage)));
     }
     Ok(Some(UnionExec::try_new(leaves)?))
 }
@@ -461,7 +470,7 @@ fn distribute_aggregate(
         let leaves: Vec<Arc<dyn ExecutionPlan>> = slices
             .into_iter()
             .zip(workers)
-            .map(|(slice, worker)| remote(worker, 0, single_partition(slice)))
+            .map(|(slice, worker)| remote(workers, worker, 0, single_partition(slice)))
             .collect();
         return Ok(Some(UnionExec::try_new(leaves)?));
     }
@@ -469,7 +478,7 @@ fn distribute_aggregate(
     if let Some(stages) = remote_branch_stages(node) {
         let leaves: Vec<Arc<dyn ExecutionPlan>> = stages
             .into_iter()
-            .map(|(worker, stage)| remote(&worker, 0, single_partition(stage)))
+            .map(|(worker, stage)| remote(workers, &worker, 0, single_partition(stage)))
             .collect();
         return Ok(Some(UnionExec::try_new(leaves)?));
     }
@@ -526,7 +535,7 @@ fn distribute_sort(
     // again a merge, never a second sort.
     let leaves: Vec<Arc<dyn ExecutionPlan>> = stages
         .into_iter()
-        .map(|(worker, stage)| remote(&worker, 0, merge_sorted(stage, sort)))
+        .map(|(worker, stage)| remote(workers, &worker, 0, merge_sorted(stage, sort)))
         .collect();
     let union = UnionExec::try_new(leaves)?;
     Ok(Some(Arc::clone(node).with_new_children(vec![union])?))
@@ -630,8 +639,47 @@ fn is_partition_wise(node: &Arc<dyn ExecutionPlan>) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Wrap `plan` so it runs on `worker`, exposing that worker's `partition` as a local leaf.
-fn remote(worker: &str, partition: u32, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
-    Arc::new(FlightReaderExec::new(worker, partition, plan))
+///
+/// Every rule in this module builds its leaves here, which is deliberately the only place failover
+/// is wired: a leaf naming one worker makes that worker a single point of failure for the whole
+/// query, and threading the fleet through each rule separately would mean a rule added later
+/// silently loses reassignment. `worker`'s position in `workers` sets where the rotation starts —
+/// see [`failover_targets`] for why the list is rotated rather than always beginning at worker 0.
+fn remote(
+    workers: &[String],
+    worker: &str,
+    partition: u32,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Arc<dyn ExecutionPlan> {
+    let primary = workers.iter().position(|w| w == worker).unwrap_or(0);
+    Arc::new(FlightReaderExec::with_fallbacks(
+        worker,
+        failover_targets(workers, primary),
+        partition,
+        plan,
+    ))
+}
+
+/// The rest of the fleet, as ordered failover targets for a stage whose primary is
+/// `workers[primary % workers.len()]`.
+///
+/// Placement is unchanged — the primary is still whatever the assignment rule chose, because
+/// changing it would change fan-out, which is a different question from fault tolerance. This only
+/// answers "if that worker is gone, who else?", and every worker is a valid answer: the stage is
+/// content-addressed and re-materializes identically wherever it lands
+/// ([`crate::stage_cache::StageCache`]).
+///
+/// The list is **rotated to start just after the primary** rather than always at worker 0. Losing a
+/// node fails several stages at once, and if every one of them named worker 0 as its first backup,
+/// recovery would stampede the whole query onto a single machine — trading a failure for an
+/// overload. Rotating spreads the reassignments the way the primary assignment is already spread.
+///
+/// A one-worker fleet yields an empty list: no reassignment is possible, and today's behavior is
+/// preserved exactly.
+fn failover_targets(workers: &[String], primary: usize) -> Vec<String> {
+    (1..workers.len())
+        .map(|offset| workers[(primary + offset) % workers.len()].clone())
+        .collect()
 }
 
 /// Funnel `plan` into the single partition a [`FlightReaderExec`] exposes.
@@ -1305,5 +1353,29 @@ mod tests {
             .unwrap(),
         );
         assert!(!is_partition_wise(&repartition));
+    }
+
+    #[test]
+    fn failover_targets_are_the_rest_of_the_fleet_rotated_after_the_primary() {
+        let fleet: Vec<String> = ["w0", "w1", "w2", "w3"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        // Each stage prefers a *different* first backup, so losing a node does not stampede every
+        // orphaned stage onto the same machine.
+        assert_eq!(failover_targets(&fleet, 0), vec!["w1", "w2", "w3"]);
+        assert_eq!(failover_targets(&fleet, 1), vec!["w2", "w3", "w0"]);
+        assert_eq!(failover_targets(&fleet, 3), vec!["w0", "w1", "w2"]);
+        // The primary never appears in its own failover list.
+        for primary in 0..fleet.len() {
+            assert!(!failover_targets(&fleet, primary).contains(&fleet[primary]));
+        }
+    }
+
+    #[test]
+    fn a_single_worker_fleet_has_no_failover_targets() {
+        // One worker means today's behavior exactly: one target, one chance.
+        let fleet = vec!["w0".to_string()];
+        assert!(failover_targets(&fleet, 0).is_empty());
     }
 }

@@ -29,13 +29,22 @@
 //! at fetch time (see [`fetch_stream`]), so all consumers of one producer name the same cache
 //! entry without any coordinator-side stage assignment.
 //!
+//! # Failover
+//!
+//! Because a stage is content-addressed and materialized once per worker, *who* runs it does not
+//! change *what* it produces. [`fetch_partition_with_failover`] turns that property into fault
+//! tolerance: a pull that fails for a transport reason is reassigned to the next candidate worker,
+//! while a pull that fails for a request reason ([`Status::invalid_argument`], [`Status::internal`]
+//! — the two faults `do_get` raises about itself) is surfaced immediately, because an identical
+//! fleet would only reproduce it. See [`crate::retry`] for the classification contract.
+//!
 //! Note: coordinator and worker MUST run the identical DataFusion build — serialized plans
 //! are not cross-version compatible.
 
 use std::pin::Pin;
 use std::sync::Arc;
 
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use arrow_flight::decode::FlightRecordBatchStream;
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -54,6 +63,7 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::retry::{Retriability, RetryPolicy, classify};
 use crate::stage_cache::{MaterializedStage, StageCache, stage_id_of};
 
 /// Boxed tonic response stream.
@@ -323,20 +333,142 @@ pub async fn fetch(
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>> {
     let plan_bytes = serialize_plan(plan)?;
+    fetch_partition(worker_url, partition, plan_bytes).await
+}
+
+/// Ship `plan` to the first worker in `candidates` that can serve it, failing over to the next on a
+/// [retriable](Retriability::Retriable) failure.
+///
+/// This is [`fetch`] with the fleet behind it. The coordinator's boundary-less path — a query with
+/// no distribution boundary, shipped whole to one worker — used to name a single address, so a fleet
+/// of ten with one dead task failed the query nine healthy workers short of having to. Reassignment
+/// is safe for the same reason it is safe at the [`FlightReaderExec`] pull boundary: the plan is
+/// self-contained, the stage id is a content hash of its bytes, and the worker materializes it once
+/// into its [`StageCache`] — so whoever runs it produces identical output.
+///
+/// Uses the default [`RetryPolicy`]; each candidate is tried at most once, in order.
+///
+/// [`FlightReaderExec`]: crate::remote::FlightReaderExec
+pub async fn fetch_with_failover(
+    candidates: &[String],
+    partition: u32,
+    plan: Arc<dyn ExecutionPlan>,
+) -> Result<Vec<RecordBatch>> {
+    let plan_bytes = serialize_plan(plan)?;
+    fetch_partition_with_failover(candidates, partition, plan_bytes, &RetryPolicy::default()).await
+}
+
+/// Pull one partition **completely** from one worker.
+///
+/// The full collection is the point, not an accident: it is the unit the failover loop retries. See
+/// [`fetch_partition_with_failover`] for why a half-delivered partition cannot be resumed.
+async fn fetch_partition(
+    worker_url: &str,
+    partition: u32,
+    plan_bytes: Vec<u8>,
+) -> Result<Vec<RecordBatch>> {
     let stream = fetch_stream(worker_url.to_string(), partition, plan_bytes).await?;
-    let batches = stream
+    stream
         .try_collect::<Vec<_>>()
         .await
-        .context("decoding flight data stream")?;
-    Ok(batches)
+        .with_context(|| format!("streaming partition {partition} from worker {worker_url}"))
+}
+
+/// Fetch one partition of an already-serialized plan, walking `candidates` until one answers.
+///
+/// The retry unit is **a whole partition**, deliberately. A stage pull that has already handed
+/// batches downstream cannot be reassigned: the replacement worker re-materializes the stage from
+/// the top (that is exactly what makes it safe to re-run), so re-pulling after a partial delivery
+/// would emit those first batches twice and silently duplicate rows. A retry that corrupts the
+/// answer is worse than the failure it replaces, so nothing is emitted until a complete
+/// `Vec<RecordBatch>` is in hand.
+///
+/// Termination: each candidate is tried **once**, in order, so the retry budget is the candidate
+/// list itself — no cycling, no unbounded loop. A fatal classification (see [`classify`]) returns
+/// immediately and names the worker; a retriable one logs, backs off, and moves to the next
+/// candidate. When the list runs out, the error names *every* candidate tried and keeps the last
+/// underlying cause in its chain, because a query-level failure must still say what failed.
+pub async fn fetch_partition_with_failover(
+    candidates: &[String],
+    partition: u32,
+    plan_bytes: Vec<u8>,
+    policy: &RetryPolicy,
+) -> Result<Vec<RecordBatch>> {
+    if candidates.is_empty() {
+        bail!("no worker candidates to fetch partition {partition} from");
+    }
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for (attempt, worker_url) in candidates.iter().enumerate() {
+        match fetch_partition(worker_url, partition, plan_bytes.clone()).await {
+            Ok(batches) => {
+                if attempt > 0 {
+                    tracing::info!(
+                        worker = %worker_url,
+                        partition,
+                        attempt = attempt + 1,
+                        "stage reassigned to a healthy worker after a retriable failure"
+                    );
+                }
+                return Ok(batches);
+            }
+            Err(err) => match classify(&err) {
+                Retriability::Fatal => {
+                    return Err(err.context(format!(
+                        "worker {worker_url} failed serving partition {partition}; not retried \
+                         (the fault is in the request, and every worker runs the identical build)"
+                    )));
+                }
+                Retriability::Retriable => {
+                    match candidates.get(attempt + 1) {
+                        Some(next) => tracing::warn!(
+                            failed_worker = %worker_url,
+                            next_worker = %next,
+                            partition,
+                            attempt = attempt + 1,
+                            error = %format!("{err:#}"),
+                            "worker failed serving a stage; reassigning to the next candidate"
+                        ),
+                        None => tracing::warn!(
+                            failed_worker = %worker_url,
+                            partition,
+                            attempt = attempt + 1,
+                            error = %format!("{err:#}"),
+                            "worker failed serving a stage and no healthy candidates remain"
+                        ),
+                    }
+                    last_error = Some(err);
+                    if attempt + 1 < candidates.len() {
+                        tokio::time::sleep(policy.backoff(attempt as u32)).await;
+                    }
+                }
+            },
+        }
+    }
+
+    // Exhaustion. Keep the last cause in the chain and name every target, so the operator sees both
+    // "which nodes did I lose" and "what did the last one actually say".
+    let tried = candidates.join(", ");
+    Err(last_error
+        .expect("a non-empty candidate list always records an error before exhausting")
+        .context(format!(
+            "all {} candidate worker(s) failed serving partition {partition}: {tried}",
+            candidates.len()
+        )))
 }
 
 /// Like [`fetch`], but hands back the *stream* instead of collecting it, and takes plan bytes
 /// that are already serialized.
 ///
-/// This is what [`FlightReaderExec`] needs: an `ExecutionPlan` must produce batches lazily, so
-/// buffering a whole remote partition into a `Vec` first would defeat the point — a reduce
-/// stage should start work on the first batch, not the last.
+/// The lowest layer of the pull: one connection, one `do_get`, no policy. Everything that decides
+/// *which* worker to ask and *whether* to ask another one is built on top of it
+/// ([`fetch_partition`], [`fetch_partition_with_failover`]).
+///
+/// It used to be handed straight to [`FlightReaderExec`], which streamed batches downstream as they
+/// arrived. That is no longer safe once a lost stage can be reassigned — a half-delivered partition
+/// cannot be resumed on another worker without duplicating rows — so the reader now collects a whole
+/// partition before emitting. The streaming shape stays here because it is the honest primitive, and
+/// because a future incremental-with-resume design (per-batch sequencing) would build on it.
 ///
 /// [`FlightReaderExec`]: crate::remote::FlightReaderExec
 pub async fn fetch_stream(
@@ -362,7 +494,7 @@ pub async fn fetch_stream(
     let flight_data = client
         .do_get(ticket)
         .await
-        .context("do_get request")?
+        .with_context(|| format!("do_get request to worker {worker_url}"))?
         .into_inner()
         .map_err(|status| FlightError::ExternalError(Box::new(status)));
 
@@ -396,5 +528,93 @@ mod tests {
         // Fewer than the 12 header bytes must error, not panic.
         assert!(decode_ticket(&[1, 2]).is_err());
         assert!(decode_ticket(&[0; TICKET_HEADER_LEN - 1]).is_err());
+    }
+
+    /// A candidate list with nothing in it is a planner bug, not a fleet outage — say so plainly
+    /// instead of returning an empty result that would look like a legitimately empty partition.
+    #[tokio::test]
+    async fn an_empty_candidate_list_is_rejected() {
+        let err = fetch_partition_with_failover(&[], 0, b"plan".to_vec(), &RetryPolicy::default())
+            .await
+            .expect_err("no candidates is invalid");
+        assert!(
+            err.to_string().contains("no worker candidates"),
+            "got: {err}"
+        );
+    }
+
+    /// A `127.0.0.1` address with nothing listening: bind a port, read it, drop the listener. A
+    /// connection there is refused immediately — the cheapest faithful stand-in for a lost worker.
+    async fn dead_worker_url() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        format!("http://{addr}")
+    }
+
+    /// A zero-wait policy: these tests are about the loop's shape, and the backoff *schedule* is
+    /// covered in [`crate::retry`].
+    fn instant_policy() -> RetryPolicy {
+        RetryPolicy {
+            base_backoff: std::time::Duration::ZERO,
+            max_backoff: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Exhaustion must name every target tried, not just the first one to fail — losing a whole
+    /// fleet is a different operational story from losing one node, and the error has to tell it.
+    #[tokio::test]
+    async fn exhausting_every_candidate_names_them_all() {
+        let candidates = vec![
+            dead_worker_url().await,
+            dead_worker_url().await,
+            dead_worker_url().await,
+        ];
+
+        let err =
+            fetch_partition_with_failover(&candidates, 7, b"plan".to_vec(), &instant_policy())
+                .await
+                .expect_err("every candidate is unreachable");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("all 3 candidate worker(s) failed serving partition 7"),
+            "got: {message}"
+        );
+        for candidate in &candidates {
+            assert!(
+                message.contains(candidate),
+                "exhaustion must name `{candidate}`, got: {message}"
+            );
+        }
+        // The last underlying cause survives in the chain, so the operator still learns *why*.
+        assert!(
+            format!("{err:#}").contains("Connection refused"),
+            "the last cause must remain in the chain, got: {err:#}"
+        );
+    }
+
+    /// A malformed worker URL is a coordinator-side configuration fault, not a fleet outage: it
+    /// would fail identically against every candidate, so it is fatal and stops at the first one.
+    /// (`discover_workers` validates scheme and port, so a well-configured fleet never gets here.)
+    #[tokio::test]
+    async fn a_malformed_worker_url_is_fatal_and_never_replayed() {
+        let candidates = vec![
+            "not a uri at all".to_string(),
+            dead_worker_url().await,
+            dead_worker_url().await,
+        ];
+
+        let err =
+            fetch_partition_with_failover(&candidates, 0, b"plan".to_vec(), &instant_policy())
+                .await
+                .expect_err("a malformed url cannot be fetched from");
+
+        let message = err.to_string();
+        assert!(message.contains("not retried"), "got: {message}");
+        assert!(
+            !message.contains("all 3 candidate"),
+            "a fatal fault must not walk the fleet, got: {message}"
+        );
     }
 }
