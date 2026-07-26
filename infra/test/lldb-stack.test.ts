@@ -1,7 +1,14 @@
 import * as cdk from 'aws-cdk-lib';
 import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import { Template, Match } from 'aws-cdk-lib/assertions';
-import { LldbStack, LldbStackProps, WORKER_PORT, NAMESPACE, WORKER_SERVICE_NAME } from '../lib/lldb-stack';
+import {
+  LldbStack,
+  LldbStackProps,
+  WORKER_PORT,
+  NAMESPACE,
+  WORKER_SERVICE_NAME,
+  WAREHOUSE_ENDPOINT_TEMPLATE,
+} from '../lib/lldb-stack';
 
 const IMAGE_TAG = '0.1.0+abcdef123456';
 
@@ -105,6 +112,134 @@ describe('worker fleet', () => {
       expect(() => synth({ workerCount })).toThrow(/positive integer/);
     },
   );
+});
+
+describe('virtual warehouses', () => {
+  /** Every ECS service in the template, paired with the Cloud Map name its tasks register under. */
+  function warehouseServices(template: Template): { desiredCount: number; discoveryId: string }[] {
+    return Object.values(template.findResources('AWS::ECS::Service')).map((service: any) => ({
+      desiredCount: service.Properties.DesiredCount,
+      discoveryId: JSON.stringify(service.Properties.ServiceRegistries),
+    }));
+  }
+
+  /** Cloud Map service names, i.e. the DNS labels a warehouse is reachable at. */
+  function discoveryNames(template: Template): string[] {
+    return Object.values(template.findResources('AWS::ServiceDiscovery::Service'))
+      .map((s: any) => s.Properties.Name)
+      .sort();
+  }
+
+  test('the default is one `worker` warehouse — the pre-warehouse fleet, unchanged', () => {
+    // Adopting warehouses must not move anyone's fleet: same name, same size, same DNS.
+    const template = synth();
+    expect(discoveryNames(template)).toEqual([WORKER_SERVICE_NAME]);
+    template.resourceCountIs('AWS::ECS::Service', 1);
+    template.hasResourceProperties('AWS::ECS::Service', { DesiredCount: 2 });
+  });
+
+  test('two warehouses of different sizes get two services and two DNS names', () => {
+    // The acceptance criterion, in infrastructure: independently sized pools, separately
+    // addressable, sharing the one warehouse bucket.
+    const template = synth({
+      warehouses: [
+        { name: 'analytics', size: 4 },
+        { name: 'etl', size: 1 },
+      ],
+    });
+    expect(discoveryNames(template)).toEqual(['analytics', 'etl']);
+    const counts = warehouseServices(template)
+      .map((s) => s.desiredCount)
+      .sort();
+    expect(counts).toEqual([1, 4]);
+    // Each warehouse's tasks register with its own Cloud Map service — no two share a record.
+    const registries = warehouseServices(template).map((s) => s.discoveryId);
+    expect(new Set(registries).size).toBe(2);
+  });
+
+  test('a suspended warehouse deploys at desiredCount 0 but keeps its definition', () => {
+    // Suspension frees compute without discarding the warehouse: the service and its DNS name
+    // survive, so resuming is a desired-count change rather than a re-creation.
+    const template = synth({
+      warehouses: [
+        { name: 'analytics', size: 4 },
+        { name: 'nightly', size: 8, state: 'suspended' },
+      ],
+    });
+    const counts = warehouseServices(template)
+      .map((s) => s.desiredCount)
+      .sort((a, b) => a - b);
+    expect(counts).toEqual([0, 4]);
+    expect(discoveryNames(template)).toEqual(['analytics', 'nightly']);
+  });
+
+  test('every warehouse gets scoped access to the same warehouse bucket', () => {
+    // Compute is partitioned; storage is not. Three warehouses + the coordinator = four task
+    // roles, each scoped to the one bucket.
+    const template = synth({
+      warehouses: [
+        { name: 'a', size: 1 },
+        { name: 'b', size: 1 },
+        { name: 'c', size: 1 },
+      ],
+    });
+    const taskRolePolicies = Object.entries(template.findResources('AWS::IAM::Policy')).filter(([name]) =>
+      name.includes('TaskRoleDefaultPolicy'),
+    );
+    expect(taskRolePolicies).toHaveLength(4);
+    for (const [, policy] of taskRolePolicies) {
+      for (const statement of (policy as any).Properties.PolicyDocument.Statement) {
+        expect(JSON.stringify(statement.Resource)).toContain('Warehouse');
+      }
+    }
+  });
+
+  test('the coordinator gets the routing template, and defaults to the first warehouse', () => {
+    const coordinator = containers(
+      synth({
+        warehouses: [
+          { name: 'analytics', size: 2 },
+          { name: 'etl', size: 1 },
+        ],
+      }),
+    ).find((c) => c.Name === 'coordinator');
+    const env = Object.fromEntries(coordinator.Environment.map((e: any) => [e.Name, e.Value]));
+    // `--warehouse <name>` renders into this; the placeholder is what makes each warehouse
+    // resolve to its own fleet rather than all of them to one.
+    expect(env.LLDB_WAREHOUSE_ENDPOINT).toBe(WAREHOUSE_ENDPOINT_TEMPLATE);
+    expect(env.LLDB_WAREHOUSE_ENDPOINT).toContain('{warehouse}');
+    // …and with no `--warehouse` at all, the pre-warehouse path still points somewhere real.
+    expect(env.LLDB_WORKERS).toBe(`http://analytics.${NAMESPACE}:${WORKER_PORT}`);
+  });
+
+  // Each of these would otherwise fail at deploy or, worse, synthesize something unroutable:
+  // a name that is not a DNS label yields a Cloud Map record nothing resolves, a duplicate yields
+  // two services fighting over one record, and `-c warehouses=…` sizes arrive as strings through
+  // Number(), so a typo becomes NaN.
+  const badWarehouses: [string, any[], RegExp][] = [
+    ['an uppercase name', [{ name: 'Analytics', size: 1 }], /DNS label/],
+    ['an underscore', [{ name: 'wh_1', size: 1 }], /DNS label/],
+    ['a leading dash', [{ name: '-lead', size: 1 }], /DNS label/],
+    ['a name over 63 characters', [{ name: 'a'.repeat(64), size: 1 }], /DNS label/],
+    ['a duplicate name', [{ name: 'a', size: 1 }, { name: 'a', size: 2 }], /duplicate warehouse name/],
+    ['size zero', [{ name: 'a', size: 0 }], /positive integer/],
+    ['a size that failed to parse', [{ name: 'a', size: NaN }], /positive integer/],
+    ['a fractional size', [{ name: 'a', size: 1.5 }], /positive integer/],
+    ['an empty list', [], /at least one warehouse/],
+  ];
+  test.each(badWarehouses)('refuses %s', (_label, warehouses, pattern) => {
+    expect(() => synth({ warehouses })).toThrow(pattern);
+  });
+
+  test('rejects an unknown state rather than treating it as running', () => {
+    expect(() => synth({ warehouses: [{ name: 'a', size: 1, state: 'paused' as any }] })).toThrow(/unknown state/);
+  });
+
+  test('workerCount and warehouses cannot both be given', () => {
+    // Both express the same thing; a stack that silently picked one would deploy a fleet whose
+    // size nobody asked for.
+    expect(() => synth({ workerCount: 3, warehouses: [{ name: 'a', size: 1 }] })).toThrow(/mutually exclusive/);
+  });
 });
 
 describe('security', () => {

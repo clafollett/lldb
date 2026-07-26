@@ -46,10 +46,12 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
   (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
-  config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`)
+  config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`),
+  virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
-  The coordinator package also builds `lldb-qe-migrate` (`src/bin/`), the one-shot that applies
-  the services-DB migrations
+  The coordinator package also builds the control-plane one-shots (`src/bin/`):
+  `lldb-qe-migrate` (applies the services-DB migrations) and `lldb-qe-warehouse`
+  (create/list/resize/suspend/resume a warehouse)
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
 - `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
   worker-fleet cluster
@@ -104,7 +106,12 @@ where transactions and constraints arbitrate instead of hope. Two rules:
    migrate — a rolling fleet racing the same DDL is a production footgun.
 2. **An unconfigured services DB is legal.** `ServicesArgs::connect` returns `None`, and
    single-node/local paths must keep working without Postgres. Never make `cargo run` need a
-   database.
+   database. Warehouse routing follows the same rule: `--warehouse` is opt-in, and without it
+   `--workers` behaves exactly as it always has.
+3. **The control plane is desired state; it does not actuate.** A warehouse row says how much
+   compute *should* exist; ECS/compose makes it so. Do NOT add an orchestrator SDK to the engine
+   binaries — it would breach the one-version dependency wall above and hard-code one cloud into
+   the control plane.
 
 Passwords are never logged: `ServicesArgs` has a hand-written redacting `Debug`, and every
 message naming a connection URL goes through `services::redact_url` first.
@@ -127,6 +134,12 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test services
 # Shared Iceberg catalog (`backend = { kind = "sql" }`): proves two independently-built
 # lakehouses on one Postgres see the same tables and the same snapshot. Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test shared_sql_catalog
+# Virtual warehouses (elastic compute). The CLI writes DESIRED state; an actuator applies it —
+# `aws ecs update-service --desired-count`, a CDK deploy (-c warehouses=analytics:4,etl:1), or
+# `docker compose up -d --scale`. The engine carries no orchestrator SDK, on purpose.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
+  --metadata-url postgres://lldb@localhost/lldb create --name analytics --size 4
+cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   # route a query
 
 # DML (`DELETE`/`UPDATE`) + the concurrent-writer race. Same three-way gating. The race test
 # asserts on the *data* (four writers, `qty = qty + 1`, final value must be exactly 4), so a lost

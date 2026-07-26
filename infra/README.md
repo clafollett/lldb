@@ -47,10 +47,76 @@ aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> 
   "awsvpcConfiguration={subnets=[<TaskSubnets>],securityGroups=[<CoordinatorSecurityGroup>],assignPublicIp=<AssignPublicIp>}"
 ```
 
-Knobs: `-c workerCount=4` sizes the fleet, `-c egress=nat-instance` moves it into private
-subnets (see below), `-c servicesDb=none` drops the control plane (see below); `cpu`/`memoryLimitMiB`
-are stack props. The `TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task`
-network config for whichever mode you deployed.
+Knobs: `-c workerCount=4` sizes the default fleet, `-c warehouses=analytics:4,etl:1` deploys named
+warehouses instead (see below), `-c egress=nat-instance` moves it into private subnets (see below),
+`-c servicesDb=none` drops the control plane (see below); `cpu`/`memoryLimitMiB` are stack props.
+The `TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task` network config for
+whichever mode you deployed.
+
+## Virtual warehouses (`-c warehouses=…`)
+
+A **warehouse** is a named, independently sized pool of workers. Here that is literally *one ECS
+service per warehouse*, each registering its tasks under its own Cloud Map name, all reading the
+same S3 warehouse bucket and the same catalog:
+
+```bash
+npx cdk deploy -c imageTag=0.1.0+<sha> -c warehouses=analytics:4,etl:1,nightly:8:suspended
+```
+
+| Piece | What it is |
+| - | - |
+| `name` | The Cloud Map DNS label — `analytics.lldb.local`. Must be a DNS label (lowercase `[a-z0-9-]`, ≤63 chars); synth fails otherwise. |
+| `size` | The service's `desiredCount` while running. Kept even when suspended — it is what resume scales back to. |
+| `state` | `running` (default) or `suspended`; **suspended deploys at `desiredCount: 0`**, so the definition and its DNS name survive while the compute bill does not. |
+
+Omit the flag and you get one `worker` warehouse of `workerCount` tasks — byte for byte the fleet
+this stack deployed before warehouses existed, at the same `worker.lldb.local`. (`workerCount` and
+`warehouses` are mutually exclusive; passing both is a synth error rather than a silent choice.)
+
+Routing: the coordinator task gets `LLDB_WAREHOUSE_ENDPOINT=http://{warehouse}.lldb.local:50051`,
+and `--warehouse <name>` (`LLDB_WAREHOUSE`) renders into it. Because each warehouse's tasks are the
+only ones registered under its name, a query fans across exactly that warehouse's fleet:
+
+```bash
+aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> \
+  --launch-type FARGATE \
+  --overrides '{"containerOverrides":[{"name":"coordinator","environment":[{"name":"LLDB_WAREHOUSE","value":"analytics"}]}]}' \
+  --network-configuration "awsvpcConfiguration={subnets=[<TaskSubnets>],securityGroups=[<CoordinatorSecurityGroup>],assignPublicIp=<AssignPublicIp>}"
+```
+
+### Applying a resize, suspend or resume — the part you do by hand
+
+The services database holds the **desired state** and this stack is one of the two things that
+applies it. The engine binaries call no AWS API at all (`lldb-qe-warehouse` writes rows and prints
+the command it did *not* run), deliberately: pulling in the AWS SDK fights the one-version
+tree-wide dependency rule the Flight boundary depends on, and it would hard-code one cloud into
+the control plane.
+
+So a lifecycle change is two steps — state the desire, then apply it:
+
+```bash
+# 1. desired state (from anywhere that can reach the services DB)
+lldb-qe-warehouse resize  --name analytics --size 8
+lldb-qe-warehouse suspend --name nightly
+
+# 2a. apply it now, no deploy — the fast path
+aws ecs update-service --cluster <ClusterName> \
+  --service <analytics, from the WarehouseServices output> --desired-count 8
+aws ecs update-service --cluster <ClusterName> --service <nightly's service> --desired-count 0
+
+# 2b. or apply it durably, so the next deploy does not undo it
+npx cdk deploy -c imageTag=… -c warehouses=analytics:8,etl:1,nightly:8:suspended
+```
+
+Use **2a for speed and 2b to persist**: a bare `update-service` is reverted by the next
+`cdk deploy`, which resets `DesiredCount` from the stack's own `warehouses`. The `Warehouses` and
+`WarehouseServices` outputs give you the current definitions and the service names those commands
+need. When the two drift, the coordinator logs a warning naming both numbers — what the warehouse
+said, and what the fleet actually answered with.
+
+Locally `docker compose` plays the same role: each warehouse is a Docker **network alias**, and
+`docker compose up -d --scale worker-etl=3` is the `update-service` equivalent. See the header of
+[`docker-compose.yml`](../docker-compose.yml).
 
 ## Services database (`-c servicesDb=…`)
 
@@ -100,8 +166,9 @@ The tests assert the invariants rather than a snapshot: both roles resolve the *
 unpinned tag is refused, the Flight port is reachable only from the coordinator's security group,
 Postgres is reachable only from the task security groups, the database password is a secret
 reference rather than plain environment, task roles are scoped to the warehouse bucket, each
-egress and `servicesDb` mode builds what it claims to, and — in *every* mode — no security group
-admits `0.0.0.0/0`.
+egress and `servicesDb` mode builds what it claims to, warehouses become one service and one
+Cloud Map name each (with a suspended one at `desiredCount: 0`, and an unroutable name refused at
+synth), and — in *every* mode — no security group admits `0.0.0.0/0`.
 
 ## Egress: how tasks reach ECR (`-c egress=…`)
 
@@ -142,7 +209,8 @@ egress with it. Raise `natGateways` to `maxAzs` when that matters more than the 
 - **`cdk synth` warns `W9008` — "RDS instance should have StorageEncrypted set to true"** — on
   the Aurora *writer*. It is a false positive: for Aurora, storage encryption is a cluster-level
   property, and `AWS::RDS::DBCluster.StorageEncrypted` is `true` in the synthesized template.
-- **Fan-out is single-worker today.** `worker.lldb.local` resolves to every healthy task IP, but
-  the coordinator currently ships its plan to one address. Spreading a query across the fleet
-  needs DNS enumeration (or a registry) plus scan-level slicing — tracked with the engine
-  internals work, not an infrastructure gap.
+- **Warehouse state lives in two places and nothing reconciles them automatically.** The stack's
+  `warehouses` list and the services database's `warehouses` table both describe the same pools,
+  and keeping them in step is an operator's job (the coordinator warns on drift). A reconciler —
+  something that reads the table and drives ECS — is a natural next step, and is deliberately not
+  the engine's job.
