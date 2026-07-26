@@ -39,6 +39,7 @@ pub mod catalog;
 pub mod config;
 pub mod discovery;
 pub mod distributed;
+pub mod dml;
 pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
@@ -55,6 +56,7 @@ pub mod tpch;
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
 pub use discovery::discover_workers;
+pub use dml::{DmlKind, DmlOutcome, DmlStatement};
 pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{

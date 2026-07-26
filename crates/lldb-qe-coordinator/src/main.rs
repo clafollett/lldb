@@ -31,6 +31,16 @@
 //! fallbacks its [`FlightReaderExec`] leaves carry, and the offload path walks the fleet with
 //! `fetch_with_failover`. A query fails only once every healthy target has been tried.
 //!
+//! # Writes are not distributed
+//!
+//! `--sql` may also be a write. `DELETE`/`UPDATE` are answered by [`lldb_qe_core::dml`] against
+//! the manifest's catalog before the fleet is even discovered; `INSERT` goes through DataFusion
+//! but is likewise executed in this process rather than offloaded. That asymmetry is deliberate:
+//! a read fans out because N workers producing disjoint slices of one answer is the whole point,
+//! whereas a write fanned out would move a statement's commit off the machine that owns it — and
+//! for `INSERT` it does not even serialize, since `iceberg-datafusion`'s commit node holds a live
+//! catalog handle and connection pool. One statement, one committer. Reads are unchanged.
+//!
 //! # Tenancy
 //!
 //! When a services database is configured (`--metadata-url`, or the discrete `--metadata-*`
@@ -54,12 +64,15 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
+use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig, apply_manifest, build_session,
-    discover_workers, fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
+    DmlOutcome, FlightReaderExec, ServicesArgs, StorageArgs, StorageConfig, apply_manifest,
+    build_session, discover_workers, dml, fetch_with_failover, init_tracing, plan_distributed,
+    register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -147,13 +160,35 @@ async fn main() -> Result<()> {
 
     let (ctx, storage) = build_session(config).await?;
 
-    // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
-    match &cli.manifest {
+    // Populate the catalog: an explicit manifest if provided, else the TPC-H seed. The lakehouse
+    // handles are kept rather than dropped: a DML statement commits *through the catalog*, not
+    // through the DataFusion session, so it needs one.
+    let lakehouses = match &cli.manifest {
         Some(path) => {
             let manifest = Manifest::from_path(path)?;
-            apply_manifest(&ctx, &storage, &manifest).await?;
+            apply_manifest(&ctx, &storage, &manifest).await?
         }
-        None => register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?,
+        None => {
+            register_tpch_parquet(&ctx, &storage, &cli.tpch_subdir).await?;
+            Vec::new()
+        }
+    };
+
+    // DELETE/UPDATE are answered here and return, before any worker is discovered. Distributing a
+    // write would mean N processes racing to commit the same snapshot for one statement, which is
+    // exactly the concurrency this engine works to serialize — so the coordinator, which is the
+    // one process that saw the statement, is the one that performs it. Reads still fan out.
+    if let Some(outcome) = run_dml(&lakehouses, &cli.sql).await? {
+        println!(
+            "{} {} row(s); snapshot {}",
+            outcome.kind,
+            outcome.rows_changed,
+            match (outcome.committed(), outcome.snapshot_id) {
+                (true, Some(id)) => id.to_string(),
+                _ => "unchanged".to_string(),
+            }
+        );
+        return Ok(());
     }
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
@@ -173,8 +208,23 @@ async fn main() -> Result<()> {
         "discovered worker fleet"
     );
 
+    let df = ctx.sql(&cli.sql).await?;
+
+    // `INSERT` runs here for the same reason `DELETE`/`UPDATE` do: it is a write. It reaches this
+    // point rather than `run_dml` because appends go through DataFusion (`IcebergTableProvider`
+    // implements `insert_into`), so the statement is an ordinary logical plan — it is simply a
+    // plan that must not leave this process. Offloading it fails outright, because the commit node
+    // `iceberg-datafusion` puts at the plan's root carries a live catalog handle and a connection
+    // pool that no codec can serialize; and even if it could, shipping a commit to a worker would
+    // move the write's serialization point off the machine that owns the statement.
+    if matches!(df.logical_plan(), LogicalPlan::Dml(_)) {
+        let batches = df.collect().await.context("running the write")?;
+        println!("{}", pretty_format_batches(&batches)?);
+        return Ok(());
+    }
+
     // Build the physical plan, then rewrite its distribution boundaries across the whole fleet.
-    let plan = ctx.sql(&cli.sql).await?.create_physical_plan().await?;
+    let plan = df.create_physical_plan().await?;
     let coordinated = plan_distributed(Arc::clone(&plan), &fleet)?;
 
     // Policy: distribute what can be distributed and reduce locally; offload a boundary-less plan
@@ -209,6 +259,42 @@ async fn main() -> Result<()> {
 
     println!("{}", pretty_format_batches(&batches)?);
     Ok(())
+}
+
+/// Run `sql` as DML if it is a `DELETE`/`UPDATE`, against whichever catalog owns its table.
+///
+/// Returns `Ok(None)` when `sql` is a query, so the caller falls through to the normal
+/// distributed path. A DML statement whose table belongs to no configured catalog is an **error**,
+/// not a fall-through: `ctx.sql` would answer it with DataFusion's generic "unsupported logical
+/// plan", which tells an operator nothing about the manifest they forgot to pass.
+async fn run_dml(lakehouses: &[Lakehouse], sql: &str) -> Result<Option<DmlOutcome>> {
+    let Some(stmt) = dml::parse(sql)? else {
+        return Ok(None);
+    };
+    let mut refusals = Vec::new();
+    for lake in lakehouses {
+        match dml::execute_statement(lake, &stmt).await {
+            Ok(outcome) => return Ok(Some(outcome)),
+            // Only "this catalog is not the target" is worth trying the next catalog for. A real
+            // failure — a conflict, a bad predicate, a partitioned table — must surface as itself
+            // rather than be retried against an unrelated warehouse.
+            Err(e) if is_wrong_catalog(&e) => {
+                refusals.push(format!("{}: {e}", lake.catalog_name()))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    bail!(
+        "no configured catalog owns `{}` — is the right --manifest loaded? Tried: [{}]",
+        stmt.name().join("."),
+        refusals.join("; ")
+    )
+}
+
+/// Whether an error means "wrong catalog for this statement" rather than a genuine failure.
+fn is_wrong_catalog(e: &anyhow::Error) -> bool {
+    e.chain()
+        .any(|c| c.to_string().contains("but this lakehouse is catalog"))
 }
 
 /// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]

@@ -37,9 +37,19 @@
 //! `iceberg-catalog-sql`'s, not ours, so they deliberately do **not** appear in
 //! `crates/lldb-qe-core/migrations/` — our migrations own the services schema (accounts, users,
 //! warehouses, queries) and nothing else. Two owners for one table is how a schema ends up
-//! half-migrated. The catalog's bootstrap is idempotent and racing copies of it are harmless,
-//! which is also why this one is allowed to be startup magic when [`crate::services::ServicesDb`]
-//! is not: `IF NOT EXISTS` on a fixed two-table schema is not a rolling DDL migration.
+//! half-migrated. The bootstrap is idempotent, which is why this one is allowed to be startup
+//! magic when [`crate::services::ServicesDb`] is not: `IF NOT EXISTS` on a fixed two-table schema
+//! is not a rolling DDL migration.
+//!
+//! Idempotent is not the same as race-free, though, and the difference bites exactly once per
+//! database. `CREATE TABLE IF NOT EXISTS` in Postgres checks for the table and then creates it
+//! *without* taking a lock that would make the pair atomic, so two processes opening a catalog
+//! against a **fresh** database at the same moment can both pass the check and one then fails on
+//! a duplicate-key error from the system catalogs. `iceberg-catalog-sql` surfaces that as an
+//! opaque error with no message. Since the whole point of a shared catalog is that a fleet boots
+//! against it simultaneously — and [`crate::dml`] opens one per writer — [`Lakehouse::open_sql`]
+//! retries a few times before giving up. Once the tables exist the race cannot recur, so the
+//! retry costs nothing on any subsequent open.
 //!
 //! # Storage: the local filesystem, and an honest error for everything else
 //!
@@ -62,6 +72,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::datatypes::Schema as ArrowSchema;
@@ -73,8 +84,20 @@ use iceberg::{Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, TableCreation,
 use iceberg_catalog_sql::{SqlBindStyle, SqlCatalogBuilder};
 use iceberg_datafusion::IcebergCatalogProvider;
 
+use sqlx::postgres::{PgPool, PgPoolOptions};
+use tokio::sync::OnceCell;
+
 use crate::manifest::CatalogBackend;
 use crate::services::{ServicesArgs, redact_url};
+
+/// How many times [`Lakehouse::open_sql`] will try before reporting a failure.
+///
+/// Bounded, and deliberately blind: the only failure it exists to absorb — two processes racing
+/// `CREATE TABLE IF NOT EXISTS` on a fresh database — arrives as an error with no message to
+/// match on, and sniffing a dependency's error text for a Postgres SQLSTATE would be a worse bug
+/// than the one it fixes. Opening a catalog is a connect plus two DDL statements, so a genuine
+/// bad-URL or bad-credentials failure pays 150ms before reporting itself unchanged.
+const BOOTSTRAP_ATTEMPTS: u32 = 3;
 
 /// An Iceberg catalog plus the glue to create tables and expose them to DataFusion.
 ///
@@ -83,6 +106,54 @@ use crate::services::{ServicesArgs, redact_url};
 pub struct Lakehouse {
     catalog: Arc<dyn Catalog>,
     catalog_name: String,
+    /// The compare-and-swap this catalog commits through, when it has one. See
+    /// [`CatalogCommitPoint`] and [`crate::dml`].
+    commit_point: Option<CatalogCommitPoint>,
+}
+
+/// The row in `iceberg_tables` whose `metadata_location` column *is* a table's committed state,
+/// plus a connection to the database that arbitrates changes to it.
+///
+/// [`crate::dml`] needs this because iceberg-rust 0.10 has no public way to hand a catalog an
+/// arbitrary [`iceberg::TableUpdate`] — `TableCommit`'s builder is `pub(crate)` and
+/// `TransactionAction` is a private trait, so the only committable action the crate exposes is
+/// `fast_append`. A copy-on-write `DELETE`/`UPDATE` therefore has to perform the pointer swap
+/// itself, and it performs *exactly* the swap `iceberg-catalog-sql` performs: a conditional
+/// `UPDATE ... WHERE metadata_location = <what I read>`. Same row, same predicate, same
+/// serialization point — so a DML commit and an ordinary `INSERT` commit race each other
+/// correctly rather than through two independent mechanisms that happen to touch one table.
+///
+/// The pool is separate from (and much smaller than) the one `SqlCatalog` holds internally,
+/// because that one is private. It is opened lazily: a `Lakehouse` that never runs DML never
+/// opens it.
+pub(crate) struct CatalogCommitPoint {
+    /// Connection URL. Never logged unredacted — see [`redact_url`].
+    uri: String,
+    pool: OnceCell<PgPool>,
+}
+
+impl CatalogCommitPoint {
+    /// The pool, connected on first use.
+    ///
+    /// Two connections is deliberate and sufficient: a commit issues one short `UPDATE`, and the
+    /// expensive part of a DML statement (scanning and rewriting the table) holds no connection
+    /// at all. A large pool here would only add idle sockets to every process in the fleet.
+    pub(crate) async fn pool(&self) -> Result<&PgPool> {
+        self.pool
+            .get_or_try_init(|| async {
+                PgPoolOptions::new()
+                    .max_connections(2)
+                    .connect(&self.uri)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "connecting to the catalog's commit point at {}",
+                            redact_url(&self.uri)
+                        )
+                    })
+            })
+            .await
+    }
 }
 
 impl Lakehouse {
@@ -102,28 +173,55 @@ impl Lakehouse {
     /// which is worth knowing when a worker reports a table that "does not exist".
     pub async fn open_sql(catalog_name: &str, catalog_uri: &str, warehouse: &str) -> Result<Self> {
         let warehouse_uri = normalize_warehouse_uri(warehouse);
-        let bind_style = sql_bind_style_for(catalog_uri)?;
+        // Validated up front so a bad dialect fails immediately rather than three times over;
+        // recomputed per attempt below because `SqlBindStyle` is neither `Copy` nor `Clone`.
+        sql_bind_style_for(catalog_uri)?;
         ensure_sql_driver_compiled(catalog_uri)?;
         let storage = storage_factory_for(&warehouse_uri)?;
 
-        let catalog = SqlCatalogBuilder::default()
-            .with_storage_factory(storage)
-            .uri(catalog_uri)
-            .warehouse_location(warehouse_uri.clone())
-            .sql_bind_style(bind_style)
-            .load(catalog_name, HashMap::new())
-            .await
-            // The URI is redacted for the same reason every services-DB message redacts it: a
-            // connection failure is the error most likely to be pasted into a ticket.
-            .with_context(|| {
-                format!(
-                    "opening sql catalog `{catalog_name}` at {} (warehouse {warehouse_uri})",
+        let mut last_error = None;
+        let mut catalog = None;
+        for attempt in 0..BOOTSTRAP_ATTEMPTS {
+            match SqlCatalogBuilder::default()
+                .with_storage_factory(storage.clone())
+                .uri(catalog_uri)
+                .warehouse_location(warehouse_uri.clone())
+                .sql_bind_style(sql_bind_style_for(catalog_uri)?)
+                .load(catalog_name, HashMap::new())
+                .await
+            {
+                Ok(c) => {
+                    catalog = Some(c);
+                    break;
+                }
+                Err(e) => {
+                    last_error = Some(e);
+                    if attempt + 1 < BOOTSTRAP_ATTEMPTS {
+                        tokio::time::sleep(Duration::from_millis(50) * (attempt + 1)).await;
+                    }
+                }
+            }
+        }
+        let catalog = match catalog {
+            Some(c) => c,
+            None => {
+                // The URI is redacted for the same reason every services-DB message redacts it: a
+                // connection failure is the error most likely to be pasted into a ticket.
+                let err = last_error.expect("a failed loop leaves an error");
+                return Err(anyhow::Error::new(err).context(format!(
+                    "opening sql catalog `{catalog_name}` at {} (warehouse {warehouse_uri}) \
+                     after {BOOTSTRAP_ATTEMPTS} attempts",
                     redact_url(catalog_uri)
-                )
-            })?;
+                )));
+            }
+        };
         Ok(Self {
             catalog: Arc::new(catalog),
             catalog_name: catalog_name.to_string(),
+            commit_point: Some(CatalogCommitPoint {
+                uri: catalog_uri.to_string(),
+                pool: OnceCell::new(),
+            }),
         })
     }
 
@@ -172,12 +270,22 @@ impl Lakehouse {
         Ok(Self {
             catalog: Arc::new(catalog),
             catalog_name: catalog_name.to_string(),
+            // A MemoryCatalog keeps its table pointers behind a private mutex with no public
+            // way to swap one, and in any case it is per-process — there is nothing for two
+            // writers to race over and nothing to arbitrate the race if there were. DML says so
+            // rather than pretending; see `crate::dml`.
+            commit_point: None,
         })
     }
 
     /// The DataFusion catalog name this lakehouse registers under.
     pub fn catalog_name(&self) -> &str {
         &self.catalog_name
+    }
+
+    /// The compare-and-swap this catalog commits through, if it has one.
+    pub(crate) fn commit_point(&self) -> Option<&CatalogCommitPoint> {
+        self.commit_point.as_ref()
     }
 
     /// Create the namespace if it does not already exist.
