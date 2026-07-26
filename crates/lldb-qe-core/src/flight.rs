@@ -239,17 +239,24 @@ impl FlightService for WorkerFlightService {
         // the consumer pulls — no upfront clone of the whole partition vector. The `unfold` state
         // owns the `Arc`, so the buffer outlives the stream. Set the schema explicitly so a
         // partition with zero batches still encodes a valid (schema-only) stream.
+        // Meter what actually leaves this worker as it leaves — the cache counts materializations,
+        // this counts transfers, and a planner that shuffles a large table instead of broadcasting a
+        // small one shows up here and nowhere else. See [`StageCache::rows_served`].
         let schema = materialized.schema.clone();
-        let batch_stream =
-            futures::stream::unfold((materialized, idx, 0usize), |(stage, idx, i)| async move {
+        let meter = Arc::clone(&self.cache);
+        let batch_stream = futures::stream::unfold(
+            (materialized, idx, 0usize, meter),
+            |(stage, idx, i, meter)| async move {
                 let partition = &stage.partitions[idx];
                 if i < partition.len() {
                     let batch = partition[i].clone();
-                    Some((Ok::<_, FlightError>(batch), (stage, idx, i + 1)))
+                    meter.record_rows_served(batch.num_rows());
+                    Some((Ok::<_, FlightError>(batch), (stage, idx, i + 1, meter)))
                 } else {
                     None
                 }
-            });
+            },
+        );
         let flight_data = FlightDataEncoderBuilder::new()
             .with_schema(schema)
             .build(batch_stream)
