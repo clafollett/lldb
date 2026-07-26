@@ -78,6 +78,25 @@ exists is not re-created and, crucially, not re-seeded. Iceberg 0.10 ships no ob
 `StorageFactory`, so a `sql` catalog requires a `file://` warehouse and **errors** on `s3://`
 rather than silently writing metadata to local disk.
 
+## Writes: append is DataFusion's, `DELETE`/`UPDATE` are ours
+
+`INSERT` goes through `iceberg-datafusion`. **`DELETE` and `UPDATE` do not** — they live in
+`dml.rs`, because iceberg-rust 0.10's `Transaction` exposes only `fast_append` (no overwrite, no
+rewrite, no delete action), `TransactionAction` is `pub(crate)` and `TableCommit`'s builder is
+`pub(crate)`, so there is no public way to commit a snapshot that *removes* a file. `dml.rs`
+therefore assembles the snapshot by hand and commits it with the same conditional
+`UPDATE iceberg_tables ... WHERE metadata_location = <what I read>` that `iceberg-catalog-sql`
+uses — one row, one serialization point, so a DML commit and an `INSERT` commit race each other
+correctly. The loser re-plans against the winner's snapshot (bounded retries) rather than
+erroring, which is a serializable outcome.
+
+Consequences worth knowing: DML is a **whole-table copy-on-write rewrite** (O(table) per
+statement — the cheaper shapes all need a remove-files commit); it requires a **`sql` catalog**,
+an unpartitioned **v2** table, and rejects `MERGE`; and writes are **not distributed** — the
+coordinator answers them itself. `MERGE` is out because its cardinality-violation rule cannot be
+approximated safely, not because of Iceberg. Do not "fix" DML by dropping and recreating a table:
+that loses snapshot lineage and the commit race with it.
+
 ## Control-plane state lives in Postgres
 
 Data-plane state (bytes in object storage, Arrow in flight, the per-worker stage cache) is
@@ -138,6 +157,11 @@ cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   #
 # Result cache (`result_cache.rs`): proves a repeat query over unchanged tables executes nothing,
 # and that an Iceberg commit invalidates it. Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test result_cache_db
+
+# DML (`DELETE`/`UPDATE`) + the concurrent-writer race. Same three-way gating. The race test
+# asserts on the *data* (four writers, `qty = qty + 1`, final value must be exactly 4), so a lost
+# or double-applied commit fails it as a wrong number rather than as an error.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test dml_snapshots
 
 # Query scheduler. `lldb-qe-coordinator` runs ONE query and exits (compose and the cluster smoke
 # test depend on that, unchanged). `lldb-qe-server` is the long-running shape: concurrent

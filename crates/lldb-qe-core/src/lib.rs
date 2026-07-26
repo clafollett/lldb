@@ -44,6 +44,7 @@ pub mod catalog;
 pub mod config;
 pub mod discovery;
 pub mod distributed;
+pub mod dml;
 pub mod engine;
 pub mod flight;
 pub mod lakehouse;
@@ -69,6 +70,7 @@ pub use discovery::{
     DEFAULT_WAREHOUSE_ENDPOINT, WAREHOUSE_PLACEHOLDER, discover_workers, discover_workers_with,
     render_warehouse_endpoint,
 };
+pub use dml::{DmlKind, DmlOutcome, DmlStatement};
 pub use engine::{
     CatalogSource, build_query_session, contains_flight_reader, execute_query,
     execute_query_cached, reject_inmemory_storage, resolve_fleet,

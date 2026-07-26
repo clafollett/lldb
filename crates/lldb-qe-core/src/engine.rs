@@ -22,6 +22,16 @@
 //! fallbacks its leaves carry, and the offload path walks the fleet with
 //! [`fetch_with_failover`](crate::fetch_with_failover).
 //!
+//! # Writes are the exception: they never leave this process
+//!
+//! An `INSERT` reaches [`execute_query_cached`] as an ordinary [`LogicalPlan::Dml`], because
+//! appends go through DataFusion (`IcebergTableProvider` implements `insert_into`). It is executed
+//! locally rather than distributed, and that is not a limitation to be lifted later: the commit
+//! node `iceberg-datafusion` puts at the plan's root carries a live catalog handle and a connection
+//! pool no codec can serialize, and fanning a write out would move its serialization point off the
+//! machine that owns the statement. One statement, one committer. `DELETE`/`UPDATE` never get here
+//! at all — [`crate::dml`] answers them against the catalog directly.
+//!
 //! # What this does NOT do
 //!
 //! - **No admission control, no query id, no history.** This is the execution path; the scheduler
@@ -52,6 +62,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
 use datafusion::prelude::SessionContext;
@@ -218,6 +229,23 @@ pub async fn execute_query_cached(
         bail!("cannot run a query with no workers");
     }
     execute_cached(ctx, cache, lakehouses, account_id, sql, |logical| async {
+        // `INSERT` is a write, and it must not leave this process. It arrives here rather than
+        // through [`crate::dml`] because appends go through DataFusion (`IcebergTableProvider`
+        // implements `insert_into`), so it is an ordinary logical plan — just one that cannot be
+        // offloaded: the commit node `iceberg-datafusion` puts at its root carries a live catalog
+        // handle and a connection pool no codec can serialize, and shipping a commit to a worker
+        // would move the write's serialization point off the machine that owns the statement. It
+        // sits inside the cache closure because a write is never cacheable, so this is the one
+        // place it can be caught without planning the statement a second time.
+        if matches!(logical, LogicalPlan::Dml(_)) {
+            return ctx
+                .execute_logical_plan(logical)
+                .await?
+                .collect()
+                .await
+                .context("running the write");
+        }
+
         // `execute_logical_plan` rather than `create_physical_plan` straight off the logical plan:
         // it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted through
         // `--sql` still take effect. Those statements are never cacheable, so they reach here
