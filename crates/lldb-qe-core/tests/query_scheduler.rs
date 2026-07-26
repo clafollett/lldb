@@ -661,3 +661,141 @@ async fn shutdown_body(harness: &Harness) -> Result<()> {
     );
     Ok(())
 }
+
+/// A client that hangs up mid-query must not leave its history row `queued`/`running` forever.
+///
+/// This matters beyond tidiness. `list_active_queries` is what an operator reads to see what a
+/// coordinator is doing, and the sweep-line over `started_at`/`finished_at` is one of the two
+/// instruments this very file uses to *prove* the concurrency bound. A row that never reaches a
+/// terminal state corrupts both — silently, and in the direction of "busier than it really is".
+/// Clients disconnecting is ordinary rather than exceptional, so this is a routine path.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_query_abandoned_by_its_client_is_closed_out_rather_than_left_active() -> Result<()> {
+    let Some((db, _target)) = db_or_skip("abandonment").await? else {
+        return Ok(());
+    };
+    let harness = Harness::start(db, "gone").await?;
+    let result = abandonment_body(&harness).await;
+    harness.cleanup().await?;
+    result
+}
+
+/// How long the abandonment test will wait for an asynchronous state change before giving up.
+///
+/// Deliberately generous, and the generosity costs nothing: both waits below exit the instant the
+/// state they want appears, so this bound is only ever reached on a genuine failure. It is sized
+/// for the worst case that actually happens — `cargo test --workspace` runs this binary alongside
+/// two dozen others on a saturated machine, and the guard's terminal write is a spawned task that
+/// has to be scheduled and then make a database round trip. A tight bound here would produce a
+/// test that fails under load and passes alone, which is worse than having no test at all.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
+
+async fn abandonment_body(harness: &Harness) -> Result<()> {
+    // Hold every permit the warehouse has, so the query below cannot be admitted and parks at the
+    // one await that matters. Taken from the coordinator's own gate, keyed by warehouse name, so
+    // these are the very permits it will try to take.
+    let gate = harness
+        .coordinator
+        .scheduler()
+        .admission_for(&harness.warehouse, WAREHOUSE_SIZE as usize);
+    let mut held = Vec::new();
+    for _ in 0..WAREHOUSE_SIZE {
+        held.push(gate.acquire().await.expect("the gate starts empty"));
+    }
+
+    let request = QueryRequest::new(workload(0)).on_warehouse(harness.warehouse.clone());
+    let query_id = {
+        let mut running = Box::pin(harness.coordinator.run_query(request, Some(&harness.token)));
+        // Drive it until it is **parked in the line**, and wait for that specific signal rather
+        // than for the history row to appear.
+        //
+        // The distinction is the whole test. The row is inserted by an `await` inside
+        // `record_submission`, and that insert commits before the future is resumed with its
+        // result — so there is a window where the row is visible to this connection while
+        // `run_query` has not yet reached the line that constructs its guard. Dropping in that
+        // window destroys a future that has nothing to clean up, and the test would be asserting
+        // that a guard which never existed did not run. (It is not hypothetical: waiting on the
+        // row alone failed roughly one run in six, here and in CI.)
+        //
+        // `queued == 1` on the gate is the precise signal, because reaching it means the future
+        // got past `record_submission` *and* past guard construction, and is now blocked on a
+        // permit that this test is holding — so it will stay there until dropped.
+        let mut found = None;
+        let deadline = std::time::Instant::now() + PATIENCE;
+        while std::time::Instant::now() < deadline {
+            assert!(
+                futures::poll!(&mut running).is_pending(),
+                "no permit is free, so this cannot complete"
+            );
+            if gate.snapshot().queued == 1 {
+                let active = harness.db.list_active_queries(harness.account_id).await?;
+                let record = active
+                    .first()
+                    .context("the query is queued on the gate, so its row must exist")?;
+                assert_eq!(record.state, QueryState::Queued);
+                found = Some(record.id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        found.context("the query never reached the queue")?
+    }; // <- the future is dropped here: exactly what tonic does when a client disconnects.
+
+    // The terminal write is handed to the runtime by the guard's `Drop`, so it lands shortly after
+    // rather than synchronously. Wait on the guard's own counters, not just on the row: if this
+    // ever fails, the counters say *which* half broke — a guard that never fired, versus a guard
+    // that fired and could not write — and that distinction is the whole diagnosis.
+    let mut final_state = None;
+    let deadline = std::time::Instant::now() + PATIENCE;
+    while std::time::Instant::now() < deadline {
+        let history = harness.db.list_queries(harness.account_id, 8).await?;
+        if let Some(record) = history.iter().find(|r| r.id == query_id)
+            && record.state != QueryState::Queued
+        {
+            final_state = Some(record.clone());
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+
+    let record = final_state.with_context(|| {
+        format!(
+            "the abandoned query was never closed out (guard closed {}, failed to close {}) — \
+             if both are zero the guard never fired; if the second is non-zero it fired and the \
+             write failed",
+            lldb_qe_core::server::abandoned_closed(),
+            lldb_qe_core::server::abandoned_unclosed(),
+        )
+    })?;
+    assert_eq!(
+        record.state,
+        QueryState::Failed,
+        "an abandoned query did not succeed, and it is certainly not still waiting"
+    );
+    assert!(
+        record.finished_at.is_some(),
+        "a terminal row must carry a finish time"
+    );
+    assert!(
+        record.started_at.is_none(),
+        "it was abandoned while queued, so it never started — history must not claim otherwise"
+    );
+    assert!(
+        record
+            .error
+            .as_deref()
+            .is_some_and(|e| e.contains("disconnected")),
+        "the reason must say what happened, not merely that it failed: {:?}",
+        record.error
+    );
+
+    // The whole point: nothing is left active, so the operator view and the sweep-line are clean.
+    let active = harness.db.list_active_queries(harness.account_id).await?;
+    assert!(
+        active.is_empty(),
+        "no query should still be active, but found {active:?}"
+    );
+
+    drop(held);
+    Ok(())
+}
