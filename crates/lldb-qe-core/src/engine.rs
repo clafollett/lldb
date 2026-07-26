@@ -30,10 +30,18 @@
 //! - **No catalog caching between calls.** [`build_query_session`] is called once per process, not
 //!   once per query. Sharing one [`SessionContext`] across concurrent queries is safe and is
 //!   exactly what the server does.
-//! - **No result cache, no cancellation, no partial results.** Batches are collected whole before
-//!   they are returned, which is what makes stage reassignment safe (see
+//! - **No cancellation, no partial results.** Batches are collected whole before they are
+//!   returned, which is what makes stage reassignment safe (see
 //!   [`crate::flight::fetch_partition_with_failover`] for why a half-delivered partition cannot be
 //!   resumed).
+//!
+//! # The result cache sits *above* the policy, not beside it
+//!
+//! [`execute_query_cached`] is the real entry point; [`execute_query`] is it with the cache turned
+//! off. The cache wraps the closure that does all of the above, so a hit is visibly the absence of
+//! physical planning, of the staging rewrite, and of every byte that would have crossed the wire.
+//! Putting it here rather than in each binary is the same argument the rest of this module makes:
+//! a cache the one-shot honours and the server does not is two engines again.
 
 use std::future::Future;
 use std::net::SocketAddr;
@@ -51,8 +59,10 @@ use datafusion::prelude::SessionContext;
 use crate::catalog::apply_manifest;
 use crate::discovery::{discover_workers, discover_workers_with};
 use crate::flight::fetch_with_failover;
+use crate::lakehouse::Lakehouse;
 use crate::manifest::Manifest;
 use crate::remote::FlightReaderExec;
+use crate::result_cache::{ResultCache, execute_cached};
 use crate::session::{build_session, register_tpch_parquet};
 use crate::staging::plan_distributed;
 use crate::storage::StorageConfig;
@@ -85,27 +95,36 @@ pub type BoxResolver = Arc<
         + 'static,
 >;
 
-/// Build a session with `config`'s storage backend and `catalog`'s tables registered.
+/// Build a session with `config`'s storage backend and `catalog`'s tables registered, returning it
+/// alongside the [`Lakehouse`] handles the catalog produced.
 ///
 /// One per process. A [`SessionContext`] is `Clone` and internally shared, so concurrent queries
 /// on one context is the intended usage, not a liberty.
+///
+/// The lakehouses are returned rather than dropped because they are the only thing that can answer
+/// "what snapshot is this table at", which is what makes a result-cache key safe to trust. The
+/// TPC-H seed registers plain-parquet listing tables, which have no snapshot — so that path yields
+/// no lakehouses and nothing it can query is cacheable. That is the intended behaviour, not a gap.
 pub async fn build_query_session(
     config: StorageConfig,
     catalog: &CatalogSource,
-) -> Result<SessionContext> {
+) -> Result<(SessionContext, Vec<Lakehouse>)> {
     let (ctx, storage) = build_session(config).await?;
-    match catalog {
+    let lakehouses = match catalog {
         CatalogSource::Manifest(path) => {
             let manifest = Manifest::from_path(path)?;
             apply_manifest(&ctx, &storage, &manifest)
                 .await
-                .with_context(|| format!("applying catalog manifest {}", path.display()))?;
+                .with_context(|| format!("applying catalog manifest {}", path.display()))?
         }
-        CatalogSource::Tpch { subdir } => register_tpch_parquet(&ctx, &storage, subdir)
-            .await
-            .with_context(|| format!("seeding the TPC-H tables from `{subdir}`"))?,
-    }
-    Ok(ctx)
+        CatalogSource::Tpch { subdir } => {
+            register_tpch_parquet(&ctx, &storage, subdir)
+                .await
+                .with_context(|| format!("seeding the TPC-H tables from `{subdir}`"))?;
+            Vec::new()
+        }
+    };
+    Ok((ctx, lakehouses))
 }
 
 /// The coordinator's in-memory object store is per-process, so a remote worker can never see data
@@ -166,23 +185,62 @@ pub async fn resolve_fleet(
 
 /// Plan `sql` in `ctx`, distribute it across `fleet`, run it, and collect the answer.
 ///
-/// See the module docs for the distribute-vs-offload policy. This is the function both binaries
-/// call, and the only place that policy is written down in code.
+/// [`execute_query_cached`] with no cache. Kept because plenty of callers — every test in here, and
+/// any deployment with no services database — genuinely have nothing to cache against.
 pub async fn execute_query(
     ctx: &SessionContext,
     sql: &str,
     fleet: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    execute_query_cached(ctx, None, &[], None, sql, fleet).await
+}
+
+/// Plan `sql`, answer it from `cache` when every input is unchanged, and otherwise distribute it
+/// across `fleet` and run it.
+///
+/// See the module docs for the distribute-vs-offload policy. This is the function both binaries
+/// call, and the only place that policy is written down in code.
+///
+/// Every argument the cache needs is optional, and every "no" falls through to a normal execution:
+/// no cache configured, no account resolved, an uncacheable statement, an input with no snapshot.
+/// With `None`/`&[]`/`None` the behaviour is bit-for-bit what it was before the cache existed.
+pub async fn execute_query_cached(
+    ctx: &SessionContext,
+    cache: Option<&ResultCache>,
+    lakehouses: &[Lakehouse],
+    account_id: Option<i64>,
+    sql: &str,
+    fleet: &[String],
+) -> Result<Vec<RecordBatch>> {
+    // Checked before anything is planned or looked up: "there is no fleet" is a configuration
+    // error, and answering it from cache would hide a broken deployment behind a stale row.
     if fleet.is_empty() {
         bail!("cannot run a query with no workers");
     }
-    let plan = ctx
-        .sql(sql)
-        .await
-        .context("planning the query")?
-        .create_physical_plan()
-        .await
-        .context("building the physical plan")?;
+    execute_cached(ctx, cache, lakehouses, account_id, sql, |logical| async {
+        // `execute_logical_plan` rather than `create_physical_plan` straight off the logical plan:
+        // it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted through
+        // `--sql` still take effect. Those statements are never cacheable, so they reach here
+        // unchanged.
+        let plan = ctx
+            .execute_logical_plan(logical)
+            .await
+            .context("planning the query")?
+            .create_physical_plan()
+            .await
+            .context("building the physical plan")?;
+        run_on_fleet(ctx, plan, fleet).await
+    })
+    .await
+}
+
+/// Distribute `plan` across `fleet`, run it, and collect the answer — the policy itself, with no
+/// planning and no caching around it.
+async fn run_on_fleet(
+    ctx: &SessionContext,
+    plan: Arc<dyn ExecutionPlan>,
+    fleet: &[String],
+) -> Result<Vec<RecordBatch>> {
     let coordinated = plan_distributed(Arc::clone(&plan), fleet)?;
 
     if contains_flight_reader(&coordinated) {

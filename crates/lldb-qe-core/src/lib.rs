@@ -50,6 +50,7 @@ pub mod lakehouse;
 pub mod manifest;
 pub mod query_log;
 pub mod remote;
+pub mod result_cache;
 pub mod retry;
 pub mod scan_split;
 pub mod scheduler;
@@ -70,7 +71,7 @@ pub use discovery::{
 };
 pub use engine::{
     CatalogSource, build_query_session, contains_flight_reader, execute_query,
-    reject_inmemory_storage, resolve_fleet,
+    execute_query_cached, reject_inmemory_storage, resolve_fleet,
 };
 pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
@@ -80,6 +81,9 @@ pub use manifest::{
 };
 pub use query_log::{QueryRecord, QueryState};
 pub use remote::{FlightReaderExec, LldbCodec};
+pub use result_cache::{
+    ResultCache, ResultCacheArgs, ResultCacheConfig, ResultCacheKey, TableInput, execute_cached,
+};
 pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use scheduler::{Admission, AdmissionError, AdmissionLimits, QuerySlot, Scheduler};

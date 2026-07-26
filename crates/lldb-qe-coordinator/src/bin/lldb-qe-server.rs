@@ -40,8 +40,8 @@ use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, DEFAULT_SERVER_BIND, serve_coordinator,
 };
 use lldb_qe_core::{
-    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ServicesArgs, StorageArgs, build_query_session,
-    init_tracing, redact_url, reject_inmemory_storage,
+    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ResultCacheArgs, ServicesArgs, StorageArgs,
+    build_query_session, init_tracing, redact_url, reject_inmemory_storage,
 };
 use tokio::net::TcpListener;
 
@@ -117,6 +117,9 @@ struct Cli {
 
     #[command(flatten)]
     services: ServicesArgs,
+
+    #[command(flatten)]
+    result_cache: ResultCacheArgs,
 }
 
 #[tokio::main]
@@ -162,7 +165,7 @@ async fn main() -> Result<()> {
             subdir: cli.tpch_subdir.clone(),
         },
     };
-    let ctx = build_query_session(config, &catalog).await?;
+    let (ctx, lakehouses) = build_query_session(config, &catalog).await?;
 
     let listener = TcpListener::bind(cli.bind)
         .await
@@ -170,7 +173,7 @@ async fn main() -> Result<()> {
     let addr = listener.local_addr()?;
     let coordinator_id = cli.coordinator_id.unwrap_or_else(|| addr.to_string());
 
-    let coordinator = Arc::new(Coordinator::new(
+    let mut coordinator = Coordinator::new(
         ctx,
         db.clone(),
         CoordinatorConfig {
@@ -181,7 +184,17 @@ async fn main() -> Result<()> {
             max_queued_queries: cli.max_queued_queries,
             coordinator_id: coordinator_id.clone(),
         },
-    ));
+    );
+    // The result cache is shared by every query this process serves, keyed by the account resolved
+    // from the services database rather than the one a ticket claimed — so it can never serve one
+    // tenant another's rows. It needs that database, so a server without one simply has no cache.
+    if let Some(db) = db.clone()
+        && let Some(cache) = cli.result_cache.build(db)
+    {
+        tracing::info!(config = ?cache.config(), "result cache is on");
+        coordinator = coordinator.with_result_cache(cache, lakehouses);
+    }
+    let coordinator = Arc::new(coordinator);
     tracing::info!(
         addr = %addr,
         coordinator_id = %coordinator_id,

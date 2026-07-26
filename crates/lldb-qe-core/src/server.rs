@@ -83,8 +83,10 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::engine::{BoxResolver, execute_query, resolve_fleet, total_rows};
+use crate::engine::{BoxResolver, execute_query_cached, resolve_fleet, total_rows};
+use crate::lakehouse::Lakehouse;
 use crate::query_log::QueryRecord;
+use crate::result_cache::ResultCache;
 use crate::scheduler::{Admission, AdmissionError, AdmissionLimits, DEFAULT_FLEET_KEY, Scheduler};
 use crate::services::ServicesDb;
 use crate::warehouse::Warehouse;
@@ -277,6 +279,12 @@ pub struct Coordinator {
     /// Injected DNS. `None` is the production path (real `lookup_host`); tests supply a fake so a
     /// warehouse's name can resolve to in-process workers.
     resolver: Option<BoxResolver>,
+    /// The cross-query result cache, when one is configured. `None` disables it entirely, which is
+    /// also what a server with no services database gets.
+    result_cache: Option<ResultCache>,
+    /// The catalog's lakehouse handles — what the cache versions its inputs against. Empty means
+    /// nothing is cacheable, which is correct for a snapshot-less catalog like the TPC-H seed.
+    lakehouses: Vec<Lakehouse>,
 }
 
 impl Coordinator {
@@ -294,6 +302,8 @@ impl Coordinator {
             config,
             scheduler,
             resolver: None,
+            result_cache: None,
+            lakehouses: Vec::new(),
         }
     }
 
@@ -301,6 +311,22 @@ impl Coordinator {
     pub fn with_resolver(mut self, resolver: BoxResolver) -> Self {
         self.resolver = Some(resolver);
         self
+    }
+
+    /// Serve repeat queries from `cache`, versioned against `lakehouses`.
+    ///
+    /// Both together or neither: a cache with no lakehouses can never build a key, so it would sit
+    /// there counting skips. The pair comes from one [`build_query_session`](crate::engine::build_query_session)
+    /// call, which is the only place that can produce a consistent one.
+    pub fn with_result_cache(mut self, cache: ResultCache, lakehouses: Vec<Lakehouse>) -> Self {
+        self.result_cache = Some(cache);
+        self.lakehouses = lakehouses;
+        self
+    }
+
+    /// The result cache in force, if any — what a test asserts hits and executions on.
+    pub fn result_cache(&self) -> Option<&ResultCache> {
+        self.result_cache.as_ref()
     }
 
     /// The admission control this server is enforcing — the handle a test asserts peak
@@ -429,7 +455,17 @@ impl Coordinator {
             self.resolver.as_ref(),
         )
         .await?;
-        execute_query(&self.ctx, sql, &fleet).await
+        // The tenant is `target.account_id` — the one resolved from the services database, never
+        // the one the ticket claimed — so one account can never be served another's cached rows.
+        execute_query_cached(
+            &self.ctx,
+            self.result_cache.as_ref(),
+            &self.lakehouses,
+            target.account_id,
+            sql,
+            &fleet,
+        )
+        .await
     }
 
     /// The gate this query queues on. Keyed by warehouse so two warehouses never share a line.

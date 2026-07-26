@@ -61,6 +61,18 @@
 //! nothing here needs Postgres. Passing `--warehouse` without a services database is an error
 //! rather than a fallback, because there is nowhere to look the warehouse up and silently
 //! querying *some* fleet would be worse than stopping.
+//! # The result cache sits in front of all of it
+//!
+//! Everything above — planning, the staging rewrite, fleet dispatch — is skipped entirely when the
+//! same query has already been answered over the same data. [`execute_cached`] resolves the
+//! query's tables to their Iceberg snapshot ids, composes a key from those plus the tenant and the
+//! engine build, and returns a stored result when the key matches. A write moves a snapshot, the
+//! key changes, and the next run recomputes; there is no invalidation step to forget. See
+//! [`lldb_qe_core::result_cache`] for what is deliberately *not* cached.
+//!
+//! It needs the services database and a resolved account, so it is inert in exactly the
+//! single-node case described above — and `--no-result-cache` takes it out of the picture without
+//! unconfiguring anything else.
 //!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
 
@@ -70,8 +82,9 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use lldb_qe_core::{
-    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ServicesArgs, StorageArgs, build_query_session,
-    execute_query, init_tracing, reject_inmemory_storage, resolve_fleet,
+    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ResultCacheArgs, ServicesArgs, StorageArgs,
+    build_query_session, execute_query_cached, init_tracing, reject_inmemory_storage,
+    resolve_fleet,
 };
 
 #[derive(Debug, Parser)]
@@ -134,6 +147,9 @@ struct Cli {
 
     #[command(flatten)]
     services: ServicesArgs,
+
+    #[command(flatten)]
+    result_cache: ResultCacheArgs,
 }
 
 #[tokio::main]
@@ -161,6 +177,11 @@ async fn main() -> Result<()> {
     // Resolve the tenant, if there is a control plane to resolve it against. A missing account is
     // an error naming the tool that creates one — a silent fallback would let a typo run a query
     // under nobody's identity, which is precisely the bug #19's enforcement has to rule out.
+    //
+    // The handle stays open now rather than being closed straight away: the result cache lives in
+    // this same database, and the tenant id resolved here is the first component of its key.
+    let mut account_id = None;
+    let mut result_cache = None;
     if let Some(db) = cli.services.connect().await? {
         let account = db.account_by_name(&cli.account).await?.with_context(|| {
             format!(
@@ -206,7 +227,11 @@ async fn main() -> Result<()> {
             );
         }
 
-        db.close().await;
+        // The cache takes ownership of the pool and keeps it for the query's lifetime, so
+        // this must come after anything that borrows `db` — and the `db.close()` that used
+        // to sit here is gone: closing it would hand the cache a dead pool.
+        account_id = Some(account.id);
+        result_cache = cli.result_cache.build(db);
     } else if let Some(name) = &cli.warehouse {
         // No control plane, so there is nothing that knows what `name` means. Say that, rather
         // than falling back to `--workers` and running the query on a fleet nobody chose.
@@ -218,20 +243,35 @@ async fn main() -> Result<()> {
     }
 
     // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
+    //
+    // The lakehouse handles come back with the session, not dropped: they are the only thing that
+    // can answer "what snapshot is this table at", which is what makes a result-cache key safe to
+    // trust.
     let catalog = match &cli.manifest {
         Some(path) => CatalogSource::Manifest(path.clone()),
         None => CatalogSource::Tpch {
             subdir: cli.tpch_subdir.clone(),
         },
     };
-    let ctx = build_query_session(config, &catalog).await?;
+    let (ctx, lakehouses) = build_query_session(config, &catalog).await?;
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
     // level is the operator-visible signal that scaling the ECS service actually changed the fleet,
     // and `resolve_fleet` is also what warns when the warehouse row and the fleet disagree.
     let fleet = resolve_fleet(&endpoints, declared_size, None).await?;
 
-    let batches = execute_query(&ctx, &cli.sql, &fleet).await?;
+    // Answer from the result cache when every input is unchanged; otherwise plan, distribute and
+    // run. Both the policy and the cache live in `engine`, so this binary and `lldb-qe-server`
+    // cannot drift apart on either one.
+    let batches = execute_query_cached(
+        &ctx,
+        result_cache.as_ref(),
+        &lakehouses,
+        account_id,
+        &cli.sql,
+        &fleet,
+    )
+    .await?;
 
     println!("{}", pretty_format_batches(&batches)?);
     Ok(())
