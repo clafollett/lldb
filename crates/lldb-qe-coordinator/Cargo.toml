@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "lldb coordinator: plans a query and runs it on a remote worker over Arrow Flight."
+# This package now ships a second binary (`src/bin/lldb-qe-migrate.rs`), which makes a bare
+# `cargo run -p lldb-qe-coordinator` ambiguous. The coordinator stays the default.
+default-run = "lldb-qe-coordinator"
 
 [dependencies]
 lldb-qe-core = { path = "../lldb-qe-core" }
