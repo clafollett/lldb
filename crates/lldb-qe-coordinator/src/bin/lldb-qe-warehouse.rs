@@ -202,9 +202,14 @@ async fn run(db: &ServicesDb, account: &Account, command: Command) -> Result<()>
         Command::Delete { name } => {
             if db.delete_warehouse(account.id, &name).await? {
                 println!("deleted warehouse `{name}` from account `{}`", account.name);
+                // The service name is CloudFormation-generated (the stack does not set
+                // `serviceName`), so naming it here would be a guess an operator would paste and
+                // watch fail. Point at the output that carries the real one, exactly as
+                // `print_apply_hint` does for the other transitions.
                 println!(
-                    "  apply: remove it from the CDK stack's `warehouses` and deploy, or \
-                     `aws ecs delete-service --service lldb-{name} --force`"
+                    "  apply: remove `{name}` from the CDK stack's `warehouses` and deploy, or \
+                     `aws ecs delete-service --cluster <ClusterName> \
+                     --service <{name} from the WarehouseServices output> --force`"
                 );
             } else {
                 // Not an error: `delete` is the one operation where "it is already gone" is the
