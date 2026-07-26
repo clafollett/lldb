@@ -68,7 +68,11 @@ services:
       # the cluster runs. Local-only credentials; nothing here is a production posture.
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # NOT `/var/lib/postgresql/data` — that is the Postgres <=17 layout. The 18 images moved
+      # PGDATA to a version-scoped subdirectory (`/var/lib/postgresql/18/docker`) and declare
+      # `/var/lib/postgresql` itself as the volume, so mounting the old path both fails to
+      # persist anything and leaves a root-owned directory inside the postgres-owned tree.
+      - pgdata:/var/lib/postgresql
     healthcheck:
       # `pg_isready` is the only honest readiness signal: the container prints "ready to accept
       # connections" once during its own bootstrap, before the real server starts.
