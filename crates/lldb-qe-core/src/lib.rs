@@ -40,6 +40,7 @@ pub mod catalog;
 pub mod config;
 pub mod discovery;
 pub mod distributed;
+pub mod dml;
 pub mod flight;
 pub mod lakehouse;
 pub mod manifest;
@@ -61,6 +62,7 @@ pub use discovery::{
     DEFAULT_WAREHOUSE_ENDPOINT, WAREHOUSE_PLACEHOLDER, discover_workers, discover_workers_with,
     render_warehouse_endpoint,
 };
+pub use dml::{DmlKind, DmlOutcome, DmlStatement};
 pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{

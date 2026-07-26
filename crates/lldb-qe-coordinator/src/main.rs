@@ -33,6 +33,16 @@
 //! fallbacks its [`FlightReaderExec`] leaves carry, and the offload path walks the fleet with
 //! `fetch_with_failover`. A query fails only once every healthy target has been tried.
 //!
+//! # Writes are not distributed
+//!
+//! `--sql` may also be a write. `DELETE`/`UPDATE` are answered by [`lldb_qe_core::dml`] against
+//! the manifest's catalog before the fleet is even discovered; `INSERT` goes through DataFusion
+//! but is likewise executed in this process rather than offloaded. That asymmetry is deliberate:
+//! a read fans out because N workers producing disjoint slices of one answer is the whole point,
+//! whereas a write fanned out would move a statement's commit off the machine that owns it — and
+//! for `INSERT` it does not even serialize, since `iceberg-datafusion`'s commit node holds a live
+//! catalog handle and connection pool. One statement, one committer. Reads are unchanged.
+//!
 //! # Tenancy
 //!
 //! When a services database is configured (`--metadata-url`, or the discrete `--metadata-*`
@@ -84,13 +94,15 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+use datafusion::logical_expr::LogicalPlan;
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::{ExecutionPlan, collect};
+use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::manifest::Manifest;
 use lldb_qe_core::{
-    DEFAULT_WAREHOUSE_ENDPOINT, FlightReaderExec, ResultCacheArgs, ServicesArgs, StorageArgs,
-    StorageConfig, apply_manifest, build_session, discover_workers, execute_cached,
-    fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
+    DEFAULT_WAREHOUSE_ENDPOINT, DmlOutcome, FlightReaderExec, ResultCacheArgs, ServicesArgs,
+    StorageArgs, StorageConfig, apply_manifest, build_session, discover_workers, dml,
+    execute_cached, fetch_with_failover, init_tracing, plan_distributed, register_tpch_parquet,
 };
 
 #[derive(Debug, Parser)]
@@ -258,10 +270,13 @@ async fn main() -> Result<()> {
 
     // Populate the catalog: an explicit manifest if provided, else the TPC-H seed.
     //
-    // The lakehouse handles are kept, not dropped: they are the only thing that can answer "what
-    // snapshot is this table at", which is what makes a cache key safe to trust. The TPC-H seed
-    // registers plain-parquet listing tables, which have no snapshot — so that path yields no
-    // lakehouses and nothing it can query is cacheable. That is the intended behaviour, not a gap.
+    // The lakehouse handles are kept, not dropped, and now for two independent reasons — either
+    // alone is sufficient, so deleting one must not take the other with it. A DML statement
+    // commits *through the catalog* rather than through the DataFusion session, so it needs one.
+    // And they are the only thing that can answer "what snapshot is this table at", which is what
+    // makes a result-cache key safe to trust. The TPC-H seed registers plain-parquet listing
+    // tables, which have no snapshot — so that path yields no lakehouses, and nothing it can query
+    // is cacheable. That is the intended behaviour, not a gap.
     let lakehouses = match &cli.manifest {
         Some(path) => {
             let manifest = Manifest::from_path(path)?;
@@ -272,6 +287,23 @@ async fn main() -> Result<()> {
             Vec::new()
         }
     };
+
+    // DELETE/UPDATE are answered here and return, before any worker is discovered. Distributing a
+    // write would mean N processes racing to commit the same snapshot for one statement, which is
+    // exactly the concurrency this engine works to serialize — so the coordinator, which is the
+    // one process that saw the statement, is the one that performs it. Reads still fan out.
+    if let Some(outcome) = run_dml(&lakehouses, &cli.sql).await? {
+        println!(
+            "{} {} row(s); snapshot {}",
+            outcome.kind,
+            outcome.rows_changed,
+            match (outcome.committed(), outcome.snapshot_id) {
+                (true, Some(id)) => id.to_string(),
+                _ => "unchanged".to_string(),
+            }
+        );
+        return Ok(());
+    }
 
     // Discover the concrete fleet behind the configured endpoints. Logging the size + URLs at info
     // level is the operator-visible signal that scaling the ECS service actually changed the fleet.
@@ -310,6 +342,24 @@ async fn main() -> Result<()> {
         account_id,
         &cli.sql,
         |logical| async {
+            // `INSERT` is a write, and it must not leave this process. It arrives here rather
+            // than through `run_dml` because appends go through DataFusion
+            // (`IcebergTableProvider` implements `insert_into`), so it is an ordinary logical
+            // plan — just one that cannot be offloaded: the commit node `iceberg-datafusion`
+            // puts at its root carries a live catalog handle and a connection pool no codec can
+            // serialize, and shipping a commit to a worker would move the write's serialization
+            // point off the machine that owns the statement. It sits inside the cache closure
+            // because a write is never cacheable, so this is the one place it can be caught
+            // without planning the statement a second time.
+            if matches!(logical, LogicalPlan::Dml(_)) {
+                return ctx
+                    .execute_logical_plan(logical)
+                    .await?
+                    .collect()
+                    .await
+                    .context("running the write");
+            }
+
             // `execute_logical_plan` rather than `create_physical_plan` straight off the logical
             // plan: it is what `ctx.sql` does, and it is what makes a DDL/DML statement submitted
             // through `--sql` still take effect. Those statements are never cacheable, so they
@@ -360,6 +410,44 @@ async fn main() -> Result<()> {
 
     println!("{}", pretty_format_batches(&batches)?);
     Ok(())
+}
+
+/// Run `sql` as DML if it is a `DELETE`/`UPDATE`, against whichever catalog owns its table.
+///
+/// Returns `Ok(None)` when `sql` is a query, so the caller falls through to the normal
+/// distributed path. A DML statement whose table belongs to no configured catalog is an **error**,
+/// not a fall-through: `ctx.sql` would answer it with DataFusion's generic "unsupported logical
+/// plan", which tells an operator nothing about the manifest they forgot to pass.
+async fn run_dml(lakehouses: &[Lakehouse], sql: &str) -> Result<Option<DmlOutcome>> {
+    let Some(stmt) = dml::parse(sql)? else {
+        return Ok(None);
+    };
+    let mut refusals = Vec::new();
+    for lake in lakehouses {
+        match dml::execute_statement(lake, &stmt).await {
+            Ok(outcome) => return Ok(Some(outcome)),
+            // Only "this catalog is not the target" is worth trying the next catalog for. A real
+            // failure — a conflict, a bad predicate, a partitioned table — must surface as itself
+            // rather than be retried against an unrelated warehouse.
+            Err(e) if is_wrong_catalog(&e) => {
+                refusals.push(format!("{}: {e}", lake.catalog_name()))
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    bail!(
+        "no configured catalog owns `{}` — is the right --manifest loaded? Tried: [{}]",
+        stmt.name().join("."),
+        refusals.join("; ")
+    )
+}
+
+/// Whether an error means "wrong catalog for this statement" rather than a genuine failure.
+fn is_wrong_catalog(e: &anyhow::Error) -> bool {
+    // A typed probe, not a substring of the message. This decides control flow — "ask the next
+    // lakehouse" versus "report the failure" — so a reworded error must not be able to change it,
+    // and an unrelated error must not be able to imitate it and be reported as a missing table.
+    e.chain().any(|c| c.is::<dml::WrongCatalog>())
 }
 
 /// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]
