@@ -48,6 +48,7 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
   config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`),
   virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`)
+  the cross-query result cache (`result_cache.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds the control-plane one-shots (`src/bin/`):
   `lldb-qe-migrate` (applies the services-DB migrations) and `lldb-qe-warehouse`
@@ -97,6 +98,16 @@ where transactions and constraints arbitrate instead of hope. Two rules:
 Passwords are never logged: `ServicesArgs` has a hand-written redacting `Debug`, and every
 message naming a connection URL goes through `services::redact_url` first.
 
+## The result cache is keyed, never invalidated
+
+`result_cache.rs` answers a repeat query from Postgres instead of the fleet. Its key is
+`(account, build version, default catalog+schema, statement + plan rendering, every referenced
+table @ its Iceberg snapshot id)`. Nothing ever *invalidates* an entry: a commit moves a snapshot,
+the next run composes a different key, and the stale row is simply unreachable. Two rules follow —
+**an input we cannot version means the query is not cached at all** (a listing table, a table
+function, `information_schema`), and **not caching is always a legal answer**, so every refusal and
+every services-DB failure falls through to ordinary execution.
+
 ## Commands
 
 ```
@@ -121,6 +132,10 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test shared_s
 cargo run -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
   --metadata-url postgres://lldb@localhost/lldb create --name analytics --size 4
 cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   # route a query
+
+# Result cache (`result_cache.rs`): proves a repeat query over unchanged tables executes nothing,
+# and that an Iceberg commit invalidates it. Same three-way gating.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test result_cache_db
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```
