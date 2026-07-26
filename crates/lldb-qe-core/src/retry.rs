@@ -74,6 +74,16 @@ fn classify_std(err: &(dyn std::error::Error + 'static)) -> Option<Retriability>
     }
     // A `tonic::transport::Error` is the connect/connection layer failing: refused, reset, closed
     // mid-stream. That is a worker problem, never a request problem.
+    //
+    // One caveat, deliberately not "fixed": tonic also uses this type for an invalid URI, which is
+    // a permanent config fault rather than worker loss. It cannot be told apart from outside the
+    // crate — `Kind` is `pub(crate)` with no accessor, so the only signal is the Display string
+    // ("invalid URI" vs "transport error"), and pinning correctness to a dependency's error text is
+    // a worse bug than the one it fixes. It does not bite us: the pull path builds its channel with
+    // `Channel::from_shared`, which returns `http::uri::InvalidUri` — a distinct type that falls to
+    // the unknown-is-fatal default. Both behaviors are pinned by tests below. If a future call site
+    // reaches for `Endpoint::from_shared` instead, validate the URL there rather than trying to
+    // classify it here.
     if err.downcast_ref::<tonic::transport::Error>().is_some() {
         return Some(Retriability::Retriable);
     }
@@ -236,13 +246,41 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_transport_error_is_retriable() {
-        // `Endpoint::from_shared` yields a real `tonic::transport::Error` without touching the
-        // network, which is the type a refused connection also surfaces.
-        let err = tonic::transport::Endpoint::from_shared("not a uri at all")
-            .expect_err("a malformed uri must not parse");
+    /// A *genuine* connect failure — the worker-loss shape this whole module exists for.
+    ///
+    /// This deliberately makes a real TCP attempt against a port nothing is listening on rather
+    /// than synthesizing a `transport::Error` from a malformed URI. Those are different faults
+    /// that happen to share a Rust type, and a test that conflates them documents the opposite of
+    /// the truth: it reads as "a malformed URI is retriable", which is exactly the wrong lesson
+    /// (see the sibling test below, and `flight::fetch_partition`).
+    #[tokio::test]
+    async fn a_connect_failure_is_retriable() {
+        // Bind then drop, so the port is real, unused, and refuses immediately.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+
+        let err = tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+            .expect("a well-formed url parses")
+            .connect()
+            .await
+            .expect_err("nothing is listening on that port");
         assert_eq!(classify(&anyhow::Error::new(err)), Retriability::Retriable);
+    }
+
+    /// A malformed worker URL is a coordinator-side configuration fault: it reproduces identically
+    /// on every worker, so replaying it across the fleet only turns one bug into N.
+    ///
+    /// This pins the type the *production* path actually produces. `Channel::from_shared` — what
+    /// [`crate::flight::fetch_partition`] calls — returns `http::uri::InvalidUri`, which hits the
+    /// documented unknown-is-fatal default. Note that `Endpoint::from_shared` returns a
+    /// `transport::Error` for the same input; the two constructors disagree, which is precisely
+    /// why this is worth a test that names the constructor under test.
+    #[test]
+    fn a_malformed_worker_url_is_fatal() {
+        let err = tonic::transport::Channel::from_shared("not a uri at all")
+            .expect_err("a malformed uri must not parse");
+        assert_eq!(classify(&anyhow::Error::new(err)), Retriability::Fatal);
     }
 
     #[test]
