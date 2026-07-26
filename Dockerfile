@@ -52,12 +52,13 @@ COPY . .
 # the build context, so the SHA must be injected). Defaults keep local `docker build` working.
 ARG GIT_SHA=unknown
 ENV LLDB_GIT_SHA=$GIT_SHA
-# The coordinator package also builds `lldb-qe-migrate`, the one-shot that applies services-DB
-# migrations. It ships in the same image on purpose: migrations are embedded in the binary at
-# compile time, so the thing that migrates must be the *same build* as the thing that queries.
+# The coordinator package also builds the control-plane one-shots: `lldb-qe-migrate` (applies
+# services-DB migrations) and `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual
+# warehouse). They ship in the same image on purpose — migrations are embedded in the binary at
+# compile time, and the build that writes a warehouse row must be the build that reads it.
 RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
     && cp target/release/lldb-qe-coordinator target/release/lldb-qe-migrate \
-          target/release/lldb-qe-worker /usr/local/bin/
+          target/release/lldb-qe-warehouse target/release/lldb-qe-worker /usr/local/bin/
 
 # ---- Runtime -------------------------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -70,6 +71,7 @@ RUN apt-get update \
 
 COPY --from=builder /usr/local/bin/lldb-qe-coordinator /usr/local/bin/lldb-qe-coordinator
 COPY --from=builder /usr/local/bin/lldb-qe-migrate /usr/local/bin/lldb-qe-migrate
+COPY --from=builder /usr/local/bin/lldb-qe-warehouse /usr/local/bin/lldb-qe-warehouse
 COPY --from=builder /usr/local/bin/lldb-qe-worker /usr/local/bin/lldb-qe-worker
 
 # Run as non-root.

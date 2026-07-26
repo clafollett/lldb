@@ -19,6 +19,7 @@
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
+//! | [`warehouse`]    | Virtual warehouses: named, resizable, suspend/resume compute pools    | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
@@ -51,10 +52,14 @@ pub mod stage_cache;
 pub mod staging;
 pub mod storage;
 pub mod tpch;
+pub mod warehouse;
 
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
-pub use discovery::discover_workers;
+pub use discovery::{
+    DEFAULT_WAREHOUSE_ENDPOINT, WAREHOUSE_PLACEHOLDER, discover_workers, discover_workers_with,
+    render_warehouse_endpoint,
+};
 pub use flight::{fetch, fetch_with_failover, serve_worker, serve_worker_with_cache};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
@@ -70,3 +75,4 @@ pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
 pub use staging::plan_distributed;
 pub use storage::{Storage, StorageConfig};
 pub use tpch::{TPCH_TABLES, tpch_manifest};
+pub use warehouse::{Warehouse, WarehouseOp, WarehouseState};
