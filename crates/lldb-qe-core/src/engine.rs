@@ -22,6 +22,18 @@
 //! fallbacks its leaves carry, and the offload path walks the fleet with
 //! [`fetch_with_failover`](crate::fetch_with_failover).
 //!
+//! # One step comes before the policy: Iceberg scans are resolved to files
+//!
+//! An `iceberg-datafusion` `IcebergTableScan` holds a live catalog handle and resolves its own
+//! files at execute time, which makes it both unserializable and unsliceable — so before this
+//! module's policy runs at all, [`resolve_iceberg_scans`](crate::iceberg_scan::resolve_iceberg_scans)
+//! rewrites every such node into a plain parquet scan over the concrete data files of the snapshot
+//! it was planned against. That is what lets an Iceberg query be distributed *and* what pins the
+//! snapshot: the file list travels inside the plan bytes, so a worker never resolves "current"
+//! itself and needs no catalog access. It runs here, in the shared funnel, for the same reason
+//! everything else here does — a coordinator that resolved and a server that did not would be two
+//! engines with two answers.
+//!
 //! # Writes are the exception: they never leave this process
 //!
 //! An `INSERT` reaches [`execute_query_cached`] as an ordinary [`LogicalPlan::Dml`], because
@@ -70,6 +82,7 @@ use datafusion::prelude::SessionContext;
 use crate::catalog::apply_manifest;
 use crate::discovery::{discover_workers, discover_workers_with};
 use crate::flight::fetch_with_failover;
+use crate::iceberg_scan::resolve_iceberg_scans;
 use crate::lakehouse::Lakehouse;
 use crate::manifest::Manifest;
 use crate::rbac::QueryAuthorization;
@@ -285,6 +298,15 @@ async fn run_on_fleet(
     plan: Arc<dyn ExecutionPlan>,
     fleet: &[String],
 ) -> Result<Vec<RecordBatch>> {
+    // Before anything is staged, sliced or serialized: every `IcebergTableScan` becomes a plain
+    // parquet scan over the data files of the snapshot it was planned against. See
+    // [`crate::iceberg_scan`] — this is the single funnel both front ends share, so putting it here
+    // is what makes "an Iceberg query is distributable" true of the engine rather than of one
+    // binary. A plan with no Iceberg scan comes back untouched.
+    let plan = resolve_iceberg_scans(ctx, plan)
+        .await
+        .context("resolving iceberg scans to the data files of their snapshot")?;
+
     let coordinated = plan_distributed(Arc::clone(&plan), fleet)?;
 
     if contains_flight_reader(&coordinated) {

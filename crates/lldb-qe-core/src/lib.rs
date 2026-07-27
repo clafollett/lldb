@@ -16,6 +16,7 @@
 //! | [`storage`]      | Where bytes live — abstracted so local dev today, S3 later | 0 |
 //! | [`session`]      | A configured DataFusion context + registered tables        | 0 |
 //! | [`lakehouse`]    | Iceberg: files → transactional, versioned tables           | 1 |
+//! | [`iceberg_scan`] | Pin an Iceberg scan to its snapshot's files, so it can be shipped and sliced | 3 |
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
@@ -50,6 +51,7 @@ pub mod distributed;
 pub mod dml;
 pub mod engine;
 pub mod flight;
+pub mod iceberg_scan;
 pub mod lakehouse;
 pub mod manifest;
 pub mod query_log;
@@ -83,6 +85,7 @@ pub use engine::{
 pub use flight::{
     fetch, fetch_with_failover, serve_worker, serve_worker_with_auth, serve_worker_with_cache,
 };
+pub use iceberg_scan::{resolve_iceberg_scans, scanned_data_files};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,

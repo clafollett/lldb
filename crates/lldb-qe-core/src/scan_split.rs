@@ -152,7 +152,12 @@ fn rebuild_with_file_group(
 }
 
 /// The [`FileScanConfig`] of a node, if it is a file-scan [`DataSourceExec`].
-fn file_scan_config(node: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
+///
+/// Crate-visible because [`crate::iceberg_scan`] needs exactly this predicate to report which data
+/// files a resolved plan will read. One definition of "this node is a file scan" — a second copy
+/// would drift from what [`split_scan`] actually accepts, which is the drift [`file_scan_count`]
+/// exists to prevent.
+pub(crate) fn file_scan_config(node: &Arc<dyn ExecutionPlan>) -> Option<&FileScanConfig> {
     node.as_any()
         .downcast_ref::<DataSourceExec>()?
         .data_source()
