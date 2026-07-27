@@ -32,6 +32,13 @@
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
+//!
+//! Its counterpart above the storage layer, and the reason a worker can be as thin as it is:
+//! **a plan is self-contained.** Everything a worker needs to answer its stage travels inside the
+//! plan bytes — file paths, byte ranges, and, since [`iceberg_scan`], the data files of the exact
+//! Iceberg snapshot the coordinator planned against. A worker registers no tables, loads no
+//! manifest and holds no catalog credential; what it must have is read access to the object store
+//! the plan names.
 
 /// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

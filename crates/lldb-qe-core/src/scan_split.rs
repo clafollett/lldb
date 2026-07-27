@@ -19,6 +19,16 @@
 //! with that leaf restricted to one slice. Because the rest of the plan (a partial aggregate,
 //! say) rides along unchanged, the caller can ship each copy to a worker via
 //! [`crate::remote::FlightReaderExec`] and reduce the partials — IO and compute both distributed.
+//!
+//! # What counts as a file scan
+//!
+//! A registered parquet/listing table produces one directly. An **Iceberg** table does not — it
+//! plans as an `IcebergTableScan`, which is not a [`DataSourceExec`] and so has nothing here to
+//! slice. [`crate::iceberg_scan::resolve_iceberg_scans`] closes that gap on the coordinator, before
+//! staging, by rewriting each Iceberg scan into a parquet [`DataSourceExec`] over the data files of
+//! its snapshot. This module needs to know nothing about Iceberg as a result: by the time a plan
+//! reaches it, an Iceberg scan *is* a file scan, and it slices identically. That is the point of
+//! doing the rewrite there rather than teaching a second slicing path here.
 
 use std::sync::Arc;
 
@@ -32,9 +42,10 @@ use datafusion::physical_plan::ExecutionPlan;
 /// Split `plan` into `partitions` copies, each reading a disjoint slice of the scan's bytes.
 ///
 /// `plan` must contain exactly one file-scan leaf — a [`DataSourceExec`] backed by a
-/// [`FileScanConfig`], which is what a registered Parquet/listing table produces. The scan's
-/// files are repartitioned into `partitions` byte-range groups balanced by size, and one copy of
-/// the plan is returned per group with its leaf restricted to that group.
+/// [`FileScanConfig`], which is what a registered Parquet/listing table produces and what
+/// [`resolve_iceberg_scans`](crate::iceberg_scan::resolve_iceberg_scans) turns an Iceberg scan into.
+/// The scan's files are repartitioned into `partitions` byte-range groups balanced by size, and one
+/// copy of the plan is returned per group with its leaf restricted to that group.
 ///
 /// The returned vector always has exactly `partitions` entries. If the data is too small to
 /// split that many ways, the surplus copies scan an empty range (and so produce no rows), which

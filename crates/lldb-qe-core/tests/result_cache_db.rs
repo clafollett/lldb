@@ -5,25 +5,53 @@
 //! Both halves need a real database — the cache lives in the services DB — and a real Iceberg
 //! catalog, because the invalidation mechanism *is* the snapshot id a commit moves. So this test
 //! builds the genuine article: a SQL catalog on Postgres, a `file://` warehouse, tables created
-//! through [`apply_manifest`] exactly as a coordinator creates them, and writes committed through
-//! DataFusion `INSERT INTO`.
+//! through [`apply_manifest`] exactly as a coordinator creates them, writes committed through
+//! DataFusion `INSERT INTO`, and a fleet of real in-process Flight workers to run the queries on.
 //!
-//! # How "no execution" is asserted
+//! # How "no execution" is asserted — on the workers, not just on the coordinator
 //!
-//! The same way the shuffle-cache tests do it: with a counter that only a real execution moves.
-//! [`execute_cached`] takes the engine's expensive half as a closure — physical planning, the
-//! staging rewrite, fleet dispatch — and the test's closure increments an [`AtomicUsize`] before
-//! doing any of it. A hit returns before the closure is ever called, so a flat counter means no
-//! plan was built and nothing was dispatched. [`ResultCache::execution_count`] agrees
-//! independently.
+//! Every run here goes through [`execute_query_cached`], the funnel both front ends call, against a
+//! fleet started with [`serve_worker_with_cache`] so the test holds each worker's [`StageCache`].
+//! Two counters, on two machines' worth of code, then have to agree:
 //!
-//! The closure runs the plan locally rather than shipping it to an in-process Flight worker, and
-//! that is a limitation of the *engine*, not of the cache: `datafusion-proto` has no encoding for
-//! `iceberg-datafusion`'s scan node, so an Iceberg plan cannot cross the Flight boundary in this
-//! build at all (`LldbCodec` only teaches it about `FlightReaderExec`). A worker-side
-//! `StageCache` counter would therefore be asserting on a path no Iceberg query can take. The
-//! counter used here sits at exactly the point the coordinator hands work to the fleet, which is
-//! the property the issue is about.
+//! - **[`ResultCache::execution_count`] — coordinator-side.** It moves only when the cache handed
+//!   the query on to the engine, so a flat one says no physical plan was built, no staging rewrite
+//!   ran, and nothing was dispatched. That is a fact no worker-side counter can report: a worker
+//!   cannot tell you about work that was never planned.
+//! - **[`StageCache::execution_count`] — worker-side.** A stage materialization happens in the
+//!   worker's own process, at the far end of a gRPC connection, so nothing the coordinator does by
+//!   itself can move it. A flat one says no work left this machine. [`StageCache::rows_served`]
+//!   backs it up with the bytes: a hit ships nothing, in either direction.
+//!
+//! ## Why every run gets a *fresh* fleet
+//!
+//! This is the part that makes the worker-side assertion mean anything. A [`StageCache`] is
+//! content-addressed: identical plan bytes are materialized once and served from the buffer
+//! thereafter. Two runs of one query over one snapshot ship **byte-identical** plans — so on a
+//! shared fleet the second run would leave `execution_count` flat whether the result cache answered
+//! it or the worker's own stage cache did. "Flat" would be unfalsifiable.
+//!
+//! So each run is pointed at a fleet whose caches have never seen a plan. `0` then means exactly
+//! one thing: nothing was dispatched. If the lookup had missed, that fleet would have had to
+//! materialize the stage itself and the assertion would fire — which is not a hope, it is
+//! reproducible by setting [`ResultCacheConfig::ttl`] to zero (every entry unreachable, every
+//! lookup a miss) and watching the flat-counter assertions fail.
+//!
+//! ## What the fleet actually does with these queries, stated plainly
+//!
+//! It depends on the query, and neither answer is the point here. The `SELECT count(*)` in the
+//! bounds test has a partial-aggregate seam, so the planner slices the scan and materializes **two**
+//! map stages, one per worker. The projections do not, so the engine offloads them whole to a single
+//! worker — [`lldb_qe_core::engine`]'s documented boundary-less policy, and the reason a run's
+//! `worker_executions` is asserted to be *non-zero* rather than to equal some particular number.
+//! Either shape serializes the plan, crosses a Flight connection and executes in a process that is
+//! not the coordinator, which is the whole of what these assertions claim. Multi-stage fan-out over
+//! Iceberg as a property in its own right is `distributed_iceberg.rs`'s subject, not this file's.
+//!
+//! None of which was assertable before [`lldb_qe_core::resolve_iceberg_scans`]: an unresolved
+//! `IcebergTableScan` has no encoding, so an Iceberg query could not cross the Flight boundary at
+//! all, and a coordinator-side counter was the only one there was to read. That limitation is gone,
+//! so the weaker assertion goes with it.
 //!
 //! # Finding a database — the same three ways as `services_db.rs`
 //!
@@ -42,21 +70,24 @@
 
 use std::path::Path;
 use std::process::Command;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
-use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableSource,
 };
-use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig, execute_cached};
+use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig};
 use lldb_qe_core::services::ServicesDb;
-use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
+use lldb_qe_core::{
+    StageCache, StorageConfig, apply_manifest, build_session, execute_query_cached,
+    serve_worker_with_cache,
+};
+use tokio::net::TcpListener;
 
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
@@ -64,6 +95,9 @@ const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The namespace the test's table lives in.
 const NS: &str = "sales";
+/// Workers per fleet. More than one so "the fleet" is not a euphemism for "a worker", and few
+/// enough that starting a fresh one per query stays cheap.
+const WORKERS: usize = 2;
 
 /// How the test got its database — and, for the container case, what to tear down.
 enum Target {
@@ -217,17 +251,89 @@ fn manifest(catalog_name: &str, url: &str, warehouse: &Path) -> Manifest {
     }
 }
 
-/// Run a query through the cache. The closure is the engine's expensive half — in the coordinator
-/// it is the fleet dispatch — and `executions` counts every time it actually runs.
+/// A fleet of [`WORKERS`] in-process Flight workers, each holding a [`StageCache`] the test can
+/// read.
+///
+/// One fleet per query, deliberately — see the module docs. The caches start empty, so anything
+/// they report afterwards was caused by *this* query and nothing else.
+struct Fleet {
+    urls: Vec<String>,
+    caches: Vec<Arc<StageCache>>,
+    servers: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Fleet {
+    fn drop(&mut self) {
+        // A test that starts a fleet per query would otherwise leave a gRPC server per query
+        // running for the rest of the process.
+        for server in &self.servers {
+            server.abort();
+        }
+    }
+}
+
+impl Fleet {
+    async fn start() -> Result<Self> {
+        let mut urls = Vec::with_capacity(WORKERS);
+        let mut caches = Vec::with_capacity(WORKERS);
+        let mut servers = Vec::with_capacity(WORKERS);
+        for _ in 0..WORKERS {
+            // Port 0: the OS picks a free one, so this file is safe under a parallel
+            // `cargo test --workspace`.
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let cache = Arc::new(StageCache::new());
+            let served = Arc::clone(&cache);
+            servers.push(tokio::spawn(async move {
+                // A bare `SessionContext`: no catalog, no manifest, no warehouse path. A worker can
+                // only read what the plan names — which, for an Iceberg scan, is the data files
+                // `resolve_iceberg_scans` pinned into it on the coordinator.
+                serve_worker_with_cache(listener, SessionContext::new(), served)
+                    .await
+                    .expect("worker serve");
+            }));
+            urls.push(format!("http://{addr}"));
+            caches.push(cache);
+        }
+        Ok(Self {
+            urls,
+            caches,
+            servers,
+        })
+    }
+
+    /// Stage materializations across the fleet — the worker-side fact.
+    fn executions(&self) -> usize {
+        self.caches.iter().map(|c| c.execution_count()).sum()
+    }
+
+    /// Rows the fleet streamed back to the coordinator.
+    fn rows_served(&self) -> usize {
+        self.caches.iter().map(|c| c.rows_served()).sum()
+    }
+}
+
+/// One query's answer plus what the fleet that answered it did.
+struct Run {
+    batches: Vec<RecordBatch>,
+    /// [`StageCache::execution_count`] summed over a fleet that started empty. `0` means the query
+    /// never left the coordinator.
+    worker_executions: usize,
+    /// [`StageCache::rows_served`] summed over the same fleet.
+    worker_rows: usize,
+}
+
+/// Run one query through [`execute_query_cached`] — the engine's real entry point, not a
+/// reimplementation of it — against a fleet started just for this query.
 async fn run_query(
     ctx: &SessionContext,
     cache: Option<&ResultCache>,
     lakehouses: &[Lakehouse],
     account_id: Option<i64>,
     sql: &str,
-    executions: &AtomicUsize,
-) -> Result<Vec<RecordBatch>> {
-    execute_cached(
+) -> Result<Run> {
+    let fleet = Fleet::start().await?;
+    let batches = execute_query_cached(
         ctx,
         cache,
         lakehouses,
@@ -243,17 +349,14 @@ async fn run_query(
         // nothing there is cacheable at all.
         None,
         sql,
-        |logical| async move {
-            executions.fetch_add(1, Ordering::SeqCst);
-            let plan = ctx
-                .execute_logical_plan(logical)
-                .await?
-                .create_physical_plan()
-                .await?;
-            Ok(collect(plan, ctx.task_ctx()).await?)
-        },
+        &fleet.urls,
     )
-    .await
+    .await?;
+    Ok(Run {
+        batches,
+        worker_executions: fleet.executions(),
+        worker_rows: fleet.rows_served(),
+    })
 }
 
 /// Results compared by *value*, not by row count: a cache that returned the right shape and the
@@ -265,6 +368,10 @@ fn rendered(batches: &[RecordBatch]) -> String {
 }
 
 /// Append rows through DataFusion — a real Iceberg commit, which is what moves the snapshot id.
+///
+/// Run on the coordinator's own context, not across the fleet, because that is where a write
+/// belongs: `iceberg-datafusion`'s commit node holds a live catalog handle no codec can serialize,
+/// and one statement gets one committer (see `CLAUDE.md`, "Writes").
 async fn insert_rows(ctx: &SessionContext, catalog: &str, values: &str) -> Result<()> {
     ctx.sql(&format!(
         "INSERT INTO \"{catalog}\".\"{NS}\".\"orders\" VALUES {values}"
@@ -296,7 +403,12 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
 
     let catalog = format!("lldb_rc_{}_{}", std::process::id(), nanos());
     let warehouse = tempfile::tempdir()?;
-    let (ctx, storage) = build_session(StorageConfig::InMemory).await?;
+    // `Local`, not `InMemory`: a resolved plan names its data files, so every worker has to be able
+    // to read the warehouse's object store. The in-memory store is per-process and a worker would
+    // find it empty — the deployment requirement this design implies, honoured by the test that
+    // relies on it.
+    let (ctx, storage) =
+        build_session(StorageConfig::Local(warehouse.path().to_path_buf())).await?;
     let lakehouses =
         apply_manifest(&ctx, &storage, &manifest(&catalog, url, warehouse.path())).await?;
     assert_eq!(lakehouses.len(), 1, "one catalog in, one lakehouse out");
@@ -320,26 +432,25 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     cache.purge_account(tenant_a.id).await?;
     cache.purge_account(tenant_b.id).await?;
 
-    let executions = AtomicUsize::new(0);
     let sql = format!("SELECT id, label FROM \"{catalog}\".\"{NS}\".\"orders\" ORDER BY id");
 
-    // ---- 1. First run: a miss, so the engine executes -------------------------------------
-    let first = run_query(
-        &ctx,
-        Some(&cache),
-        &lakehouses,
-        Some(tenant_a.id),
-        &sql,
-        &executions,
-    )
-    .await?;
-    assert_eq!(executions.load(Ordering::SeqCst), 1);
+    // ---- 1. First run: a miss, so the fleet executes ------------------------------------------
+    let first = run_query(&ctx, Some(&cache), &lakehouses, Some(tenant_a.id), &sql).await?;
     assert_eq!(cache.execution_count(), 1);
     assert_eq!(cache.miss_count(), 1);
     assert_eq!(cache.hit_count(), 0);
     assert_eq!(cache.store_count(), 1, "a small result must be cached");
+    assert!(
+        first.worker_executions > 0,
+        "a miss must reach a worker — if this is 0 the query never left the coordinator and \
+         everything below is comparing a cache against nothing"
+    );
+    assert!(
+        first.worker_rows > 0,
+        "and the rows must have been streamed back off that worker"
+    );
 
-    // ---- 2. The identical query over unchanged tables: no execution at all ------------------
+    // ---- 2. The identical query over unchanged tables: no execution at all --------------------
     // Deliberately re-spelled with different whitespace and keyword case. Same question, so the
     // normalizer must reach the same key.
     let respelled =
@@ -350,23 +461,31 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
         &lakehouses,
         Some(tenant_a.id),
         &respelled,
-        &executions,
     )
     .await?;
     assert_eq!(
-        executions.load(Ordering::SeqCst),
+        cache.execution_count(),
         1,
-        "the second run executed; it must have been served from the cache"
+        "the second run was handed to the engine; it must have been served from the cache"
     );
-    assert_eq!(cache.execution_count(), 1);
     assert_eq!(cache.hit_count(), 1);
+    // The worker-side half of the same claim, on a fleet that has never seen a plan: had the
+    // lookup missed, these two would be non-zero.
     assert_eq!(
-        rendered(&second),
-        rendered(&first),
+        second.worker_executions, 0,
+        "a cache hit must materialize nothing on any worker"
+    );
+    assert_eq!(
+        second.worker_rows, 0,
+        "a cache hit must move no rows across the wire"
+    );
+    assert_eq!(
+        rendered(&second.batches),
+        rendered(&first.batches),
         "a cache hit must return the same values, not merely the same shape"
     );
 
-    // ---- 3. A write to a referenced table invalidates it -------------------------------------
+    // ---- 3. A write to a referenced table invalidates it --------------------------------------
     insert_rows(&ctx, &catalog, "(4, 'd'), (5, 'e')").await?;
     let snapshot_after = lakehouses[0]
         .current_snapshot_id(NS, "orders")
@@ -378,68 +497,54 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     );
 
     // Ground truth, computed with the cache entirely out of the picture.
-    let truth_executions = AtomicUsize::new(0);
-    let truth = run_query(&ctx, None, &lakehouses, None, &sql, &truth_executions).await?;
-    assert_eq!(truth_executions.load(Ordering::SeqCst), 1);
+    let truth = run_query(&ctx, None, &lakehouses, None, &sql).await?;
+    assert!(truth.worker_executions > 0, "an uncached run must execute");
 
-    let third = run_query(
-        &ctx,
-        Some(&cache),
-        &lakehouses,
-        Some(tenant_a.id),
-        &sql,
-        &executions,
-    )
-    .await?;
+    let third = run_query(&ctx, Some(&cache), &lakehouses, Some(tenant_a.id), &sql).await?;
     assert_eq!(
-        executions.load(Ordering::SeqCst),
+        cache.execution_count(),
         2,
         "the write must have forced a recompute"
     );
-    assert_eq!(cache.execution_count(), 2);
+    assert!(
+        third.worker_executions > 0,
+        "and the recompute must have gone to the fleet, not been answered locally"
+    );
     assert_eq!(
-        rendered(&third),
-        rendered(&truth),
+        rendered(&third.batches),
+        rendered(&truth.batches),
         "the recomputed answer must match a freshly computed one — values, not row counts"
     );
     assert_ne!(
-        rendered(&third),
-        rendered(&first),
+        rendered(&third.batches),
+        rendered(&first.batches),
         "the write added rows, so the new answer must differ from the cached one"
     );
 
     // …and the recomputed answer is itself cached, so a fourth run hits again.
-    let fourth = run_query(
-        &ctx,
-        Some(&cache),
-        &lakehouses,
-        Some(tenant_a.id),
-        &sql,
-        &executions,
-    )
-    .await?;
-    assert_eq!(executions.load(Ordering::SeqCst), 2);
+    let fourth = run_query(&ctx, Some(&cache), &lakehouses, Some(tenant_a.id), &sql).await?;
+    assert_eq!(cache.execution_count(), 2);
     assert_eq!(cache.hit_count(), 2);
-    assert_eq!(rendered(&fourth), rendered(&truth));
+    assert_eq!(fourth.worker_executions, 0);
+    assert_eq!(fourth.worker_rows, 0);
+    assert_eq!(rendered(&fourth.batches), rendered(&truth.batches));
 
-    // ---- 4. A different tenant sees none of it -----------------------------------------------
+    // ---- 4. A different tenant sees none of it ------------------------------------------------
     // Same session, same catalog, same SQL, same snapshot: the *only* difference is the account.
-    let other_tenant = run_query(
-        &ctx,
-        Some(&cache),
-        &lakehouses,
-        Some(tenant_b.id),
-        &sql,
-        &executions,
-    )
-    .await?;
+    // The plan tenant B ships is byte-identical to tenant A's, which is exactly why its fleet is a
+    // fresh one — on a shared fleet the worker's own content-addressed stage cache would have
+    // served it and the counter would say nothing.
+    let other_tenant = run_query(&ctx, Some(&cache), &lakehouses, Some(tenant_b.id), &sql).await?;
     assert_eq!(
-        executions.load(Ordering::SeqCst),
+        cache.execution_count(),
         3,
         "tenant B was served tenant A's cached result — that is a data leak, not a cache hit"
     );
-    assert_eq!(cache.execution_count(), 3);
-    assert_eq!(rendered(&other_tenant), rendered(&truth));
+    assert!(
+        other_tenant.worker_executions > 0,
+        "tenant B's query must have been executed for tenant B"
+    );
+    assert_eq!(rendered(&other_tenant.batches), rendered(&truth.batches));
 
     // Row counts, which show the invalidation model plainly. Tenant A holds *two* entries: the
     // pre-write one and the post-write one. The stale one is not deleted — it is unreachable,
@@ -470,19 +575,23 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
         "two tenants must never share a cache key, even for byte-identical SQL"
     );
 
-    // ---- 5. Uncacheable shapes fall through, every time --------------------------------------
+    // ---- 5. Uncacheable shapes fall through, every time ---------------------------------------
     // No table reference means nothing to invalidate on, so this must execute on every run.
     let skips_before = cache.skip_count();
+    let executions_before = cache.execution_count();
     for _ in 0..2 {
-        run_query(
+        let declined = run_query(
             &ctx,
             Some(&cache),
             &lakehouses,
             Some(tenant_a.id),
             "SELECT 1 AS one",
-            &executions,
         )
         .await?;
+        assert!(
+            declined.worker_executions > 0,
+            "a declined query executes normally, every time"
+        );
     }
     assert_eq!(
         cache.skip_count(),
@@ -490,16 +599,16 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
         "a query with no versionable input must be declined, not cached"
     );
     assert_eq!(
-        executions.load(Ordering::SeqCst),
-        5,
-        "a declined query executes normally, every time"
+        cache.execution_count(),
+        executions_before,
+        "a declined query never got a key, so it is not an execution *through the cache* — the \
+         worker-side counter above is what proves it ran at all"
     );
 
     // ---- 6. No cache configured behaves exactly as before -------------------------------------
-    let unconfigured = AtomicUsize::new(0);
-    let plain = run_query(&ctx, None, &lakehouses, None, &sql, &unconfigured).await?;
-    assert_eq!(unconfigured.load(Ordering::SeqCst), 1);
-    assert_eq!(rendered(&plain), rendered(&truth));
+    let plain = run_query(&ctx, None, &lakehouses, None, &sql).await?;
+    assert!(plain.worker_executions > 0);
+    assert_eq!(rendered(&plain.batches), rendered(&truth.batches));
 
     // ---- Cleanup: this run's rows only ---------------------------------------------------------
     // Deleting the accounts cascades the cache rows away, which is also the assertion that the
@@ -557,7 +666,9 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
 
     let catalog = format!("lldb_rcb_{}_{}", std::process::id(), nanos());
     let warehouse = tempfile::tempdir()?;
-    let (ctx, storage) = build_session(StorageConfig::InMemory).await?;
+    // `Local` for the same reason as above: the workers read the warehouse's files directly.
+    let (ctx, storage) =
+        build_session(StorageConfig::Local(warehouse.path().to_path_buf())).await?;
     let lakehouses =
         apply_manifest(&ctx, &storage, &manifest(&catalog, url, warehouse.path())).await?;
     insert_rows(&ctx, &catalog, "(1, 'a'), (2, 'b')").await?;
@@ -578,27 +689,14 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
         },
     );
     cache.purge_account(tenant.id).await?;
-    let executions = AtomicUsize::new(0);
 
     let mut expected = Vec::new();
     for sql in &queries {
-        expected.push(rendered(
-            &run_query(
-                &ctx,
-                Some(&cache),
-                &lakehouses,
-                Some(tenant.id),
-                sql,
-                &executions,
-            )
-            .await?,
-        ));
+        let run = run_query(&ctx, Some(&cache), &lakehouses, Some(tenant.id), sql).await?;
+        assert!(run.worker_executions > 0, "a miss runs on the fleet");
+        expected.push(rendered(&run.batches));
     }
-    assert_eq!(
-        executions.load(Ordering::SeqCst),
-        3,
-        "three distinct queries"
-    );
+    assert_eq!(cache.execution_count(), 3, "three distinct queries");
 
     let (held,): (i64,) = sqlx::query_as("SELECT count(*) FROM result_cache WHERE account_id = $1")
         .bind(tenant.id)
@@ -614,16 +712,19 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
         &lakehouses,
         Some(tenant.id),
         &queries[0],
-        &executions,
     )
     .await?;
     assert_eq!(
-        executions.load(Ordering::SeqCst),
+        cache.execution_count(),
         4,
         "the evicted entry must be recomputed"
     );
+    assert!(
+        again.worker_executions > 0,
+        "and recomputing means the fleet ran it again"
+    );
     assert_eq!(
-        rendered(&again),
+        rendered(&again.batches),
         expected[0],
         "eviction cannot change an answer"
     );
@@ -635,15 +736,18 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
         &lakehouses,
         Some(tenant.id),
         &queries[2],
-        &executions,
     )
     .await?;
     assert_eq!(
-        executions.load(Ordering::SeqCst),
+        cache.execution_count(),
         4,
         "a recently-used entry must not have been evicted"
     );
-    assert_eq!(rendered(&survivor), expected[2]);
+    assert_eq!(
+        survivor.worker_executions, 0,
+        "a surviving entry is served without touching a worker"
+    );
+    assert_eq!(rendered(&survivor.batches), expected[2]);
 
     // ---- The TTL ---------------------------------------------------------------------------
     // Zero seconds makes `expires_at` equal to the insert's `now()`, and a lookup requires
@@ -657,21 +761,23 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
         },
     );
     expiring.purge_account(tenant.id).await?;
-    let ttl_executions = AtomicUsize::new(0);
     for _ in 0..2 {
-        let batches = run_query(
+        let run = run_query(
             &ctx,
             Some(&expiring),
             &lakehouses,
             Some(tenant.id),
             &queries[0],
-            &ttl_executions,
         )
         .await?;
-        assert_eq!(rendered(&batches), expected[0]);
+        assert_eq!(rendered(&run.batches), expected[0]);
+        assert!(
+            run.worker_executions > 0,
+            "an expired entry must never be served — every run goes to the fleet"
+        );
     }
     assert_eq!(
-        ttl_executions.load(Ordering::SeqCst),
+        expiring.execution_count(),
         2,
         "an expired entry must never be served"
     );

@@ -35,6 +35,27 @@ SQL ──parse──▶ Logical Plan ──optimize──▶ Physical Plan ─�
 | Object storage (local / S3) | object_store | `object_store` |
 | Worker data exchange | Arrow Flight (gRPC) | `arrow-flight` |
 
+### Iceberg reads distribute by pinning the snapshot at plan time
+
+`iceberg-datafusion` plans a table read as a node that holds a live catalog handle and resolves its
+own data files when it executes. That node can be neither shipped to a worker (nothing can serialize
+a catalog connection) nor split into byte ranges, so before a plan is staged the coordinator rewrites
+each Iceberg scan into a plain Parquet scan over the concrete data files of the snapshot it was
+planned against.
+
+One move, three results: the plan becomes serializable, so it can cross Arrow Flight; it becomes
+sliceable, so the fleet reads the table once *between* its workers instead of once each; and the
+snapshot is pinned by construction, because the file list travels inside the plan bytes. A commit
+landing mid-query is invisible to a plan already in flight, and **a worker needs no catalog access
+at all** — it reads exactly what the plan names, and nothing else.
+
+The honest scope: this makes reads distributable for **unpartitioned, delete-free, Parquet** Iceberg
+tables. A partitioned table, one carrying row-level delete files, one with non-Parquet data files,
+or one whose files span two object stores is refused with an error naming the reason rather than
+read approximately — the failure mode of guessing is a silently wrong answer. Because the plan
+addresses data files directly, every worker must be able to read the warehouse's object store.
+Writes are not distributed at all: the coordinator commits them itself.
+
 ## Workspace
 
 | Crate | Role |
@@ -157,9 +178,13 @@ cargo test
 - [x] **Phase 6** — Generic config-as-data catalog (multi-schema), S3 storage backend
 - [x] **Phase 7** — Containerized cluster + cross-container test + CI
 - [x] **Phase 8** — AWS IaC in CDK: ECS Fargate worker fleet + S3 warehouse ([infra/](infra/))
-- [ ] **Next** — Real network-shuffle exec node + worker-to-worker `do_exchange`; scan-level
-  slicing (the work that makes fan-out across the fleet meaningful); persistent shared catalog
-  (SQL/REST); publish versioned images to a registry from CI
+- [x] **Phase 9** — Scan-level slicing (byte ranges, so `n` workers do one scan's IO rather than
+  `n`), a staging planner that cuts arbitrary SQL into stages, a persistent shared SQL catalog on
+  Postgres, and Iceberg scans resolved to their snapshot's files — the piece that makes an Iceberg
+  query distributable at all
+- [ ] **Next** — Real network-shuffle exec node + worker-to-worker `do_exchange`; REST catalog;
+  distributed reads of partitioned tables and of tables carrying row-level deletes; publish
+  versioned images to a registry from CI
 
 ## Deploying to AWS
 

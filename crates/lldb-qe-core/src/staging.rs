@@ -158,7 +158,12 @@ type PlacedStages = Vec<(String, Arc<dyn ExecutionPlan>)>;
 ///
 /// Returns a coordinator-side plan whose remote stages are [`FlightReaderExec`] leaves. Execute it
 /// with `datafusion::physical_plan::collect` on the coordinator's own [`SessionContext`]: the plan
-/// is self-contained (scans embed their file paths), so the workers need no table registration.
+/// is self-contained (scans embed their file paths), so the workers need no table registration —
+/// and, for an Iceberg table, no catalog either, because
+/// [`resolve_iceberg_scans`](crate::iceberg_scan::resolve_iceberg_scans) has already turned its scan
+/// into a file scan over the data files of one snapshot. `plan` is expected to arrive already
+/// resolved; an `IcebergTableScan` reaching this planner is neither sliceable nor serializable and
+/// will fail at the Flight boundary.
 ///
 /// The plan is walked bottom-up and every distribution boundary the planner recognizes is cut, so
 /// one plan can yield many stages — a join feeding a `GROUP BY` becomes join stages with aggregate
