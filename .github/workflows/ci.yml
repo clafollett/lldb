@@ -19,7 +19,7 @@ jobs:
     name: fmt • clippy • test
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    # The services-database test (tests/integration/services_db.rs) proves claims only a real server can
+    # The services-database test (crates/lldb-qe-core/tests/integration/services_db.rs) proves claims only a real server can
     # settle — that the migrations apply, that re-applying them is a no-op, and that deleting an
     # account cascades to its warehouses. It skips itself when no database is reachable, so
     # without this container CI would report green on a test that never ran. Same 18.4 as compose.
