@@ -26,8 +26,8 @@
 //! database we are handed may be someone's dev instance.
 //!
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb \
-//!     cargo test -p lldb-qe-core --test dml_snapshots
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test dml_snapshots -- --nocapture
+//!     cargo test -p lldb-qe-core --test integration dml_snapshots
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration dml_snapshots -- --nocapture
 
 use std::path::Path;
 use std::process::Command;

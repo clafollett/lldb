@@ -15,16 +15,14 @@
 //! this is safe to run against a shared dev instance and concurrently with itself. The test
 //! deletes the accounts it created, which cascades to their warehouses; it drops nothing global.
 //!
-//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test warehouse_lifecycle
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test warehouse_lifecycle -- --nocapture
+//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration warehouse_lifecycle
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration warehouse_lifecycle -- --nocapture
 
-mod support;
-
+use crate::support::{self, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use lldb_qe_core::discovery::DEFAULT_WAREHOUSE_ENDPOINT;
 use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::WarehouseState;
-use support::{resolve_target, unique_name};
 
 /// Skip-or-connect, shared by every test in this file. Returns `None` when there is no database,
 /// having already printed why.

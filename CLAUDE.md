@@ -108,9 +108,9 @@ in order of importance:
    Naming the snapshot id narrows that window; it does not close it, because the file list is still
    recomputed remotely from state the coordinator does not control.
 2. **A worker needs no catalog access of any kind** — no connection, no credential, no manifest, no
-   warehouse path. `tests/distributed_iceberg.rs` proves that rather than asserting it: its catalog
-   is a per-process `MemoryCatalog`, so the workers *cannot* see it even in principle, and the query
-   still answers correctly.
+   warehouse path. `tests/integration/distributed_iceberg.rs` proves that rather than asserting it:
+   its catalog is a per-process `MemoryCatalog`, so the workers *cannot* see it even in principle,
+   and the query still answers correctly.
 3. **Iceberg inherits scan slicing for free.** A `FileScanConfig` is precisely what
    `scan_split::split_scan` cuts into byte ranges, so the fleet reads the snapshot once *between*
    the workers instead of once *each*.
@@ -240,13 +240,26 @@ every services-DB failure falls through to ordinary execution.
 A default `--all-targets` debug build of this workspace is ~30 GB, almost all of it debuginfo for
 dependencies. That is the version wall's other face: one arrow / object_store / datafusion tree-wide
 means nothing dedupes away. `[profile.dev]` in the root `Cargo.toml` sets `debug = 0` and
-`incremental = false`, which takes it to ~9 GB, and `[profile.test]` inherits both.
+`incremental = false`, which takes it to ~9.8 GB, and `[profile.test]` inherits both. Consolidating
+the integration tests into one binary took it the rest of the way, to **4.4 GB** — the same
+one-version-tree-wide fact, seen from the other end: 24 test targets each statically linked the
+whole graph, so the target directory held 24 near-identical copies of it.
 
 This is **committed config, not a flag to remember**. Do not pass `CARGO_PROFILE_DEV_DEBUG=0` /
 `CARGO_INCREMENTAL=0` on the command line — they are the same settings by another route, and a build
 run with different values than the last one invalidates the whole target directory and rebuilds it,
 which is the disk exhaustion the profile exists to prevent. If you need line numbers in a backtrace,
 change `debug` to `"line-tables-only"` in `Cargo.toml` rather than overriding it per invocation.
+
+There is deliberately **no `.cargo/config.toml`, and in particular no `rustflags` selecting a
+linker.** rustc 1.97.1 already links `x86_64-unknown-linux-gnu` with the `rust-lld` that ships
+inside the toolchain — `rustc --print link-args` shows it passing `-B .../bin/gcc-ld -fuse-ld=lld`
+itself. Setting `-C link-arg=-fuse-ld=lld` was measured (issue #44) and produces a **byte-identical
+binary**; all it would buy is one target-directory invalidation per contributor plus a soft
+dependency on whatever `lld` is on `PATH`, which on this box is *older* than the bundled one. lld is
+worth roughly 8x over GNU `bfd` here — we just already have it. `docs/build-performance.md` holds
+the numbers, the method, and the baseline that any future build-time change is measured against;
+read it before re-running this experiment.
 
 ## Commands
 
@@ -257,15 +270,19 @@ cargo fmt --all && cargo clippy --all-targets
 docker compose up --build                                 # full cluster (MinIO + Postgres 18.4 + fleet)
 LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smoke test (needs a daemon)
 
+# `crates/lldb-qe-core/tests/` is ONE test target, `integration` (plus `distributed_cluster`,
+# which stays separate — see `tests/integration/main.rs` for why). Each former file is a module
+# of it, so selecting one is a filter, not a target: `--test integration <module>`, as below.
+
 # Services DB (control plane). Migrations are an explicit one-shot step, NEVER startup magic —
 # a rolling fleet must not race to apply DDL. Compose runs it as the `db-migrate` service.
 cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
   --metadata-url postgres://lldb@localhost/lldb --seed-account default
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test services_db  # or LLDB_DOCKER=1
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration services_db  # or LLDB_DOCKER=1
 
 # Shared Iceberg catalog (`backend = { kind = "sql" }`): proves two independently-built
 # lakehouses on one Postgres see the same tables and the same snapshot. Same three-way gating.
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test shared_sql_catalog
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration shared_sql_catalog
 # Virtual warehouses (elastic compute). The CLI writes DESIRED state; an actuator applies it —
 # `aws ecs update-service --desired-count`, a CDK deploy (-c warehouses=analytics:4,etl:1), or
 # `docker compose up -d --scale`. The engine carries no orchestrator SDK, on purpose.
@@ -277,12 +294,12 @@ cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   #
 # asserted on a WORKER's `StageCache::execution_count`, with a fresh in-process fleet per query so
 # "flat" cannot mean "the worker's own stage cache absorbed it" — and that an Iceberg commit
 # invalidates it. Same three-way gating.
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test result_cache_db
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration result_cache_db
 
 # DML (`DELETE`/`UPDATE`) + the concurrent-writer race. Same three-way gating. The race test
 # asserts on the *data* (four writers, `qty = qty + 1`, final value must be exactly 4), so a lost
 # or double-applied commit fails it as a wrong number rather than as an error.
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test dml_snapshots
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration dml_snapshots
 
 # Query scheduler. `lldb-qe-coordinator` runs ONE query and exits (compose and the cluster smoke
 # test depend on that, unchanged). `lldb-qe-server` is the long-running shape: concurrent
@@ -291,7 +308,7 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test dml_snap
 # two servers on one warehouse each enforce their own limit (crates/lldb-qe-core/src/scheduler.rs).
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test query_scheduler
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_scheduler
 # Accounts, API keys, roles, grants. Same operator-tool posture as `lldb-qe-warehouse`: its
 # credential IS the Postgres password, so treat that as the deployment's root credential. The token
 # `key create` prints is shown exactly once and stored nowhere.
@@ -307,7 +324,7 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
 
 # Authentication, RBAC and tenant isolation end-to-end: the issue's three "done when" bullets as
 # actual assertions, plus the worker fleet-secret boundary. Same three-way gating.
-LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test auth_rbac
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration auth_rbac
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```
@@ -316,3 +333,11 @@ cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 
 Every module carries a `#[cfg(test)] mod tests`; end-to-end paths get a `tests/` integration
 test. No milestone lands without green tests.
+
+A new integration test is a **module of the `integration` binary** (`tests/integration/`, declared
+in its `main.rs`), not a new `tests/*.rs` file — a new file is a new target that statically links
+the entire dependency graph again, which is what Story 2 of issue #44 spent itself undoing. The one
+reason to add a separate target is process-global state: one binary is one process, so a test that
+mutates the environment, or asserts on a process-wide counter, must not share it. `main.rs` names
+the three pieces of such state that exist today and why each is safe; add to that list or add a
+target, but do not add a file and hope.

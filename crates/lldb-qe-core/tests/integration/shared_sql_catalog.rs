@@ -27,8 +27,8 @@
 //! be shared with a real catalog on someone's dev database — only this run's rows are deleted.
 //!
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb \
-//!     cargo test -p lldb-qe-core --test shared_sql_catalog
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test shared_sql_catalog -- --nocapture
+//!     cargo test -p lldb-qe-core --test integration shared_sql_catalog
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration shared_sql_catalog -- --nocapture
 
 use std::path::Path;
 use std::process::Command;
@@ -222,7 +222,7 @@ async fn start_worker(
 /// different resolution path ([`lldb_qe_core::services::ServicesArgs::from_env`]). Exercising it
 /// requires the environment to actually name this database, which only the caller can arrange:
 ///
-///   LLDB_TEST_POSTGRES_URL=$U LLDB_METADATA_URL=$U cargo test --test shared_sql_catalog
+///   LLDB_TEST_POSTGRES_URL=$U LLDB_METADATA_URL=$U cargo test --test integration shared_sql_catalog
 ///
 /// When they disagree — the ordinary CI case — the explicit URI is used and the assertions are
 /// unchanged. The unit tests in `lakehouse.rs` cover the resolution rules with no database.

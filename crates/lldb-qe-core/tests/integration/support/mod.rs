@@ -1,9 +1,19 @@
 //! Finding a Postgres to test against, in the three ways that can work.
 //!
-//! Two integration tests now need a real server — `services_db.rs` (migrations, accounts, the
-//! foreign keys) and `warehouse_lifecycle.rs` (the warehouse API and its transitions) — and they
-//! must agree exactly on *which* server and on how to skip when there is none. So the resolution
-//! lives here rather than being copied, in the order the first one that works wins:
+//! Four integration tests resolve their database through this module — `services_db` (migrations,
+//! accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its transitions),
+//! `query_scheduler` and `auth_rbac` — and they must agree exactly on *which* server and on how to
+//! skip when there is none. The order is first-one-that-works:
+//!
+//! Be aware that they are **not** the only database-gated tests: `dml_snapshots`, `result_cache_db`
+//! and `shared_sql_catalog` each carry their own private copy of this resolution — their own
+//! `Target`, `Drop` guard and container bootstrap. That is an accident of history rather than a
+//! decision. Each was once its own binary, where taking a dependency on this module was opt-in and
+//! copying looked cheap; now that they are all modules of one binary (see `main.rs`) the copies sit
+//! side by side in a single compilation unit. They behave identically and name their containers
+//! distinctly, so nothing is broken — but four implementations of "find me a Postgres" is three too
+//! many, and the next person to touch any of them should migrate it here rather than fix a bug in
+//! one copy.
 //!
 //! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is. CI's path (the `check` job runs a
 //!    `postgres:18.4-alpine` service container) and the path for anyone with a local server.
@@ -14,13 +24,15 @@
 //!
 //! Every test using this must be safe to run repeatedly against the same database *and*
 //! concurrently with another copy of itself — the URL it is handed may well be someone's dev
-//! instance, and in CI both test binaries share one container. Hence [`unique_name`]: a pid +
-//! nanosecond suffix, so no run can collide with another, and each test deletes exactly the rows
-//! it made and nothing global.
+//! instance, and in CI every database-gated test shares one container. Hence [`unique_name`]: a
+//! pid + nanosecond suffix, so no run can collide with another, and each test deletes exactly the
+//! rows it made and nothing global.
 //!
-//! `dead_code` is allowed because each integration test binary compiles this module separately
-//! and legitimately uses only the parts it needs.
-#![allow(dead_code)]
+//! This module used to carry `#![allow(dead_code)]`, because it was compiled separately into each
+//! integration-test binary and each of them legitimately used only the parts it needed. That
+//! stopped being true when those binaries became modules of one (see `main.rs`): there is now a
+//! single copy, every item in it has a caller, and the allow — which would have hidden a genuinely
+//! unused helper — is gone. Do not put it back to silence a warning; delete the helper instead.
 
 use std::process::Command;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
