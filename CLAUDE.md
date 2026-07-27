@@ -248,6 +248,16 @@ run with different values than the last one invalidates the whole target directo
 which is the disk exhaustion the profile exists to prevent. If you need line numbers in a backtrace,
 change `debug` to `"line-tables-only"` in `Cargo.toml` rather than overriding it per invocation.
 
+There is deliberately **no `.cargo/config.toml`, and in particular no `rustflags` selecting a
+linker.** rustc 1.97.1 already links `x86_64-unknown-linux-gnu` with the `rust-lld` that ships
+inside the toolchain — `rustc --print link-args` shows it passing `-B .../bin/gcc-ld -fuse-ld=lld`
+itself. Setting `-C link-arg=-fuse-ld=lld` was measured (issue #44) and produces a **byte-identical
+binary**; all it would buy is one target-directory invalidation per contributor plus a soft
+dependency on whatever `lld` is on `PATH`, which on this box is *older* than the bundled one. lld is
+worth roughly 8x over GNU `bfd` here — we just already have it. `docs/build-performance.md` holds
+the numbers, the method, and the baseline that any future build-time change is measured against;
+read it before re-running this experiment.
+
 ## Commands
 
 ```
