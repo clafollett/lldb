@@ -94,7 +94,7 @@ const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The namespace the test's table lives in.
-const NS: &str = "sales";
+pub(crate) const NS: &str = "sales";
 /// Workers per fleet. More than one so "the fleet" is not a euphemism for "a worker", and few
 /// enough that starting a fresh one per query stays cheap.
 const WORKERS: usize = 2;
@@ -219,7 +219,10 @@ fn unique(tag: &str) -> String {
 
 /// One Iceberg table on a shared SQL catalog, declared with an explicit schema so the test needs
 /// no generated data on disk.
-fn manifest(catalog_name: &str, url: &str, warehouse: &Path) -> Manifest {
+///
+/// Shared with `cache_grant_ordering`, which needs the same thing for the same reason: a query is
+/// only cacheable if its inputs carry a snapshot to version against.
+pub(crate) fn manifest(catalog_name: &str, url: &str, warehouse: &Path) -> Manifest {
     Manifest {
         catalogs: vec![CatalogDef {
             name: catalog_name.to_string(),
@@ -341,12 +344,11 @@ async fn run_query(
         // No authorization to enforce: this file is about the cache in isolation.
         //
         // The interaction between the two — that the grant check must dominate the cache lookup,
-        // so a revoked caller cannot be served a stored result — is **not** covered by any test,
-        // here or in `auth_rbac.rs`. It holds by construction (`execute_cached` checks before it
-        // looks up, see that function) and by review, which is weaker than a test and should be
-        // read as such. Proving it needs a cacheable query, which needs an Iceberg snapshot to
-        // version the inputs against; the tables in `auth_rbac.rs` are plain parquet and so
-        // nothing there is cacheable at all.
+        // so a revoked caller cannot be served a stored result — is `cache_grant_ordering.rs`.
+        // It lives in neither of the two files it composes for the same reason it needed its own:
+        // proving it needs a cacheable query, which needs an Iceberg snapshot to version the
+        // inputs against, and the tables in `auth_rbac.rs` are plain parquet, so nothing there is
+        // cacheable at all.
         None,
         sql,
         &fleet.urls,
@@ -372,7 +374,7 @@ fn rendered(batches: &[RecordBatch]) -> String {
 /// Run on the coordinator's own context, not across the fleet, because that is where a write
 /// belongs: `iceberg-datafusion`'s commit node holds a live catalog handle no codec can serialize,
 /// and one statement gets one committer (see `CLAUDE.md`, "Writes").
-async fn insert_rows(ctx: &SessionContext, catalog: &str, values: &str) -> Result<()> {
+pub(crate) async fn insert_rows(ctx: &SessionContext, catalog: &str, values: &str) -> Result<()> {
     ctx.sql(&format!(
         "INSERT INTO \"{catalog}\".\"{NS}\".\"orders\" VALUES {values}"
     ))

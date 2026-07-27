@@ -325,6 +325,12 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
 # Authentication, RBAC and tenant isolation end-to-end: the issue's three "done when" bullets as
 # actual assertions, plus the worker fleet-secret boundary. Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration auth_rbac
+
+# The grant check dominates the result-cache lookup: a caller whose SELECT is revoked is refused
+# even though the answer is still cached and still reachable (the entry is asserted to be live,
+# and re-granting turns the next run straight back into a hit). Same three-way gating. Confirm the
+# fix's teeth by moving the check below the lookup in `result_cache.rs` — this must then fail.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration cache_grant_ordering
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```
