@@ -167,6 +167,19 @@ the next run composes a different key, and the stale row is simply unreachable. 
 function, `information_schema`), and **not caching is always a legal answer**, so every refusal and
 every services-DB failure falls through to ordinary execution.
 
+## Debug builds are big — the profile handles it, don't re-derive it
+
+A default `--all-targets` debug build of this workspace is ~30 GB, almost all of it debuginfo for
+dependencies. That is the version wall's other face: one arrow / object_store / datafusion tree-wide
+means nothing dedupes away. `[profile.dev]` in the root `Cargo.toml` sets `debug = 0` and
+`incremental = false`, which takes it to ~9 GB, and `[profile.test]` inherits both.
+
+This is **committed config, not a flag to remember**. Do not pass `CARGO_PROFILE_DEV_DEBUG=0` /
+`CARGO_INCREMENTAL=0` on the command line — they are the same settings by another route, and a build
+run with different values than the last one invalidates the whole target directory and rebuilds it,
+which is the disk exhaustion the profile exists to prevent. If you need line numbers in a backtrace,
+change `debug` to `"line-tables-only"` in `Cargo.toml` rather than overriding it per invocation.
+
 ## Commands
 
 ```
