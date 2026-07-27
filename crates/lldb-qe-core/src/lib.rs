@@ -16,6 +16,7 @@
 //! | [`storage`]      | Where bytes live — abstracted so local dev today, S3 later | 0 |
 //! | [`session`]      | A configured DataFusion context + registered tables        | 0 |
 //! | [`lakehouse`]    | Iceberg: files → transactional, versioned tables           | 1 |
+//! | [`iceberg_scan`] | Pin an Iceberg scan to its snapshot's files, so it can be shipped and sliced | 3 |
 //! | Flight transport | Ship sub-plans to workers, stream Arrow back | 3 |
 //! | Distributed shuffle | Hash-partition a join across workers   | 4 |
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
@@ -31,6 +32,13 @@
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
+//!
+//! Its counterpart above the storage layer, and the reason a worker can be as thin as it is:
+//! **a plan is self-contained.** Everything a worker needs to answer its stage travels inside the
+//! plan bytes — file paths, byte ranges, and, since [`iceberg_scan`], the data files of the exact
+//! Iceberg snapshot the coordinator planned against. A worker registers no tables, loads no
+//! manifest and holds no catalog credential; what it must have is read access to the object store
+//! the plan names.
 
 /// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -50,6 +58,7 @@ pub mod distributed;
 pub mod dml;
 pub mod engine;
 pub mod flight;
+pub mod iceberg_scan;
 pub mod lakehouse;
 pub mod manifest;
 pub mod query_log;
@@ -83,6 +92,7 @@ pub use engine::{
 pub use flight::{
     fetch, fetch_with_failover, serve_worker, serve_worker_with_auth, serve_worker_with_cache,
 };
+pub use iceberg_scan::{resolve_iceberg_scans, scanned_data_files};
 pub use lakehouse::Lakehouse;
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,

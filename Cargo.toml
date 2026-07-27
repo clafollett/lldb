@@ -98,6 +98,27 @@ toml = "0.8"
 criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
 
+[profile.dev]
+# This workspace's debug build is enormous, and that is a property of the dependency tree rather
+# than of anything we wrote: DataFusion, Arrow, the Iceberg stack and sqlx are all large, and the
+# "ONE arrow / object_store / datafusion version tree-wide" rule above means none of it dedupes
+# away. With default settings `cargo build --all-targets` produces roughly 30 GB of artifacts —
+# enough to exhaust a CI runner's or a container's disk allowance mid-build and fail the run for a
+# reason that looks nothing like its cause. These two keys take it to about 9 GB.
+#
+# `debug = 0` drops debuginfo, which is what almost all of that 30 GB actually is. The cost is
+# line numbers in panic backtraces; if you are chasing one, `debug = "line-tables-only"` buys them
+# back for a fraction of the full size. It is not the default because the common case is running
+# the test suite, not debugging it.
+#
+# `incremental = false` because incremental state is a second large on-disk cache that pays off
+# only across repeated local edits — and never in CI, a container, or a fresh worktree, which is
+# where the disk ceiling is actually hit.
+#
+# `[profile.test]` inherits from this, so tests get both.
+debug = 0
+incremental = false
+
 [profile.release]
 # Analytical engines live and die on the optimizer; make release builds honest.
 lto = "thin"

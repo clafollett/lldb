@@ -60,6 +60,7 @@ use datafusion::physical_plan::{
 };
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::TryStreamExt;
+use iceberg_datafusion::physical_plan::IcebergTableScan;
 
 use crate::flight;
 use crate::retry::RetryPolicy;
@@ -358,9 +359,7 @@ impl PhysicalExtensionCodec for LldbCodec {
         let reader = node
             .as_any()
             .downcast_ref::<FlightReaderExec>()
-            .ok_or_else(|| {
-                DataFusionError::NotImplemented(format!("LldbCodec cannot encode {}", node.name()))
-            })?;
+            .ok_or_else(|| encode_failure(&node))?;
 
         if reader.fallbacks.len() > MAX_ENCODED_FALLBACKS as usize {
             return Err(DataFusionError::Internal(format!(
@@ -379,6 +378,29 @@ impl PhysicalExtensionCodec for LldbCodec {
         buf.extend_from_slice(&serialize_plan(Arc::clone(&reader.inner))?);
         Ok(())
     }
+}
+
+/// The error for a node this codec has no encoding for.
+///
+/// [`IcebergTableScan`] gets its own message because it is the one un-encodable node a *correct*
+/// query routinely produces, and because the fix is a step the caller skipped rather than a missing
+/// feature: [`crate::iceberg_scan::resolve_iceberg_scans`] turns it into a parquet scan
+/// `datafusion-proto` already understands, and [`crate::engine`] runs that before anything is
+/// staged. Reaching the codec with one still in the plan means some path bypassed that funnel —
+/// which is worth saying out loud, since the generic "cannot encode IcebergTableScan" reads like
+/// "Iceberg is unsupported" and would send someone off to write a codec that should not exist.
+fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
+    if node.as_any().downcast_ref::<IcebergTableScan>().is_some() {
+        return DataFusionError::NotImplemented(
+            "LldbCodec cannot encode IcebergTableScan: it holds a live catalog handle and resolves \
+             its own files, so it is deliberately not serialized. Call \
+             `iceberg_scan::resolve_iceberg_scans` to pin the scan to its snapshot's data files \
+             before the plan is staged — `engine::run_on_fleet` already does, so a plan that gets \
+             here bypassed it."
+                .to_string(),
+        );
+    }
+    DataFusionError::NotImplemented(format!("LldbCodec cannot encode {}", node.name()))
 }
 
 /// Serialize a plan with this codec, so nested [`FlightReaderExec`] nodes survive.

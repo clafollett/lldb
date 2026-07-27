@@ -446,7 +446,11 @@ fn is_concurrent_bootstrap(err: &iceberg::Error) -> bool {
 
 /// The scheme of a URI, lowercased — `postgres://a/b` → `postgres`, `sqlite:x.db` → `sqlite`,
 /// `/tmp/wh` → `None`. Split on `:` rather than `://` because SQLite URIs have no authority.
-fn uri_scheme(uri: &str) -> Option<String> {
+///
+/// Crate-visible because [`crate::iceberg_scan`] asks the same question of an Iceberg data-file
+/// path, and "is this a URI or a path" must be one ruling, not two — in particular the Windows
+/// drive-letter case below, which a second implementation would get wrong.
+pub(crate) fn uri_scheme(uri: &str) -> Option<String> {
     let (scheme, _) = uri.split_once(':')?;
     // RFC 3986: a scheme starts with a letter, then letters, digits, `+`, `-` or `.`. Two extra
     // restrictions on top of that, both deliberate:

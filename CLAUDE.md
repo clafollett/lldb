@@ -3,7 +3,8 @@
 Distributed analytical query engine: DataFusion + Arrow Flight + Iceberg on object storage — a
 rudimentary cloud data warehouse. It **began** as a learning-grade POC and is now maturing into a
 real system: the distributed-execution core (scan slicing, a staging planner, a materialize-once
-shuffle, fleet discovery) is in place, and the roadmap ahead is production-track — a Postgres
+shuffle, fleet discovery, and Iceberg scans resolved to their snapshot's files so an Iceberg query
+can be distributed at all) is in place, and the roadmap ahead is production-track — a Postgres
 services DB (metadata/catalog/accounts), virtual warehouses, RBAC, a query scheduler, fault
 tolerance, DML. Treat the code as production-track, not throwaway; the "POC" label describes where
 it started, not where it is.
@@ -45,13 +46,14 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 ## Layout
 
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
-  (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, shared CLI/logging
-  config (`config.rs`), Postgres services DB / control plane (`services.rs` + `migrations/`),
-  virtual warehouses (`warehouse.rs`) and the discovery that routes to them (`discovery.rs`),
-  the cross-query result cache (`result_cache.rs`), the one-query pipeline both front ends share
-  (`engine.rs`), admission control (`scheduler.rs`), query history (`query_log.rs`), the
-  long-running coordinator (`server.rs`), and access control — identity and credentials
-  (`auth.rs`) plus grants and the plan-time check (`rbac.rs`)
+  (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, the coordinator-side
+  Iceberg-scan resolver that makes an Iceberg plan shippable and sliceable (`iceberg_scan.rs`),
+  shared CLI/logging config (`config.rs`), Postgres services DB / control plane (`services.rs` +
+  `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
+  (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
+  front ends share (`engine.rs`), admission control (`scheduler.rs`), query history
+  (`query_log.rs`), the long-running coordinator (`server.rs`), and access control — identity and
+  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
   migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
@@ -79,6 +81,72 @@ they are **not** in `migrations/`; and applying a manifest is idempotent — a t
 exists is not re-created and, crucially, not re-seeded. Iceberg 0.10 ships no object-store
 `StorageFactory`, so a `sql` catalog requires a `file://` warehouse and **errors** on `s3://`
 rather than silently writing metadata to local disk.
+
+## Iceberg reads: resolved to files on the coordinator, then distributed
+
+`iceberg-datafusion` plans a table read as an `IcebergTableScan` — a DataFusion *extension* node
+holding a live `iceberg::table::Table` (catalog handle, FileIO, metadata) that resolves its own
+files when it executes. That node can be neither **serialized** (`LldbCodec` encodes exactly one
+node, `FlightReaderExec`) nor **byte-range sliced** (it is not a `DataSourceExec` over a
+`FileScanConfig`). Until `iceberg_scan.rs` existed, that meant **no Iceberg query could be
+distributed at all** — the fleet only ever worked on plain-parquet listing tables, which is the
+opposite of what this engine is for.
+
+`iceberg_scan::resolve_iceberg_scans` rewrites every such node — **on the coordinator, before the
+plan is staged, sliced or serialized** — into a plain parquet `DataSourceExec` over the concrete
+data files of the snapshot the scan was planned against. `engine::run_on_fleet` calls it at the
+top, so the one-shot coordinator and `lldb-qe-server` inherit it identically. Three consequences,
+in order of importance:
+
+1. **The snapshot is pinned by construction.** The file list *is* the snapshot, and it travels
+   inside the plan bytes. The tempting alternative — teach the codec to encode a table identifier
+   plus a snapshot id and let each worker load the table and re-plan its files — is the design to
+   reject, and not merely because it puts a catalog credential in every worker and re-does manifest
+   planning `n` times. Each worker would resolve *which files* independently, so a commit landing
+   mid-query could leave two workers of the same query reading two different tables: the exact
+   split-brain #8 closed by putting one shared catalog behind the fleet, reopened one layer down.
+   Naming the snapshot id narrows that window; it does not close it, because the file list is still
+   recomputed remotely from state the coordinator does not control.
+2. **A worker needs no catalog access of any kind** — no connection, no credential, no manifest, no
+   warehouse path. `tests/distributed_iceberg.rs` proves that rather than asserting it: its catalog
+   is a per-process `MemoryCatalog`, so the workers *cannot* see it even in principle, and the query
+   still answers correctly.
+3. **Iceberg inherits scan slicing for free.** A `FileScanConfig` is precisely what
+   `scan_split::split_scan` cuts into byte ranges, so the fleet reads the snapshot once *between*
+   the workers instead of once *each*.
+
+**Deployment requirement this implies:** every worker must be able to read the warehouse's object
+store, because the plan names data files directly (`s3://bucket/…`, `file:///wh/…`). A coordinator
+that can reach the bucket and workers that cannot is now a broken deployment rather than a slow one.
+The rewrite checks the store resolves on the coordinator's session and errors there, naming the
+scheme, instead of failing deep inside a remote stage on some worker.
+
+Two details worth keeping straight. The rewrite lands *after* DataFusion's physical optimizer, so
+nothing is pushed into the replacement — the `FilterExec` above it still filters the rows
+(`IcebergTableProvider` reports every pushdown as `Inexact`, so that node was always going to be
+there), and what is lost is parquet row-group pruning, an IO optimization rather than a correctness
+property. And the replacement uses **exactly one** `FileGroup` however many files the snapshot has,
+because `IcebergTableScan` reports one partition and every parent's `PlanProperties` were computed
+against that; re-slicing across the fleet is `split_scan`'s job, later.
+
+### The refusals — each an error naming its reason, never an approximation
+
+A plain parquet read is not a complete Iceberg reader, and the gap between them is where silent
+wrong answers live:
+
+| Refused | Why |
+| - | - |
+| row-level deletes attached to a data file | position/equality deletes are applied by Iceberg's own reader and by nothing else, so reading the data files alone resurrects deleted rows |
+| a non-parquet data file (Avro/ORC/Puffin) | `ParquetSource` cannot read it |
+| a partitioned table | identity-partition values live in manifest metadata, not in the data file, so a bare parquet read can be missing columns. Checked against the table metadata's partition specs, because iceberg-rust 0.10 hardcodes `FileScanTask::partition_spec` to `None` and the per-file check would never fire |
+| data files spanning two object stores | a `FileScanConfig` names exactly one `ObjectStoreUrl` |
+| a scan task covering a partial byte range | iceberg 0.10 always plans whole files, so anything else means the library changed under us — and reading the whole file regardless would duplicate rows |
+
+Be honest about what a refusal costs: the binaries have **no single-node fallback**, so a refused
+table is a refused query, not a slower one. That is deliberate — quietly running a shape we cannot
+distribute correctly on the coordinator would hide the problem — and the errors say what to do about
+the table (compact it, rewrite it as parquet). Do not "fix" one of these by widening the rewrite;
+widen the *check*, or add the missing reader.
 
 ## Writes: append is DataFusion's, `DELETE`/`UPDATE` are ours
 
@@ -167,6 +235,19 @@ the next run composes a different key, and the stale row is simply unreachable. 
 function, `information_schema`), and **not caching is always a legal answer**, so every refusal and
 every services-DB failure falls through to ordinary execution.
 
+## Debug builds are big — the profile handles it, don't re-derive it
+
+A default `--all-targets` debug build of this workspace is ~30 GB, almost all of it debuginfo for
+dependencies. That is the version wall's other face: one arrow / object_store / datafusion tree-wide
+means nothing dedupes away. `[profile.dev]` in the root `Cargo.toml` sets `debug = 0` and
+`incremental = false`, which takes it to ~9 GB, and `[profile.test]` inherits both.
+
+This is **committed config, not a flag to remember**. Do not pass `CARGO_PROFILE_DEV_DEBUG=0` /
+`CARGO_INCREMENTAL=0` on the command line — they are the same settings by another route, and a build
+run with different values than the last one invalidates the whole target directory and rebuilds it,
+which is the disk exhaustion the profile exists to prevent. If you need line numbers in a backtrace,
+change `debug` to `"line-tables-only"` in `Cargo.toml` rather than overriding it per invocation.
+
 ## Commands
 
 ```
@@ -192,8 +273,10 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
   --metadata-url postgres://lldb@localhost/lldb create --name analytics --size 4
 cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   # route a query
 
-# Result cache (`result_cache.rs`): proves a repeat query over unchanged tables executes nothing,
-# and that an Iceberg commit invalidates it. Same three-way gating.
+# Result cache (`result_cache.rs`): proves a repeat query over unchanged tables executes nothing —
+# asserted on a WORKER's `StageCache::execution_count`, with a fresh in-process fleet per query so
+# "flat" cannot mean "the worker's own stage cache absorbed it" — and that an Iceberg commit
+# invalidates it. Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test result_cache_db
 
 # DML (`DELETE`/`UPDATE`) + the concurrent-writer race. Same three-way gating. The race test
