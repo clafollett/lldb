@@ -33,15 +33,14 @@
 //! The database is found the same way `services_db.rs` finds it (see [`support`]): an explicit
 //! `LLDB_TEST_POSTGRES_URL`, else a throwaway container under `LLDB_DOCKER=1`, else a clean skip.
 //!
-//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test auth_rbac
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test auth_rbac -- --nocapture
-
-mod support;
+//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration auth_rbac
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration auth_rbac -- --nocapture
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::{self, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use arrow_flight::Ticket;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -61,7 +60,6 @@ use lldb_qe_core::server::{
 use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::WarehouseState;
 use lldb_qe_core::{DEFAULT_WAREHOUSE_ENDPOINT, flight};
-use support::{resolve_target, unique_name};
 
 /// Workers standing behind each tenant's warehouse.
 const WAREHOUSE_SIZE: i32 = 1;

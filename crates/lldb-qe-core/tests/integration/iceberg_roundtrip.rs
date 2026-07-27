@@ -98,7 +98,7 @@ async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
 }
 
 /// The Phase 0 query, now answered through Iceberg. Heavy (loads 6M rows) — run explicitly
-/// with `cargo test -p lldb-qe-core --test iceberg_roundtrip -- --ignored`.
+/// with `cargo test -p lldb-qe-core --test integration iceberg_roundtrip -- --ignored`.
 #[tokio::test]
 #[ignore = "loads the 6M-row lineitem table into Iceberg"]
 async fn lineitem_group_by_through_iceberg() -> anyhow::Result<()> {

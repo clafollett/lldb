@@ -4,7 +4,7 @@
 //! Issue #14's "done when" is a schema claim, and a schema claim can only be proven by a server:
 //! `CREATE TABLE` typos, a `CHECK` that rejects legal values, an `ON DELETE CASCADE` that was
 //! never written — none of them show up in a unit test. So this test needs a database, and it
-//! finds one through [`support::resolve_target`]: an explicit `LLDB_TEST_POSTGRES_URL`, else a
+//! finds one through [`crate::support::resolve_target`]: an explicit `LLDB_TEST_POSTGRES_URL`, else a
 //! throwaway container under `LLDB_DOCKER=1`, else a clean skip.
 //!
 //! The test is safe to run repeatedly against the same database, and concurrently with another
@@ -12,14 +12,12 @@
 //! deletes exactly the rows it made. It never drops anything global — the database it is handed
 //! may well be someone's dev instance.
 //!
-//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test services_db
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test services_db -- --nocapture
+//!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration services_db
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration services_db -- --nocapture
 
-mod support;
-
+use crate::support::{resolve_target, unique_name};
 use anyhow::{Context, Result};
 use lldb_qe_core::services::ServicesDb;
-use support::{resolve_target, unique_name};
 
 /// A name no other run — or concurrent copy of this run — will pick.
 fn unique_account_name(tag: &str) -> String {

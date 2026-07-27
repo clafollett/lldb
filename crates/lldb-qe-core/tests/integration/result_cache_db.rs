@@ -65,8 +65,8 @@
 //! never drops a table — the database it is handed may be someone's dev instance.
 //!
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb \
-//!     cargo test -p lldb-qe-core --test result_cache_db
-//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test result_cache_db -- --nocapture
+//!     cargo test -p lldb-qe-core --test integration result_cache_db
+//!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration result_cache_db -- --nocapture
 
 use std::path::Path;
 use std::process::Command;

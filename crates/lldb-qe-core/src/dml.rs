@@ -1048,7 +1048,7 @@ fn totals(new_files: &[DataFile]) -> HashMap<String, String> {
 /// rather than through two independent schemes.
 ///
 /// The column names are `iceberg-catalog-sql`'s private statics, so they are spelled out here and
-/// pinned by `tests/dml_snapshots.rs`, which asserts the live table still has exactly these
+/// pinned by `tests/integration/dml_snapshots.rs`, which asserts the live table still has exactly these
 /// columns. A silent rename in that crate would otherwise turn every commit into a runtime error
 /// — or, worse, a `WHERE` clause that matches nothing and reports a phantom conflict forever.
 async fn swap_metadata_pointer(
