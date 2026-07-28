@@ -53,14 +53,16 @@ COPY . .
 ARG GIT_SHA=unknown
 ENV LLDB_GIT_SHA=$GIT_SHA
 # The coordinator package also builds the control-plane one-shots: `lldb-qe-migrate` (applies
-# services-DB migrations) and `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual
-# warehouse), plus `lldb-qe-server`, the long-running query scheduler. They ship in the same image
-# on purpose — migrations are embedded in the binary at compile time, the build that writes a
-# warehouse row must be the build that reads it, and a coordinator (one-shot or serving) must be
-# the identical build to every worker it ships a plan to.
+# services-DB migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual
+# warehouse) and `lldb-qe-reap` (resolve query-history rows stranded by a dead coordinator), plus
+# `lldb-qe-server`, the long-running query scheduler. They ship in the same image on purpose —
+# migrations are embedded in the binary at compile time, the build that writes a warehouse row must
+# be the build that reads it, and a coordinator (one-shot or serving) must be the identical build to
+# every worker it ships a plan to.
 RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
     && cp target/release/lldb-qe-coordinator target/release/lldb-qe-migrate \
-          target/release/lldb-qe-warehouse target/release/lldb-qe-server \
+          target/release/lldb-qe-warehouse target/release/lldb-qe-reap \
+          target/release/lldb-qe-server \
           target/release/lldb-qe-worker /usr/local/bin/
 
 # ---- Runtime -------------------------------------------------------------------------------
@@ -75,6 +77,7 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/lldb-qe-coordinator /usr/local/bin/lldb-qe-coordinator
 COPY --from=builder /usr/local/bin/lldb-qe-migrate /usr/local/bin/lldb-qe-migrate
 COPY --from=builder /usr/local/bin/lldb-qe-warehouse /usr/local/bin/lldb-qe-warehouse
+COPY --from=builder /usr/local/bin/lldb-qe-reap /usr/local/bin/lldb-qe-reap
 COPY --from=builder /usr/local/bin/lldb-qe-server /usr/local/bin/lldb-qe-server
 COPY --from=builder /usr/local/bin/lldb-qe-worker /usr/local/bin/lldb-qe-worker
 

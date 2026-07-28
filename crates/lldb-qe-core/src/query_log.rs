@@ -31,15 +31,13 @@
 //!
 //! # What this does NOT do
 //!
-//! - **No reaping.** If a coordinator process dies mid-query, its row stays `running` (or
-//!   `queued`) forever — nothing here sweeps them. That is why every row records the
-//!   `coordinator` that owns it: a reaper is a later issue, and it will need to know whose rows
-//!   to touch. Treat a `running` row from a coordinator that is no longer alive as unknown, not
-//!   as running. Since [`crate::liveness`], "is that coordinator alive" is a question with an
-//!   answer — the row records the writing process as a `(coordinator, coordinator_incarnation)`
-//!   pair, so a coordinator that died and was replaced *on the same address* is distinguishable
-//!   from one that is still running. Nothing here acts on that answer; the sweep is still a later
-//!   issue.
+//! - **No reaping *here*.** If a coordinator process dies mid-query, nothing in this module moves
+//!   its rows out of `running` (or `queued`). That is why every row records the `coordinator` that
+//!   owns it, and — since [`crate::liveness`] — the *incarnation* beside it, so a coordinator that
+//!   died and was replaced on the same address is distinguishable from one that is still running.
+//!   Treat a `running` row from a coordinator that is no longer alive as unknown, not as running.
+//!   [`crate::reaper`] is what acts on that, out of process, as `lldb-qe-reap`; the sweep lives
+//!   there rather than here because nothing on the query path may ever run it.
 //! - **No result storage.** [`QueryRecord::result_rows`] is a count, not a cache. The batches are
 //!   streamed to the client and dropped.
 //! - **No tenancy enforcement.** Callers pass the `account_id` they resolved; nothing here checks
@@ -195,12 +193,15 @@ impl QueryRecord {
 }
 
 /// The column list every query lookup returns, in the order [`QueryRow`] expects.
-const QUERY_COLUMNS: &str = "id, account_id, warehouse_id, sql_text, state, submitted_at, \
-                             started_at, finished_at, error, coordinator, \
-                             coordinator_incarnation, result_rows";
+///
+/// `pub(crate)` because [`crate::reaper`] reads the same rows through the same shape; a second
+/// column list would be a second thing to keep in step with [`QueryRow`].
+pub(crate) const QUERY_COLUMNS: &str = "id, account_id, warehouse_id, sql_text, state, \
+                                        submitted_at, started_at, finished_at, error, coordinator, \
+                                        coordinator_incarnation, result_rows";
 
 /// The raw row shape. Named so the `query_as` turbofishes below stay readable.
-type QueryRow = (
+pub(crate) type QueryRow = (
     i64,
     i64,
     Option<i64>,
@@ -218,7 +219,7 @@ type QueryRow = (
 /// Turn a row into a [`QueryRecord`], failing loudly on a state the schema should have made
 /// impossible. Reachable only if someone edits `state` by hand or a future migration adds a value
 /// this build does not know — both worth an error rather than a guess.
-fn query_from_row(row: QueryRow) -> Result<QueryRecord> {
+pub(crate) fn query_from_row(row: QueryRow) -> Result<QueryRecord> {
     let (
         id,
         account_id,
@@ -332,10 +333,24 @@ impl ServicesDb {
 
     /// The single UPDATE behind every transition.
     ///
-    /// One statement, not read-then-write: unlike a warehouse (whose transitions are contested by
-    /// several operators and therefore need [`SELECT ... FOR UPDATE`](crate::warehouse)), a query
-    /// row has exactly one writer — the coordinator task that owns it — for its whole life. There
-    /// is nothing to race, so a lock would buy nothing and cost a round trip per state change.
+    /// One statement, not read-then-write — but no longer because there is only one writer. That
+    /// was the justification here until [`crate::reaper`] existed, and it is now false: a query row
+    /// has **two** writers, the coordinator task that owns it and a reaper resolving rows whose
+    /// coordinator is gone.
+    ///
+    /// What replaces it is an asymmetry rather than a lock. This writer is the *authority* on its
+    /// own query — it alone knows whether the rows were delivered — so it writes unconditionally,
+    /// and a late terminal write from it corrects a row a reaper had already given up on. The
+    /// reaper is the one that must prove the row has not moved underneath it, and it does: its
+    /// `UPDATE` carries the whole reapable predicate (state, coordinator identity and that
+    /// coordinator's liveness) in its own `WHERE`, so a row this writer has just moved to a terminal
+    /// state fails the recheck and is left alone. See `reaper`'s decision 3 for both interleavings;
+    /// `query_reaper::a_reaper_never_clobbers_a_terminal_state` asserts them.
+    ///
+    /// So a lock here would still buy nothing — the contention it would arbitrate is arbitrated by
+    /// the other writer's compare-and-swap — and would still cost a round trip per state change.
+    /// Unlike a warehouse, whose transitions are contested by several equally-entitled operators and
+    /// therefore do need [`SELECT ... FOR UPDATE`](crate::warehouse).
     ///
     /// `started_at` is set only on the transition *into* `running`, and `finished_at` only on a
     /// transition into a terminal state, so re-marking cannot smear the timings.
@@ -430,6 +445,14 @@ impl ServicesDb {
 ///
 /// A row that never started contributes nothing. A row that started but has no `finished_at` is
 /// treated as still running, i.e. its interval extends past every other event.
+///
+/// That last rule is why this instrument needs [`crate::reaper`]: a row stranded by a coordinator
+/// that died is *indistinguishable here* from one still executing, so a single one of them makes
+/// every later query look concurrent with it and the measured peak drifts upward — silently, and in
+/// the direction that makes a correct scheduler look broken. Reaping closes those intervals at the
+/// last instant their coordinator was known alive, which is what keeps this reporting the true
+/// bound; `query_reaper::peak_concurrency_over_reaped_history_reports_the_true_bound` is that claim
+/// against a real history.
 pub fn peak_concurrency(records: &[QueryRecord]) -> usize {
     // Sweep line over (timestamp, delta). Ends are sorted before starts at the same instant so
     // two queries that touch — one finishing exactly when the next starts — count as one, not

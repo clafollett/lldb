@@ -1,9 +1,10 @@
 //! Finding a Postgres to test against, in the three ways that can work.
 //!
-//! Four integration tests resolve their database through this module — `services_db` (migrations,
-//! accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its transitions),
-//! `query_scheduler` and `auth_rbac` — and they must agree exactly on *which* server and on how to
-//! skip when there is none. The order is first-one-that-works:
+//! Most database-gated integration tests resolve their database through this module — `services_db`
+//! (migrations, accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its
+//! transitions), `query_scheduler`, `auth_rbac`, `tenant_catalogs`, `coordinator_liveness` and
+//! `query_reaper` — and they must agree exactly on *which* server and on how to skip when there is
+//! none. The order is first-one-that-works:
 //!
 //! Be aware that they are **not** the only database-gated tests: `dml_snapshots`, `result_cache_db`
 //! and `shared_sql_catalog` each carry their own private copy of this resolution — their own
