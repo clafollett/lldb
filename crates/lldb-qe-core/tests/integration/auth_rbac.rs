@@ -65,7 +65,7 @@ use lldb_qe_core::{DEFAULT_WAREHOUSE_ENDPOINT, flight};
 const WAREHOUSE_SIZE: i32 = 1;
 
 /// Skip-or-connect, shared by every test in this file.
-async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+pub(crate) async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
         eprintln!(
@@ -124,7 +124,7 @@ async fn start_workers(count: usize) -> Result<Vec<SocketAddr>> {
 
 /// A resolver answering any of `names` with `addrs`, and erroring on anything else — a query must
 /// never resolve a warehouse it was not routed to.
-fn cloud_map(names: Vec<String>, addrs: Vec<SocketAddr>) -> BoxResolver {
+pub(crate) fn cloud_map(names: Vec<String>, addrs: Vec<SocketAddr>) -> BoxResolver {
     Arc::new(move |asked: String| {
         let answer = if names.contains(&asked) {
             Ok(addrs.clone())
@@ -136,13 +136,13 @@ fn cloud_map(names: Vec<String>, addrs: Vec<SocketAddr>) -> BoxResolver {
 }
 
 /// One tenant, fully wired: an account, a user, a role, a key, a warehouse.
-struct Tenant {
-    account_id: i64,
-    account_name: String,
-    user_id: i64,
-    role_id: i64,
-    warehouse: String,
-    token: String,
+pub(crate) struct Tenant {
+    pub(crate) account_id: i64,
+    pub(crate) account_name: String,
+    pub(crate) user_id: i64,
+    pub(crate) role_id: i64,
+    pub(crate) warehouse: String,
+    pub(crate) token: String,
 }
 
 /// Two tenants sharing one server, one catalog and one database — which is the only arrangement in
@@ -250,8 +250,9 @@ impl Harness {
 /// Create a tenant with a user, a role holding `USAGE` on its own warehouse, and one API key.
 ///
 /// Note what it is **not** granted: any table. Every table grant in this file is made explicitly by
-/// the test that needs it, so "denied by default" is the starting state rather than an assumption.
-async fn provision(db: &ServicesDb, tag: &str) -> Result<Tenant> {
+/// the test that needs it, so "denied by default" is the starting state rather than an assumption —
+/// which is also why `cache_grant_ordering` reuses it rather than seeding its own tenant.
+pub(crate) async fn provision(db: &ServicesDb, tag: &str) -> Result<Tenant> {
     let account = db.create_account(&unique_name(tag)).await?;
     let user = db.create_user(account.id, "operator").await?;
     let role = db.create_role(account.id, "analyst").await?;
@@ -319,7 +320,11 @@ async fn raw_status_of(url: &str, request: &QueryRequest, raw: &str) -> tonic::S
     }
 }
 
-async fn status_of(url: &str, request: &QueryRequest, token: Option<&str>) -> tonic::Status {
+pub(crate) async fn status_of(
+    url: &str,
+    request: &QueryRequest,
+    token: Option<&str>,
+) -> tonic::Status {
     let channel = tonic::transport::Channel::from_shared(url.to_string())
         .expect("valid url")
         .connect()
