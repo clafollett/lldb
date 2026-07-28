@@ -26,8 +26,15 @@
 //!     --manifest /manifests/tpch.toml --metadata-host postgres --bind 0.0.0.0:50050
 //! ```
 //!
-//! With no `--metadata-*` it still runs; it just has no accounts, no warehouses and no history —
-//! the same bargain every other binary here strikes (see CLAUDE.md).
+//! With no `--metadata-*` it still runs; it just has no accounts, no warehouses, no history and no
+//! liveness registration — the same bargain every other binary here strikes (see CLAUDE.md).
+//!
+//! # Liveness
+//!
+//! With a services database, this process registers itself in `coordinators` before it serves and
+//! renews on an interval, so the rest of the fleet can tell a coordinator that died from one that is
+//! merely busy. It deregisters on a clean exit. It never acts on another coordinator's liveness —
+//! the design, and the four decisions behind it, are on [`lldb_qe_core::liveness`].
 //!
 //! # Security posture
 //!
@@ -46,10 +53,14 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use lldb_qe_core::engine::TenantSessions;
+use lldb_qe_core::liveness::{
+    CoordinatorIdentity, CoordinatorRegistration, DEFAULT_RENEW_INTERVAL, death_threshold,
+};
 use lldb_qe_core::scheduler::DEFAULT_MAX_QUEUED_QUERIES;
 use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, DEFAULT_SERVER_BIND, serve_coordinator,
@@ -120,12 +131,27 @@ struct Cli {
     #[arg(long, env = "LLDB_MAX_QUEUED_QUERIES", default_value_t = DEFAULT_MAX_QUEUED_QUERIES)]
     max_queued_queries: usize,
 
-    /// How this process names itself in `queries.coordinator`. Defaults to the bound address.
-    /// Worth setting to something stable (a task id, a hostname) when several coordinators write
-    /// to one services database, because concurrency limits are only meaningful within one value
-    /// of that column.
+    /// How this process names itself in `queries.coordinator` and in the `coordinators` table.
+    /// Defaults to the bound address.
+    ///
+    /// This is a **deployment slot**, not a process id: it is meant to survive a restart, and the
+    /// per-process half of the identity is minted here and never configurable (see
+    /// [`lldb_qe_core::liveness`]). Worth setting to something stable — a task id, a hostname —
+    /// when several coordinators write to one services database, because concurrency limits are
+    /// only meaningful within one value of that column, and because two coordinators sharing a slot
+    /// is a misconfiguration that costs one of them its registration.
     #[arg(long, env = "LLDB_COORDINATOR_ID")]
     coordinator_id: Option<String>,
+
+    /// How often this coordinator renews its registration in the services database, in seconds.
+    ///
+    /// The liveness threshold is a fixed multiple of this and there is deliberately no separate
+    /// setting for it: two knobs could be configured inconsistently, and the failure mode of that
+    /// is a live coordinator's queries being treated as abandoned. Lower it to shorten how long a
+    /// dead coordinator goes unnoticed; raise it to cut control-plane writes on a large fleet.
+    /// Ignored entirely when no services database is configured.
+    #[arg(long, env = "LLDB_COORDINATOR_RENEW_INTERVAL_SECS", default_value_t = DEFAULT_RENEW_INTERVAL.as_secs())]
+    coordinator_renew_interval_secs: u64,
 
     /// Serve requests that carry **no API key**, even though a services database is configured.
     ///
@@ -204,7 +230,41 @@ async fn main() -> Result<()> {
         .await
         .context("binding server")?;
     let addr = listener.local_addr()?;
-    let coordinator_id = cli.coordinator_id.unwrap_or_else(|| addr.to_string());
+    // The slot is what an operator configures and what survives a restart; the incarnation is minted
+    // right here, once, and cannot be. Every query row this process writes carries both, so a
+    // restart — onto this address or another — is distinguishable from the process it replaced.
+    let identity = CoordinatorIdentity::new(cli.coordinator_id.unwrap_or_else(|| addr.to_string()));
+    let renew_interval = Duration::from_secs(cli.coordinator_renew_interval_secs.max(1));
+
+    // Registration follows the services database, like history and auth: with none there is nothing
+    // to register with, nobody to reap and no fleet to coordinate, so this is `None` and the process
+    // behaves exactly as it did before liveness existed — no row, no background task, no per-query
+    // anything. See `lldb_qe_core::liveness`.
+    let registration =
+        CoordinatorRegistration::start_if_configured(db.clone(), identity.clone(), renew_interval)
+            .await?;
+    if registration.is_some() {
+        // A read, never an action: this process must not conclude anything *about* its peers, and
+        // certainly must not sweep after them at startup — a fleet restarting together would have
+        // every member judging the others through a lease none of them had renewed yet. Logging the
+        // count makes the "admission control is per coordinator process" caveat visible in an
+        // operator's logs at the moment it starts being true.
+        if let Some(db) = &db {
+            match db.live_coordinators().await {
+                Ok(live) => tracing::info!(
+                    live_coordinators = live.len(),
+                    renew_interval_secs = renew_interval.as_secs(),
+                    death_threshold_secs = death_threshold(renew_interval).as_secs(),
+                    "coordinator liveness is on (this coordinator included in the count); \
+                     admission control is still per process, so a fleet-wide limit is not implied"
+                ),
+                Err(error) => tracing::warn!(
+                    error = %format!("{error:#}"),
+                    "could not read the coordinator registry; this is informational only"
+                ),
+            }
+        }
+    }
 
     let mut coordinator = Coordinator::multi_tenant(
         sessions,
@@ -215,7 +275,7 @@ async fn main() -> Result<()> {
             warehouse_endpoint: cli.warehouse_endpoint,
             max_concurrent_queries: cli.max_concurrent_queries,
             max_queued_queries: cli.max_queued_queries,
-            coordinator_id: coordinator_id.clone(),
+            coordinator: identity.clone(),
             allow_anonymous: cli.allow_anonymous,
         },
     );
@@ -233,7 +293,8 @@ async fn main() -> Result<()> {
     coordinator.log_posture();
     tracing::info!(
         addr = %addr,
-        coordinator_id = %coordinator_id,
+        coordinator_id = %identity.slot(),
+        incarnation = %identity.incarnation(),
         max_concurrent_queries = ?coordinator.config().max_concurrent_queries,
         max_queued_queries = coordinator.config().max_queued_queries,
         "lldb-qe-server listening (admission control is per-process, not fleet-wide)"
@@ -250,6 +311,13 @@ async fn main() -> Result<()> {
     .await;
 
     tracing::info!(admission = ?coordinator.scheduler().snapshot(), "lldb-qe-server stopped");
+    // Deregister *before* closing the pool, and before returning: a coordinator that stopped on
+    // purpose must be observably not-live at once rather than after the liveness threshold, and the
+    // write needs a connection to do it. Failing to get it in is survivable — the registration then
+    // simply expires the way a killed coordinator's does.
+    if let Some(registration) = registration {
+        registration.shut_down().await;
+    }
     if let Some(db) = db {
         db.close().await;
     }

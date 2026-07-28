@@ -26,6 +26,7 @@
 //! | [`engine`]       | Running one query: plan → distribute → collect, shared by both front ends | 5 |
 //! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
 //! | [`query_log`]    | Query history: what ran, when, and how it ended                       | 5 |
+//! | [`liveness`]     | Coordinator registration and renewal: telling a dead coordinator from a slow one | 5 |
 //! | [`server`]       | The long-running coordinator: concurrent queries over one Flight port  | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
@@ -60,6 +61,7 @@ pub mod engine;
 pub mod flight;
 pub mod iceberg_scan;
 pub mod lakehouse;
+pub mod liveness;
 pub mod manifest;
 pub mod query_log;
 pub mod rbac;
@@ -95,6 +97,10 @@ pub use flight::{
 };
 pub use iceberg_scan::{resolve_iceberg_scans, scanned_data_files};
 pub use lakehouse::Lakehouse;
+pub use liveness::{
+    CoordinatorIdentity, CoordinatorRegistration, CoordinatorRow, DEFAULT_RENEW_INTERVAL,
+    MISSED_RENEWALS_BEFORE_DEAD, death_threshold,
+};
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,

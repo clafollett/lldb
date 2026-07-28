@@ -67,6 +67,7 @@ use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::prelude::SessionContext;
 use lldb_qe_core::engine::{TenantSession, TenantSessions};
+use lldb_qe_core::liveness::CoordinatorIdentity;
 use lldb_qe_core::rbac::{ObjectRef, Privilege};
 use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig};
 use lldb_qe_core::server::{
@@ -315,7 +316,7 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
                 warehouse_endpoint: vec![DEFAULT_WAREHOUSE_ENDPOINT.to_string()],
                 max_concurrent_queries: Some(2),
                 max_queued_queries: 32,
-                coordinator_id: format!("cache-order-{addr}"),
+                coordinator: CoordinatorIdentity::new(format!("cache-order-{addr}")),
                 allow_anonymous: false,
             },
         )

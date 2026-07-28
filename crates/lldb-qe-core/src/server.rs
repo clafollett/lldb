@@ -113,6 +113,7 @@ use crate::auth::{AUTHORIZATION_HEADER, AuthError, Principal, bearer_header, bea
 use crate::engine::{
     BoxResolver, TenantSession, TenantSessions, execute_query_cached, resolve_fleet, total_rows,
 };
+use crate::liveness::CoordinatorIdentity;
 use crate::query_log::QueryRecord;
 use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
@@ -298,8 +299,16 @@ pub struct CoordinatorConfig {
     pub max_concurrent_queries: Option<usize>,
     /// Queue depth per warehouse.
     pub max_queued_queries: usize,
-    /// How this process identifies itself in `queries.coordinator`.
-    pub coordinator_id: String,
+    /// How this process identifies itself on every row it writes: a stable slot (what
+    /// `--coordinator-id` names, and what `queries.coordinator` has always held) plus a per-process
+    /// incarnation.
+    ///
+    /// It is a pair rather than a string because a coordinator id is ambiguous on its own — a
+    /// restart onto a *new* address looks like a different coordinator, and a restart onto the
+    /// *same* one looks like the same process. Recording both means a reader of history can tell
+    /// which happened. See [`crate::liveness`], which is also what turns the pair into a liveness
+    /// answer when there is a services database to register with.
+    pub coordinator: CoordinatorIdentity,
     /// Serve unauthenticated requests *even though* a services database is configured.
     ///
     /// The escape hatch, and it is `false` by default on purpose: security that has to be turned on
@@ -321,7 +330,7 @@ impl Default for CoordinatorConfig {
             warehouse_endpoint: vec![crate::discovery::DEFAULT_WAREHOUSE_ENDPOINT.to_string()],
             max_concurrent_queries: None,
             max_queued_queries: crate::scheduler::DEFAULT_MAX_QUEUED_QUERIES,
-            coordinator_id: DEFAULT_SERVER_BIND.to_string(),
+            coordinator: CoordinatorIdentity::new(DEFAULT_SERVER_BIND),
             allow_anonymous: false,
         }
     }
@@ -853,7 +862,7 @@ impl Coordinator {
                 account_id,
                 target.warehouse_id,
                 sql,
-                Some(&self.config.coordinator_id),
+                Some(&self.config.coordinator),
             )
             .await
             .context("recording the query in history")?;

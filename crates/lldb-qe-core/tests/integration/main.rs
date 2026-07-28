@@ -73,6 +73,7 @@ mod support;
 mod auth_rbac;
 mod cache_grant_ordering;
 mod catalog_generic;
+mod coordinator_liveness;
 mod distributed_iceberg;
 mod distributed_join;
 mod distributed_operators;

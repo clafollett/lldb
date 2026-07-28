@@ -52,6 +52,7 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use lldb_qe_core::auth::{AUTHORIZATION_HEADER, bearer_header};
 use lldb_qe_core::auth::{AuthError, FleetAuth};
 use lldb_qe_core::engine::BoxResolver;
+use lldb_qe_core::liveness::CoordinatorIdentity;
 use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
 use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, QueryRequest, encode_query_ticket, serve_coordinator,
@@ -208,7 +209,7 @@ impl Harness {
                     warehouse_endpoint: vec![DEFAULT_WAREHOUSE_ENDPOINT.to_string()],
                     max_concurrent_queries: Some(2),
                     max_queued_queries: 32,
-                    coordinator_id: format!("auth-test-{addr}"),
+                    coordinator: CoordinatorIdentity::new(format!("auth-test-{addr}")),
                     allow_anonymous: false,
                 },
             )
@@ -933,7 +934,7 @@ async fn a_malformed_credential_is_refused_even_when_anonymous_is_allowed() -> R
         CoordinatorConfig {
             workers: vec!["http://127.0.0.1:1".to_string()],
             allow_anonymous: true,
-            coordinator_id: format!("anon-test-{addr}"),
+            coordinator: CoordinatorIdentity::new(format!("anon-test-{addr}")),
             ..CoordinatorConfig::default()
         },
     ));

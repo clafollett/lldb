@@ -57,6 +57,7 @@ use datafusion::parquet::file::properties::WriterProperties;
 use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use lldb_qe_core::distributed::{GroupCount, extract_group_counts};
 use lldb_qe_core::engine::BoxResolver;
+use lldb_qe_core::liveness::CoordinatorIdentity;
 use lldb_qe_core::query_log::{QueryRecord, QueryState, peak_concurrency};
 use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
 use lldb_qe_core::server::{
@@ -237,7 +238,7 @@ impl Harness {
                     // therefore `warehouse.size`.
                     max_concurrent_queries: None,
                     max_queued_queries: 64,
-                    coordinator_id: format!("test-{}", addr),
+                    coordinator: CoordinatorIdentity::new(format!("test-{}", addr)),
                     // Not `true`: this file's submissions all present a real key, so the
                     // scheduler is exercised through the same authenticated path production uses.
                     allow_anonymous: false,

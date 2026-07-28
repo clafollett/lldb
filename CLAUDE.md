@@ -52,7 +52,8 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
   (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
   front ends share (`engine.rs`), admission control (`scheduler.rs`), query history
-  (`query_log.rs`), the long-running coordinator (`server.rs`), access control — identity and
+  (`query_log.rs`), coordinator liveness (`liveness.rs`), the long-running coordinator
+  (`server.rs`), access control — identity and
   credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — and the per-account
   catalog/warehouse partitioning those two rest on (`tenancy.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
@@ -259,6 +260,43 @@ The other operator binaries — `lldb-qe-coordinator`, `lldb-qe-warehouse`, `lld
 services database's own, and whoever holds that can grant themselves anything. Do not expose them
 as a multi-tenant entry point; expose `lldb-qe-server`.
 
+## Coordinator liveness: a lease, and deliberately nothing that acts on it
+
+Nothing could tell a dead coordinator from a slow one — no lease, no heartbeat, no `last_seen`.
+`liveness.rs` is that mechanism, and it exists *once* because two later issues (reaping stranded
+query rows, fleet-wide admission) each need the answer and would otherwise each build half of it.
+Four decisions, all argued in the module docs:
+
+1. **Identity is a pair.** `--coordinator-id` is ambiguous in both directions: a coordinator that
+   restarts on a new port looks like a different coordinator, and one that restarts onto the *same*
+   address inherits the previous process's rows without having run them. So a registration is a
+   stable `slot` (the configured id) plus an `incarnation` (128 CSPRNG bits minted at startup), and
+   `queries` records **both** — a row whose slot is live but whose incarnation is gone belongs to a
+   coordinator that died and was replaced. A warehouse is deliberately *not* registered: this
+   coordinator serves whatever a request names, so it has a set of them, not one.
+2. **A failed renewal does not stop the process.** It is counted, logged and retried at the same
+   interval; past the threshold the log moves to `error` and `is_stale()` goes true. A
+   control-plane hiccup must not become a data-plane outage — the same rule history writes and the
+   result cache already follow. A *stolen slot* (another process registered the same id) is the
+   other branch and is conceded rather than fought, because two processes trading one lease forever
+   is worse than one being visibly wrong.
+3. **The threshold is `MISSED_RENEWALS_BEFORE_DEAD` × the renewal interval, and there is no second
+   knob.** Two settings could be configured inconsistently and the failure mode of that is reaping a
+   working coordinator. The interval is stored per row, so each coordinator is judged by its own
+   cadence. A clean exit stamps `shutdown_at` and is not-live at once rather than after the
+   threshold.
+4. **Nobody in-process evaluates it.** This ships the predicate only (`is_coordinator_live`,
+   `live_coordinators`). A coordinator sweeping for dead peers at startup is the dangerous shape — a
+   fleet restarting together would have every member judging the others through a lease none of them
+   had renewed. Whatever acts on the answer is a one-shot out of process, in `lldb-qe-migrate`'s
+   style; nothing here writes to `queries`.
+
+**Liveness is never a precondition for scheduling.** `scheduler.rs` does not know this module
+exists, which is what keeps its bound, fairness and release-on-failure provable with no Postgres, no
+workers and no Flight. With no services DB there is no row, no background task and no per-query
+anything — `CoordinatorRegistration::start_if_configured` is that rule as a function, so it is
+testable without a database.
+
 ## The result cache is keyed, never invalidated
 
 `result_cache.rs` answers a repeat query from Postgres instead of the fleet. Its key is
@@ -343,6 +381,14 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_scheduler
+
+# Coordinator liveness (`liveness.rs`): registers, renews, is promptly not-live on a clean exit and
+# not-live within MISSED_RENEWALS_BEFORE_DEAD intervals after a kill — and, the assertion that makes
+# a reaper safe to build, a LIVE coordinator running a query that outlives the threshold is never
+# concluded dead. Same three-way gating. Slower than the rest of the binary on purpose:
+# `renew_interval_secs` is whole seconds, so the shortest threshold that can exist is 3s and a test
+# that outlives it must really take that long.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration coordinator_liveness
 # Accounts, API keys, roles, grants. Same operator-tool posture as `lldb-qe-warehouse`: its
 # credential IS the Postgres password, so treat that as the deployment's root credential. The token
 # `key create` prints is shown exactly once and stored nowhere.
