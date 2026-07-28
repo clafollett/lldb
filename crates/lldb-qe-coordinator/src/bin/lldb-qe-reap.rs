@@ -59,7 +59,19 @@ struct Cli {
     account: Option<String>,
 
     /// Most rows to resolve in this run. A run that fills its batch says so; run it again.
-    #[arg(long, env = "LLDB_REAP_LIMIT", default_value_t = DEFAULT_REAP_BATCH)]
+    ///
+    /// Refused at zero rather than accepted and reinterpreted. [`ServicesDb::reap_stranded_queries`]
+    /// clamps a zero batch to one, because a sweep that resolves nothing is never what a caller
+    /// meant — but that clamp is a library invariant, and letting it stand in for operator input
+    /// would make `--limit 0` reap a row while `report_batch` compared `0 >= 0` and announced the
+    /// batch was full. An operator's number should mean what it says or be refused; it should not
+    /// quietly become a different number.
+    #[arg(
+        long,
+        env = "LLDB_REAP_LIMIT",
+        default_value_t = DEFAULT_REAP_BATCH,
+        value_parser = positive_limit,
+    )]
     limit: usize,
 
     /// Report what would be resolved and change nothing.
@@ -189,6 +201,22 @@ async fn run(db: &lldb_qe_core::ServicesDb, cli: &Cli, account_id: Option<i64>) 
     Ok(())
 }
 
+/// Parse `--limit`, refusing zero.
+///
+/// The refusal is the point. [`ServicesDb::reap_stranded_queries`] clamps a zero batch to one — a
+/// sensible library invariant, since a sweep that resolves nothing is never what a caller meant —
+/// but a clamp is the wrong response to *operator* input. `--limit 0` would reap one row while
+/// [`report_batch`] compared `0 >= 0` and announced the batch was full, so the run would both do
+/// something the operator did not ask for and describe it wrongly. A number should mean what it
+/// says or be refused.
+fn positive_limit(raw: &str) -> Result<usize, String> {
+    match raw.parse::<usize>() {
+        Ok(0) => Err("must be at least 1; a sweep of zero rows resolves nothing".to_string()),
+        Ok(n) => Ok(n),
+        Err(e) => Err(format!("`{raw}` is not a whole number: {e}")),
+    }
+}
+
 /// A full batch means there may be more. Said out loud rather than looped over here, because a
 /// sweep that keeps going until the table is clean is unbounded again by another name — and an
 /// operator who wants that can run this in a loop with their eyes open.
@@ -240,5 +268,37 @@ fn coordinator_of(slot: Option<&str>, incarnation: Option<&str>) -> String {
         (Some(slot), Some(incarnation)) => format!("{slot}#{incarnation}"),
         (Some(slot), None) => slot.to_string(),
         _ => "<unknown>".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Zero is refused rather than clamped. The core sweep would turn it into one, so accepting it
+    /// here would mean a run that resolves a row the operator did not ask for *and* reports a full
+    /// batch, because `report_batch` compares `0 >= 0`. Refusing at the boundary is what keeps the
+    /// number an operator typed and the number the sweep uses the same number.
+    #[test]
+    fn a_zero_limit_is_refused_rather_than_clamped() {
+        let err = positive_limit("0").expect_err("zero resolves nothing and must be refused");
+        assert!(err.contains("at least 1"), "got: {err}");
+
+        assert_eq!(
+            positive_limit("1").expect("one is the smallest useful batch"),
+            1
+        );
+        assert_eq!(positive_limit("500").expect("an ordinary batch"), 500);
+    }
+
+    /// A non-number names itself in the error, so an operator who typed `--limit lots` is told
+    /// which argument was wrong rather than being handed a bare parse failure.
+    #[test]
+    fn a_non_numeric_limit_names_what_was_typed() {
+        let err = positive_limit("lots").expect_err("not a number");
+        assert!(
+            err.contains("lots"),
+            "the error must quote the input: {err}"
+        );
     }
 }
