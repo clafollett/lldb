@@ -61,6 +61,7 @@ pub mod discovery;
 pub mod distributed;
 pub mod dml;
 pub mod engine;
+pub mod fleet_admission;
 pub mod flight;
 pub mod iceberg_scan;
 pub mod lakehouse;

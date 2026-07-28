@@ -72,12 +72,20 @@
 //! plane before it has issued its first key, and which logs a warning on every startup for exactly
 //! as long as it is set.
 //!
+//! # Admission is fleet-wide, with one condition
+//!
+//! Two servers pointed at one warehouse share its limit: a query needs a slot in this process's
+//! semaphore *and* one of the warehouse's fleet-wide slots in the services database, so `K` is a
+//! property of the warehouse rather than of however many coordinators are running. The condition is
+//! the usual one — it needs a services database, and this process must be registered in it
+//! ([`crate::liveness`]), because a claim's expiry *is* its holder's registration. With no
+//! `--metadata-*` there is no control plane to share a limit through and admission is per process,
+//! exactly as it always was. So is a query routed at a raw `--workers` fleet, which has no
+//! warehouse row for two coordinators to agree on. The design, the costs and the degraded mode are
+//! all in [`crate::scheduler`] and [`crate::fleet_admission`].
+//!
 //! # What this does NOT do
 //!
-//! - **Admission is per coordinator process.** Two servers pointed at one warehouse do not share a
-//!   limit and cannot see each other. This is the single most important caveat here; the full
-//!   argument, and what a fleet-wide design would cost, is in [`crate::scheduler`]'s module docs.
-//!   Run one coordinator per warehouse, or divide the budget by hand.
 //! - **No submit-then-poll.** `do_get` is one call: the client's stream stays open while the query
 //!   queues and runs, then delivers the batches. That is how a JDBC-style client behaves anyway. A
 //!   detached submit — `do_action("submit")` returning a id, then `do_get` on a ticket naming it —
@@ -462,6 +470,18 @@ impl Coordinator {
         self
     }
 
+    /// Share every warehouse's concurrency limit with the rest of the fleet through `fleet`.
+    ///
+    /// A builder called before the first query, because a warehouse's gate is created on first
+    /// sight and keeps whatever bound it was born with. `lldb-qe-server` passes
+    /// [`crate::fleet_admission::FleetAdmission::start_if_registered`]'s answer straight in, so a
+    /// deployment with no services database — or one whose registration did not happen — is simply
+    /// a coordinator that never calls this and is bounded per process, exactly as before.
+    pub fn with_fleet_admission(mut self, fleet: Arc<dyn crate::scheduler::FleetGate>) -> Self {
+        self.scheduler = self.scheduler.with_fleet(fleet);
+        self
+    }
+
     /// Serve repeat queries from `cache`.
     ///
     /// The lakehouses the cache versions against are **not** passed here any more, and that is the
@@ -835,6 +855,11 @@ impl Coordinator {
             warehouse = %slot.warehouse(),
             running = admission.snapshot().running,
             limit = admission.limits().max_concurrent,
+            // Which bound this query actually passed. `running` above is this process's count, and
+            // under a fleet-wide bound it is legitimately below the limit while the warehouse is
+            // saturated by another coordinator — so an operator reading these needs to know which
+            // number they are looking at.
+            fleet_slot = slot.fleet_lease().map(|lease| lease.slot_no),
             "query admitted"
         );
 
@@ -903,10 +928,16 @@ impl Coordinator {
         .await
     }
 
-    /// The gate this query queues on. Keyed by warehouse so two warehouses never share a line.
+    /// The gate this query queues on. Keyed by warehouse so two warehouses never share a line —
+    /// and, for the *fleet-wide* half of the bound, by the warehouse's row id, because a name is
+    /// unique only within an account and shared state keyed by one would merge two tenants'
+    /// concurrency budgets. See [`crate::scheduler`].
     fn admission_for(&self, target: &Target) -> Arc<Admission> {
-        self.scheduler
-            .admission_for(&target.admission_key, target.max_concurrent)
+        self.scheduler.admission_for(
+            &target.admission_key,
+            target.warehouse_id,
+            target.max_concurrent,
+        )
     }
 
     /// Turn a request into everything execution needs, refusing anything unroutable — or anything
@@ -1919,8 +1950,10 @@ mod tests {
         assert_eq!(cancelled.to_status().code(), tonic::Code::Cancelled);
         assert!(cancelled.to_status().message().contains("dana"));
 
-        // `NOT_FOUND`, and the message has to point at *which* coordinator to ask, because
-        // admission — and therefore the cancellation registry — is per process.
+        // `NOT_FOUND`, and the message has to point at *which* coordinator to ask, because the
+        // cancellation registry is per process — the one boundary in `crate::cancel` that
+        // fleet-wide admission did not move, since stopping a query means reaching into the task
+        // running it and only its own process can do that.
         let stale = QueryError::NotRunning(41);
         assert_eq!(stale.to_status().code(), tonic::Code::NotFound);
         let message = stale.to_string();
