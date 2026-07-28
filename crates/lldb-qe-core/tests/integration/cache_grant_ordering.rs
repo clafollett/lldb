@@ -157,8 +157,20 @@ struct Harness {
     tenant: Tenant,
     catalog: String,
     coordinator: Arc<Coordinator>,
+    /// The coordinator's Flight server, retained for the same reason [`Fleet`] retains its
+    /// workers': dropping a `JoinHandle` detaches the task rather than stopping it, so a coordinator
+    /// spawned with a `pending()` shutdown would hold its listening socket for the rest of the
+    /// process. Since #44 that process is the whole `integration` binary — one test's leaked
+    /// listener now outlives its test and accumulates across every test that follows.
+    server: tokio::task::JoinHandle<()>,
     fleet: Fleet,
     _warehouse: tempfile::TempDir,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
 }
 
 impl Harness {
@@ -282,7 +294,7 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
     );
 
     let served = Arc::clone(&coordinator);
-    tokio::spawn(async move {
+    let server = tokio::spawn(async move {
         serve_coordinator(listener, served, std::future::pending::<()>())
             .await
             .expect("coordinator serve");
@@ -294,6 +306,7 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
         tenant,
         catalog,
         coordinator,
+        server,
         fleet,
         _warehouse: warehouse,
     })
