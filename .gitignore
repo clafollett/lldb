@@ -30,3 +30,8 @@ Thumbs.db
 .idea/
 .vscode/*
 !.vscode/extensions.json
+
+# Throwaway git worktrees created for isolated agent runs. Transient scaffolding, not project
+# config — scoped to `worktrees/` rather than all of `.claude/` so anything a repo legitimately
+# commits there (settings, agent definitions) stays visible.
+.claude/worktrees/
