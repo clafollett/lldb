@@ -35,6 +35,21 @@
 //! The assigned query id comes back in the gRPC response metadata as `lldb-query-id`, on success
 //! **and** on failure, so a client always has the handle it needs to look the query up in history.
 //!
+//! # Cancellation: the same id, sent back as an action
+//!
+//! `do_action("cancel", <query id in decimal ASCII>)` stops a query this coordinator is running and
+//! returns its admission slot to the warehouse at once, so the queue behind it advances. The body is
+//! byte-for-byte what `lldb-query-id` returned, so a client copies one into the other and never
+//! learns a second wire format. `list_actions` advertises it, which is how a Flight client discovers
+//! the verb without reading this file.
+//!
+//! Three things about it are decided elsewhere and worth following the links for: the *mechanism* is
+//! a signal into the query's own task rather than an abort from outside, so every exit path keeps
+//! running the same bookkeeping ([`crate::cancel`]); the *scope* is this process's queries, like
+//! admission ([`crate::scheduler`]); and worker-side work is **not** cancelled across the Flight
+//! boundary, it drains on its own ([`crate::cancel`] again, which states exactly what that does and
+//! does not stop).
+//!
 //! # Identity: proven, not claimed
 //!
 //! This used to be the hole in the design. The ticket's `account` field was believed verbatim, so
@@ -64,19 +79,20 @@
 //!   argument, and what a fleet-wide design would cost, is in [`crate::scheduler`]'s module docs.
 //!   Run one coordinator per warehouse, or divide the budget by hand.
 //! - **No submit-then-poll.** `do_get` is one call: the client's stream stays open while the query
-//!   queues and runs, then delivers the batches. That is how a JDBC-style client behaves anyway,
-//!   and it means cancellation is "hang up", which works. A detached submit — `do_action("submit")`
-//!   returning a id, then `do_get` on a ticket naming it — is expressible in Flight and would need
-//!   a place to park results; it is not needed to serve concurrent queries, so it is not here.
+//!   queues and runs, then delivers the batches. That is how a JDBC-style client behaves anyway. A
+//!   detached submit — `do_action("submit")` returning a id, then `do_get` on a ticket naming it —
+//!   is expressible in Flight and would need a place to park results; it is not needed to serve
+//!   concurrent queries, so it is not here.
 //! - **No transport security.** The credential above crosses the wire in plaintext unless the
 //!   deployment terminates TLS in front of this port. A bearer token on an unencrypted channel is a
 //!   token anyone on the path can replay; tonic supports TLS and wiring it is a deployment
 //!   decision, not a code one, but nothing here forces it.
 //! - **No per-request identity at the worker boundary.** Workers authenticate the *fleet*, not the
 //!   user (see [`crate::auth`]). A compromised coordinator can still ask a worker for anything.
-//! - **No cancellation of a running query.** Dropping the client's stream removes a *queued* query
-//!   from the line (the future awaiting admission is dropped), but a query that already started
-//!   runs to completion.
+//! - **No cancellation of another coordinator's query, and none of the fleet's work.** A cancel is
+//!   answered by the process that is running the query and refused as "not running here" by any
+//!   other, and the workers executing its stages are not told (see [`crate::cancel`] for both, and
+//!   for what dropping the coordinator's streams does and does not stop).
 //! - **No streaming results.** Batches are collected whole before any are sent, which is what makes
 //!   stage reassignment safe — see [`crate::flight::fetch_partition_with_failover`].
 //!
@@ -110,11 +126,15 @@ use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, Principal, bearer_header, bearer_token};
+use crate::cancel::{
+    CANCEL_ACCEPTED, CANCEL_ACTION, Cancellation, QueryRegistry, decode_cancel_body,
+    encode_cancel_body,
+};
 use crate::engine::{
     BoxResolver, TenantSession, TenantSessions, execute_query_cached, resolve_fleet, total_rows,
 };
 use crate::liveness::CoordinatorIdentity;
-use crate::query_log::QueryRecord;
+use crate::query_log::{QueryRecord, QueryState};
 use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
 use crate::scheduler::{Admission, AdmissionError, AdmissionLimits, DEFAULT_FLEET_KEY, Scheduler};
@@ -245,6 +265,25 @@ pub enum QueryError {
     /// Planning or execution failed.
     #[error("{0:#}")]
     Execution(anyhow::Error),
+    /// Somebody stopped it with `do_action("cancel", <id>)`. The string is the same reason stored
+    /// on the history row, so the client and the row tell one story.
+    ///
+    /// Not a variant of [`QueryError::Execution`]: a cancelled query did not fail, and a client
+    /// that cannot tell "your query hit an error" from "somebody stopped your query" will retry the
+    /// second one forever.
+    #[error("{0}")]
+    Cancelled(String),
+    /// A cancel named a query this coordinator is not running.
+    ///
+    /// Also what a caller gets for a query belonging to **another account** — deliberately
+    /// indistinguishable, so query ids cannot be probed across the tenant boundary. See
+    /// [`Coordinator::cancel_query`].
+    #[error(
+        "query {0} is not running on this coordinator: it has already finished, it was never \
+         submitted here, or it belongs to another coordinator process (see queries.coordinator in \
+         the services database — a cancel must be sent to the coordinator that is running it)"
+    )]
+    NotRunning(i64),
 }
 
 impl QueryError {
@@ -272,6 +311,11 @@ impl QueryError {
             QueryError::Denied(_) => Status::permission_denied(self.to_string()),
             QueryError::Request(_) => Status::invalid_argument(self.to_string()),
             QueryError::Execution(_) => Status::internal(self.to_string()),
+            // `CANCELLED` is gRPC's own word for it, and it is neither `INTERNAL` (nothing broke)
+            // nor `ABORTED` (nothing will succeed on retry) — a client that resubmits will simply
+            // run the query again, which is exactly right.
+            QueryError::Cancelled(_) => Status::cancelled(self.to_string()),
+            QueryError::NotRunning(_) => Status::not_found(self.to_string()),
         }
     }
 }
@@ -366,6 +410,10 @@ pub struct Coordinator {
     /// The cross-query result cache, when one is configured. `None` disables it entirely, which is
     /// also what a server with no services database gets.
     result_cache: Option<ResultCache>,
+    /// Which queries this process is running, so a `do_action("cancel", id)` has something to reach
+    /// into. Per-query in *content* but not per-query in *lifetime* — entries come and go with the
+    /// requests that own them, which is why the invariant above still holds.
+    in_flight: QueryRegistry,
 }
 
 impl Coordinator {
@@ -404,6 +452,7 @@ impl Coordinator {
             scheduler,
             resolver: None,
             result_cache: None,
+            in_flight: QueryRegistry::new(),
         }
     }
 
@@ -440,6 +489,11 @@ impl Coordinator {
     /// The configuration in force.
     pub fn config(&self) -> &CoordinatorConfig {
         &self.config
+    }
+
+    /// The queries this process is running right now — what a cancel reaches into.
+    pub fn in_flight(&self) -> &QueryRegistry {
+        &self.in_flight
     }
 
     /// Whether this server requires a credential. See [`CoordinatorConfig::allow_anonymous`].
@@ -542,30 +596,180 @@ impl Coordinator {
         // From here on the row is active, and everything below is awaited — so everything below is
         // a point at which this whole future can be dropped, taking the terminal write with it.
         // The guard is what closes that hole; see [`ActiveQuery`].
-        let active = self
+        let mut active = self
             .db
             .clone()
             .zip(query_id)
             .map(|(db, id)| ActiveQuery::new(db, id));
 
-        let result = self
-            .run_admitted(&target, &request.sql, query_id, authorization.as_ref())
-            .await;
-        // Reached only if we were not cancelled, and every path inside `run_admitted` has already
-        // written a terminal state — so the guard has nothing left to do.
-        if let Some(active) = active {
+        // Registered from here to the end of the call, so `do_action("cancel", id)` can find it.
+        // Only a query that *has* an id is registerable, which is the same thing as saying
+        // cancellation follows the services database — with no control plane there is no id to name
+        // it by. See [`crate::cancel`].
+        let running = query_id.zip(target.account_id).map(|(id, account_id)| {
+            self.in_flight
+                .register(id, account_id, target.admission_key.clone())
+        });
+
+        // Only the cancellation branch below can clear this. Every other path has already issued
+        // its own terminal write by the time it returns here, and stands the guard down as it
+        // always did.
+        let mut cancellation_recorded = true;
+        let result = match running {
+            None => {
+                self.run_admitted(&target, &request.sql, query_id, authorization.as_ref())
+                    .await
+            }
+            Some(mut running) => {
+                // The whole mechanism, in one statement. `select!` drops the losing branch, so a
+                // cancellation drops the admit-and-execute future — and with it the `QuerySlot`
+                // guard, which hands the permit straight to the next waiter. Nothing calls
+                // `release()`, because there is no `release()`; see [`crate::scheduler`].
+                //
+                // `biased` so execution is polled first: a query that finished in the same tick as
+                // its cancellation arrived is reported by its real outcome, not overwritten by a
+                // cancellation that changed nothing.
+                tokio::select! {
+                    biased;
+                    outcome = self.run_admitted(
+                        &target, &request.sql, query_id, authorization.as_ref(),
+                    ) => outcome,
+                    cancellation = running.cancelled() => {
+                        // Re-arm the guard with the cancellation *before* attempting the write.
+                        // Doing it in this order is what lets the failure path need no code of its
+                        // own: if the write lands, the guard is stood down below and this cost
+                        // nothing; if it does not, the guard is already carrying the right terminal
+                        // state rather than its default of "abandoned by its client".
+                        let reason = cancellation.reason();
+                        if let Some(active) = active.as_mut() {
+                            active.will_record_cancellation(&reason);
+                        }
+                        // Written here rather than inside `run_admitted`, which no longer exists by
+                        // the time this runs. Unconditional, like every other terminal write on
+                        // this path: this task owns the row and is the authority on it, which is
+                        // exactly the asymmetry `crate::reaper` rests on.
+                        cancellation_recorded = self.mark_cancelled(query_id, &reason).await;
+                        Err(QueryError::Cancelled(reason))
+                    }
+                }
+            }
+        };
+        // Reached on every path that produced an outcome, and each of them — success, failure,
+        // refusal, cancellation — has already written a terminal state, so the guard has nothing
+        // left to do and is stood down.
+        //
+        // Except when a cancellation's own terminal write *failed*, which is the one case this
+        // condition exists for. Standing the guard down there would leave the row in `running` with
+        // nothing left in the world to resolve it: not this process, which has just declared itself
+        // finished with the query, and not `crate::reaper`, whose predicate takes a row only when no
+        // *live* coordinator matches both its slot and its incarnation — and this coordinator is
+        // alive. The row would sit active until this process exits, counting against
+        // `list_active_queries` and against every later query's `peak_concurrency`, which is exactly
+        // the drift the reaper was built to remove.
+        //
+        // So the guard stays armed instead — and it stays armed with the cancellation, because the
+        // objection to its default is still right: recording a query somebody deliberately stopped
+        // as abandoned by its client would be a worse lie than either outcome. `Drop` writes
+        // `cancelled`, on a second and independent round trip, which is where a blip that took the
+        // first one has the best chance of already being over.
+        if cancellation_recorded && let Some(active) = active {
             active.finished();
         }
-        if let Err(error) = &result {
-            tracing::warn!(
+        match &result {
+            // A cancellation is not a failure and must not be logged as one — an operator grepping
+            // for failed queries is asking a health question, and careful users answering it wrong
+            // is the same mistake `QueryState::Cancelled` exists to avoid in history.
+            Err(QueryError::Cancelled(reason)) => tracing::info!(
+                query_id = ?query_id,
+                warehouse = %target.admission_key,
+                reason = %reason,
+                "query cancelled; its slot is back"
+            ),
+            Err(error) => tracing::warn!(
                 query_id = ?query_id,
                 warehouse = %target.admission_key,
                 user = principal.as_ref().map(|p| p.to_string()),
                 error = %error,
                 "query failed"
-            );
+            ),
+            Ok(_) => {}
         }
         QueryOutcome { query_id, result }
+    }
+
+    /// Stop a query this coordinator is running, by the id its submission returned.
+    ///
+    /// The order of operations is the design, and two of the three steps are about not answering
+    /// questions the caller has no right to ask:
+    ///
+    /// 0. **Authenticate**, exactly as a submission does. An unauthenticated caller must not be able
+    ///    to make this process do work, and must certainly not be able to stop somebody's query.
+    /// 1. **Find it, then check the tenant.** A query belonging to another account is answered with
+    ///    the *same* [`QueryError::NotRunning`] as one that is not here at all. That is deliberate:
+    ///    query ids are consecutive integers from one sequence shared by every tenant, so a
+    ///    distinguishable "permission denied" would let any authenticated caller walk the id space
+    ///    and learn precisely which ids belong to other tenants and when they were running. The
+    ///    account is taken from the credential and never from the request, like everywhere else.
+    /// 2. **Check the grant.** Within the account, cancelling is
+    ///    [`Privilege::Cancel`](crate::rbac::Privilege::Cancel) on the warehouse whose slot the
+    ///    cancellation frees. This one *is* reported as `PERMISSION_DENIED`, because a caller who
+    ///    got here has already proven they are in the tenant, so naming the missing grant leaks
+    ///    nothing and saves a support ticket.
+    ///
+    /// Only then is anything signalled — the check and the signal are two calls, so there is no
+    /// interleaving in which a refusal still stops a query.
+    ///
+    /// This coordinator's own queries and no others; see [`crate::cancel`] for why forwarding is not
+    /// the right shape here.
+    pub async fn cancel_query(
+        &self,
+        query_id: i64,
+        credential: Option<&str>,
+    ) -> Result<(), QueryError> {
+        let (principal, authorization) = self.authenticate(credential).await?;
+
+        let Some(running) = self.in_flight.describe(query_id) else {
+            return Err(QueryError::NotRunning(query_id));
+        };
+
+        if let Some(principal) = &principal
+            && principal.account_id != running.account_id
+        {
+            // Logged, because from the caller's side this is indistinguishable from a stale id and
+            // an operator investigating a cross-tenant probe would otherwise have nothing to read.
+            tracing::warn!(
+                query_id,
+                user = %principal,
+                "refused a cancel for a query belonging to a different account"
+            );
+            return Err(QueryError::NotRunning(query_id));
+        }
+
+        if let Some(authorization) = &authorization {
+            authorization
+                .check(&Requirement::new(
+                    Privilege::Cancel,
+                    ObjectRef::warehouse(running.admission_key.clone()),
+                ))
+                .map_err(QueryError::Denied)?;
+        }
+
+        let cancellation = match &principal {
+            Some(principal) => Cancellation::by(principal.user_name.clone()),
+            None => Cancellation::anonymous(),
+        };
+        if !self.in_flight.cancel(query_id, cancellation) {
+            // It finished between the lookup and here. Nothing went wrong; there is simply nothing
+            // to stop, and saying so is more useful than a success the caller would misread.
+            return Err(QueryError::NotRunning(query_id));
+        }
+        tracing::info!(
+            query_id,
+            warehouse = %running.admission_key,
+            user = principal.as_ref().map(|p| p.to_string()),
+            "cancellation requested"
+        );
+        Ok(())
     }
 
     /// Step 0: prove the credential and load what it may do.
@@ -869,6 +1073,49 @@ impl Coordinator {
         Ok(Some(record))
     }
 
+    /// Best-effort terminal write for a cancellation, and the reason it does *not* need to be a
+    /// compare-and-swap.
+    ///
+    /// [`crate::reaper`] introduced a second writer to a query row and settled the question with an
+    /// asymmetry: the owning coordinator writes unconditionally because it is the authority on its
+    /// own query, and the reaper proves the row has not moved. Cancellation adds **no third
+    /// writer**. The `do_action` handler signals; the task that already owns the row is the one
+    /// that writes, from the same `run_query` frame that writes every other terminal state. So this
+    /// is writer number one, unchanged, and it composes with the reaper's CAS by construction:
+    /// `cancelled` is terminal and therefore outside the reaper's `state IN (active)` predicate, so
+    /// a sweep racing this write either sees the row still active and reaps it (the coordinator was
+    /// unreachable long enough to be judged dead — the price [`crate::liveness`]'s decision 2 names)
+    /// or sees `cancelled` and skips it. Both orderings end in a terminal state and neither loses a
+    /// slot.
+    ///
+    /// Best effort like the rest: a control-plane hiccup must not become a data-plane outage, and
+    /// the slot has already been returned by the time this runs.
+    ///
+    /// Returns **whether the row actually reached `cancelled`**, because best effort is not the same
+    /// as nobody caring. `run_query` stands the [`ActiveQuery`] guard down only on `true`; on
+    /// `false` it leaves the guard armed with the cancellation, so the row still reaches a terminal
+    /// state from the destructor instead of sitting in `running` until this process exits.
+    async fn mark_cancelled(&self, query_id: Option<i64>, reason: &str) -> bool {
+        let (Some(db), Some(id)) = (&self.db, query_id) else {
+            // No services database or no id means there is no row — so there is nothing to write
+            // and, equally, nothing left active. Reported as recorded, which is also the only
+            // honest answer for the guard: it cannot exist without both of these either.
+            return true;
+        };
+        match db.mark_query_cancelled(id, reason).await {
+            Ok(_) => true,
+            Err(write_error) => {
+                tracing::warn!(
+                    query_id = id,
+                    error = %format!("{write_error:#}"),
+                    "could not record the query's cancellation; \
+                     leaving it to the guard to close out"
+                );
+                false
+            }
+        }
+    }
+
     /// Best-effort terminal write for a failure. Never propagates: the query has already failed
     /// and the client is owed *that* error, not a second one about the history table.
     async fn mark_failed(&self, query_id: Option<i64>, error: &str) {
@@ -887,13 +1134,19 @@ impl Coordinator {
 /// What a client sees in `queries.error` when it hung up before its query finished.
 const ABANDONED: &str = "the client disconnected before the query finished";
 
-/// Abandoned queries this process has successfully closed out, and the ones it could not.
+/// Rows [`ActiveQuery`]'s destructor has successfully closed out, and the ones it could not.
 ///
 /// A best-effort write issued from a destructor is the least observable thing in this module:
 /// nobody awaits it, no request fails when it does not happen, and the only trace it leaves is a
 /// log line. These make it countable — for an operator who wants to know whether clients are
 /// hanging up, and for the test that proves the guard actually fires. Process-wide rather than
 /// per-coordinator because that is the scope a destructor can reach.
+///
+/// Named for the case they were built for and the case that overwhelmingly dominates them. The
+/// other one — a cancellation whose own terminal write failed, see [`Unrecorded`] — is closed out
+/// by the same destructor and counted here too, because what these actually measure is
+/// guard-issued writes, and `abandoned_unclosed`'s meaning ("history has rows stuck in
+/// `queued`/`running` that only a reaper will resolve") is exactly as true of that case.
 static ABANDONED_CLOSED: AtomicUsize = AtomicUsize::new(0);
 static ABANDONED_UNCLOSED: AtomicUsize = AtomicUsize::new(0);
 
@@ -924,6 +1177,16 @@ pub fn abandoned_unclosed() -> usize {
 /// `Handle::try_current` rather than a bare `tokio::spawn` because dropping after the runtime has
 /// gone (shutdown, a test) would otherwise panic in a destructor.
 ///
+/// # It is also the backstop for a terminal write that failed
+///
+/// A client that vanishes is not the only way a row is left active. A **cancellation** whose own
+/// `UPDATE` failed — a Postgres blip in exactly that instant — leaves one too, and that row is
+/// worse off than an abandoned one: [`crate::reaper`] takes a row only when no *live* coordinator
+/// matches its slot and incarnation, and the coordinator that just failed to write it is alive. So
+/// nothing out of process would resolve it either, and it would sit in `running` until the process
+/// exited. `run_query` therefore does not stand the guard down after a failed cancellation write,
+/// and tells it — via [`Unrecorded`] — to record `cancelled` rather than its default.
+///
 /// Two gaps remain, and both are a reaper's job rather than oversights:
 ///
 /// - **A coordinator that dies outright.** Nothing in-process can close out a row once the process
@@ -942,6 +1205,38 @@ struct ActiveQuery {
     db: ServicesDb,
     query_id: i64,
     finished: bool,
+    unrecorded: Unrecorded,
+}
+
+/// What [`ActiveQuery`]'s destructor writes when it fires.
+///
+/// Two cases, and the distinction is the entire reason this is not a `bool`. A row left active
+/// because its client vanished and a row left active because a *cancellation's* terminal write
+/// failed are different events, and recording the first onto the second would tell an operator that
+/// somebody hung up on a query they had in fact deliberately stopped — a lie in history, and in
+/// `queries.error` the only place anyone would ever look for the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unrecorded {
+    /// The default, and the case this guard was built for: nothing wrote a terminal state, so the
+    /// only remaining explanation is that the request future was dropped out from under the query.
+    AbandonedByClient,
+    /// The query *was* cancelled and [`Coordinator::mark_cancelled`]'s write did not land. Carries
+    /// the same reason that write carried, so the row is indistinguishable from one the ordinary
+    /// path wrote.
+    Cancelled(String),
+}
+
+impl Unrecorded {
+    /// The row this guard would write: the state, and the prose that goes in `error`.
+    ///
+    /// Pulled out of `Drop` so the choice is assertable without a database, a runtime, or a
+    /// destructor — which is the only part of this mechanism a test can reach directly.
+    fn terminal(&self) -> (QueryState, &str) {
+        match self {
+            Unrecorded::AbandonedByClient => (QueryState::Failed, ABANDONED),
+            Unrecorded::Cancelled(reason) => (QueryState::Cancelled, reason),
+        }
+    }
 }
 
 impl ActiveQuery {
@@ -950,10 +1245,23 @@ impl ActiveQuery {
             db,
             query_id,
             finished: false,
+            unrecorded: Unrecorded::AbandonedByClient,
         }
     }
 
+    /// This query was cancelled: if the guard fires, record *that* rather than an abandonment.
+    ///
+    /// Called before the cancellation's own terminal write is attempted, so the guard is correct
+    /// whether or not that write lands. It does not arm the guard — the guard is armed from
+    /// construction — it only changes what arming means.
+    fn will_record_cancellation(&mut self, reason: &str) {
+        self.unrecorded = Unrecorded::Cancelled(reason.to_string());
+    }
+
     /// The query reached a terminal state under its own power; stand down.
+    ///
+    /// Consuming `self` is deliberate: a guard that has been stood down cannot be re-armed, so the
+    /// only way to reach `Drop` with something left to write is never to have called this.
     fn finished(mut self) {
         self.finished = true;
     }
@@ -965,17 +1273,32 @@ impl Drop for ActiveQuery {
             return;
         }
         let (db, id) = (self.db.clone(), self.query_id);
+        let unrecorded = self.unrecorded.clone();
+        let (state, detail) = unrecorded.terminal();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             ABANDONED_UNCLOSED.fetch_add(1, AtomicOrdering::AcqRel);
             tracing::warn!(
                 query_id = id,
-                "no runtime left to close out an abandoned query; the row stays active"
+                state = %state,
+                "no runtime left to close out an active query; the row stays active"
             );
             return;
         };
-        tracing::info!(query_id = id, "query abandoned by its client; recording it");
+        tracing::info!(
+            query_id = id,
+            state = %state,
+            detail = %detail,
+            "closing out a query row the request left active"
+        );
         handle.spawn(async move {
-            match db.mark_query_failed(id, ABANDONED).await {
+            // One arm per variant rather than one call parameterised by state, because
+            // `mark_query_failed` and `mark_query_cancelled` are the two documented entry points
+            // and a new `Unrecorded` variant should fail to compile here rather than pick one.
+            let written = match &unrecorded {
+                Unrecorded::AbandonedByClient => db.mark_query_failed(id, ABANDONED).await,
+                Unrecorded::Cancelled(reason) => db.mark_query_cancelled(id, reason).await,
+            };
+            match written {
                 Ok(_) => {
                     ABANDONED_CLOSED.fetch_add(1, AtomicOrdering::AcqRel);
                 }
@@ -984,7 +1307,7 @@ impl Drop for ActiveQuery {
                     tracing::warn!(
                         query_id = id,
                         error = %format!("{error:#}"),
-                        "could not record an abandoned query"
+                        "could not close out an active query row"
                     );
                 }
             }
@@ -1018,6 +1341,40 @@ pub struct CoordinatorFlightService {
 impl CoordinatorFlightService {
     pub fn new(coordinator: Arc<Coordinator>) -> Self {
         Self { coordinator }
+    }
+}
+
+/// Read the bearer token out of a request's metadata, for any verb this service exposes.
+///
+/// The credential is read from the metadata and never from the ticket or the action body — both of
+/// those are logged and stored, and a secret must be in neither.
+///
+/// A header that is *present but unparseable* is refused here rather than folded into `None`.
+/// Folding looks harmless — under the default posture both end in the same `UNAUTHENTICATED` — but
+/// under `--allow-anonymous` `None` means "run as nobody, with nothing checked", so a corrupted or
+/// mistyped token would silently stop being a credential and its caller would be served as
+/// anonymous while believing it was authenticated and scoped. Losing an identity quietly is worse
+/// than being told the token is bad.
+///
+/// Shared by `do_get` and `do_action` rather than written twice: the second copy is exactly where
+/// the strictness above would eventually be relaxed by accident.
+fn credential_of(metadata: &tonic::metadata::MetadataMap) -> Result<Option<String>, Status> {
+    match metadata.get(AUTHORIZATION_HEADER) {
+        None => Ok(None),
+        Some(value) => Ok(Some(
+            value
+                .to_str()
+                .ok()
+                .and_then(|value| bearer_token(value).ok())
+                .ok_or_else(|| {
+                    Status::unauthenticated(
+                        "unauthenticated: the `authorization` header is not a usable \
+                         `Bearer <token>` value. Send a valid API key, or send no header at \
+                         all — a credential this server cannot read is never treated as one",
+                    )
+                })?
+                .to_string(),
+        )),
     }
 }
 
@@ -1074,32 +1431,7 @@ impl FlightService for CoordinatorFlightService {
         &self,
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
-        // The credential is read from the metadata and never from the ticket.
-        //
-        // A header that is *present but unparseable* is refused here rather than folded into
-        // `None`. Folding looks harmless — under the default posture both end in the same
-        // `UNAUTHENTICATED` — but under `--allow-anonymous` `None` means "run as nobody, with
-        // nothing checked", so a corrupted or mistyped token would silently stop being a
-        // credential and its caller would be served as anonymous while believing it was
-        // authenticated and scoped. Losing an identity quietly is worse than being told the
-        // token is bad.
-        let credential = match request.metadata().get(AUTHORIZATION_HEADER) {
-            None => None,
-            Some(value) => Some(
-                value
-                    .to_str()
-                    .ok()
-                    .and_then(|value| bearer_token(value).ok())
-                    .ok_or_else(|| {
-                        Status::unauthenticated(
-                            "unauthenticated: the `authorization` header is not a usable \
-                             `Bearer <token>` value. Send a valid API key, or send no header at \
-                             all — a credential this server cannot read is never treated as one",
-                        )
-                    })?
-                    .to_string(),
-            ),
-        };
+        let credential = credential_of(request.metadata())?;
 
         let ticket = request.into_inner();
         let query = decode_query_ticket(&ticket.ticket)
@@ -1185,17 +1517,65 @@ impl FlightService for CoordinatorFlightService {
     ) -> Result<Response<Self::DoExchangeStream>, Status> {
         Err(Status::unimplemented("do_exchange"))
     }
+    /// Stop a running query: `do_action("cancel", <query id in decimal ASCII>)`.
+    ///
+    /// The body is byte-for-byte what the submission's `lldb-query-id` response header carried, so
+    /// a client hands one straight to the other. The credential comes from the metadata, exactly as
+    /// it does for a submission — cancelling is an authorized operation, not a side channel around
+    /// authorization.
+    ///
+    /// The reply is a single [`arrow_flight::Result`] carrying [`CANCEL_ACCEPTED`], because a Flight
+    /// client that gets an empty stream back cannot tell a server that did the work from one that
+    /// ignored the action. "Accepted" is the honest word: the query's task has been signalled and
+    /// its slot is returned as it unwinds, which is promptly but not synchronously.
     async fn do_action(
         &self,
-        _request: Request<Action>,
+        request: Request<Action>,
     ) -> Result<Response<Self::DoActionStream>, Status> {
-        Err(Status::unimplemented("do_action"))
+        let credential = credential_of(request.metadata())?;
+        let action = request.into_inner();
+        if action.r#type != CANCEL_ACTION {
+            return Err(Status::unimplemented(format!(
+                "unknown action `{}`; this coordinator serves `{CANCEL_ACTION}` (call \
+                 list_actions)",
+                action.r#type
+            )));
+        }
+        let query_id = decode_cancel_body(&action.body)
+            .map_err(|e| Status::invalid_argument(format!("bad cancel action: {e:#}")))?;
+
+        self.coordinator
+            .cancel_query(query_id, credential.as_deref())
+            .await
+            .map_err(|error| error.to_status())?;
+
+        let accepted = arrow_flight::Result {
+            body: CANCEL_ACCEPTED.as_bytes().to_vec().into(),
+        };
+        Ok(Response::new(
+            Box::pin(futures::stream::once(async move { Ok(accepted) })) as Self::DoActionStream,
+        ))
     }
+
+    /// What this coordinator's `do_action` accepts — the one verb, described.
+    ///
+    /// Implemented rather than left `unimplemented`: `list_actions` is how a Flight client that has
+    /// never heard of lldb discovers that cancellation exists, and a Flight service whose actions
+    /// can only be learned from a source file is a Flight service in name only.
     async fn list_actions(
         &self,
         _request: Request<Empty>,
     ) -> Result<Response<Self::ListActionsStream>, Status> {
-        Err(Status::unimplemented("list_actions"))
+        let cancel = ActionType {
+            r#type: CANCEL_ACTION.to_string(),
+            description: "Stop a running query. The body is the decimal query id returned in the \
+                          `lldb-query-id` response header. Requires CANCEL on the warehouse the \
+                          query is running on, within the caller's own account."
+                .to_string(),
+        };
+        Ok(Response::new(
+            Box::pin(futures::stream::once(async move { Ok(cancel) })) as Self::ListActionsStream,
+        ))
     }
 }
 
@@ -1272,6 +1652,54 @@ pub async fn submit_query_as(
         .with_context(|| format!("streaming the result from {server_url}"))?;
 
     Ok(SubmittedQuery { query_id, batches })
+}
+
+/// Ask the query server at `server_url` to stop query `query_id`, presenting `token`.
+///
+/// The client half of `do_action("cancel", ...)`, and as small as [`submit_query_as`] for the same
+/// reason: any Arrow Flight client in any language can send an action with a decimal id in its body
+/// and an `authorization: Bearer` header, so nothing here is lldb-specific except the two constants.
+///
+/// Returns once the coordinator has accepted the cancellation, which is *before* the query's row
+/// reaches `cancelled` — the terminal write happens as the query's own task unwinds. A caller that
+/// needs to observe the end state polls [`ServicesDb::query_by_id`](crate::services::ServicesDb).
+pub async fn cancel_query(server_url: &str, query_id: i64, token: Option<&str>) -> Result<()> {
+    let channel = Channel::from_shared(server_url.to_string())
+        .with_context(|| format!("invalid coordinator url {server_url}"))?
+        .connect()
+        .await
+        .with_context(|| format!("connecting to coordinator {server_url}"))?;
+    let mut client = FlightServiceClient::new(channel);
+
+    let mut grpc_request = Request::new(Action {
+        r#type: CANCEL_ACTION.to_string(),
+        body: encode_cancel_body(query_id).into(),
+    });
+    if let Some(token) = token {
+        let value = bearer_header(token)
+            .parse()
+            .context("the API key is not usable as an HTTP header value")?;
+        grpc_request
+            .metadata_mut()
+            .insert(AUTHORIZATION_HEADER, value);
+    }
+
+    let mut results = client
+        .do_action(grpc_request)
+        .await
+        .map_err(|status| anyhow!("cancelling query {query_id} on {server_url}: {status}"))?
+        .into_inner();
+    // Drained rather than ignored: the body is the server's confirmation that it did the work, and
+    // a client that never reads it cannot tell acceptance from an empty stream.
+    let accepted = results
+        .try_next()
+        .await
+        .with_context(|| format!("reading the cancellation reply for query {query_id}"))?
+        .map(|result| String::from_utf8_lossy(&result.body).into_owned());
+    match accepted.as_deref() {
+        Some(CANCEL_ACCEPTED) => Ok(()),
+        other => bail!("the coordinator answered the cancellation with {other:?}"),
+    }
 }
 
 /// Read the `lldb-query-id` header, if the server sent one.
@@ -1482,6 +1910,103 @@ mod tests {
         assert_eq!(gate.peak_running, 1, "the limit of 1 was respected");
     }
 
+    /// A refusal a client must be able to tell from every other one.
+    #[test]
+    fn cancellation_and_a_stale_id_have_their_own_status_codes() {
+        // `CANCELLED` rather than `INTERNAL`: nothing broke, and a client that reads a cancellation
+        // as an engine failure will report a bug that does not exist.
+        let cancelled = QueryError::Cancelled("cancelled: user `dana` stopped it".to_string());
+        assert_eq!(cancelled.to_status().code(), tonic::Code::Cancelled);
+        assert!(cancelled.to_status().message().contains("dana"));
+
+        // `NOT_FOUND`, and the message has to point at *which* coordinator to ask, because
+        // admission — and therefore the cancellation registry — is per process.
+        let stale = QueryError::NotRunning(41);
+        assert_eq!(stale.to_status().code(), tonic::Code::NotFound);
+        let message = stale.to_string();
+        assert!(message.contains("41"), "{message}");
+        assert!(message.contains("queries.coordinator"), "{message}");
+    }
+
+    /// A cancel naming a query this process is not running is refused, not silently accepted.
+    ///
+    /// "Silently accepted" is the tempting shape — the query is not running, so arguably there is
+    /// nothing to do — and it is wrong: a client that hits the wrong coordinator of two would be
+    /// told its expensive query had been stopped while it kept running.
+    #[tokio::test]
+    async fn cancelling_a_query_this_coordinator_is_not_running_is_refused() {
+        let coordinator = Coordinator::new(
+            SessionContext::new(),
+            None,
+            CoordinatorConfig {
+                workers: vec!["http://127.0.0.1:1".to_string()],
+                ..CoordinatorConfig::default()
+            },
+        );
+        let error = coordinator
+            .cancel_query(7, None)
+            .await
+            .expect_err("nothing with that id is running here");
+        assert!(matches!(error, QueryError::NotRunning(7)), "{error:?}");
+        assert!(coordinator.in_flight().is_empty());
+    }
+
+    /// With no services database a query has no id, so there is nothing to cancel it by.
+    ///
+    /// Asserted rather than assumed because it is the one place cancellation is *absent* by design:
+    /// the handle is the history row's id, history needs a control plane, and `cargo run` must
+    /// never need Postgres. A single-node user hangs up instead.
+    #[tokio::test]
+    async fn without_a_control_plane_a_query_is_never_registered_for_cancellation() {
+        let coordinator = Coordinator::new(
+            SessionContext::new(),
+            None,
+            CoordinatorConfig {
+                workers: vec!["http://127.0.0.1:1".to_string()],
+                ..CoordinatorConfig::default()
+            },
+        );
+        let outcome = coordinator
+            .run_query(QueryRequest::new("SELECT 1"), None)
+            .await;
+        assert_eq!(outcome.query_id, None);
+        assert!(outcome.result.is_err(), "port 1 has no worker");
+        assert!(
+            coordinator.in_flight().is_empty(),
+            "a query with no id must not occupy the registry"
+        );
+    }
+
+    /// The signal reaches the query, and carries no user when there is no identity to carry.
+    ///
+    /// Registered by hand rather than through `run_query`, because `run_query` only registers a
+    /// query that has a history id and this coordinator deliberately has no database. What is under
+    /// test is the wiring from `cancel_query` to the guard — the *policy* on top of it (tenant and
+    /// grant) needs real accounts and is asserted in `tests/integration/query_cancel.rs`.
+    #[tokio::test]
+    async fn a_coordinator_with_nothing_to_enforce_cancels_on_request() {
+        let coordinator =
+            Coordinator::new(SessionContext::new(), None, CoordinatorConfig::default());
+        let mut running = coordinator.in_flight().register(11, 1, "analytics");
+        coordinator
+            .cancel_query(11, None)
+            .await
+            .expect("no services database means nothing is enforced");
+        let cancellation =
+            tokio::time::timeout(std::time::Duration::from_secs(5), running.cancelled())
+                .await
+                .expect("the signal must arrive");
+        assert_eq!(cancellation.requested_by, None);
+        assert!(cancellation.reason().starts_with("cancelled: "));
+
+        // Once the query is gone, the same call is refused rather than being a silent no-op.
+        drop(running);
+        assert!(matches!(
+            coordinator.cancel_query(11, None).await,
+            Err(QueryError::NotRunning(11))
+        ));
+    }
+
     /// Once shut down, submissions are refused with a code that says "not now" rather than
     /// "never".
     #[tokio::test]
@@ -1501,5 +2026,66 @@ mod tests {
         let error = outcome.result.expect_err("the server is going away");
         assert_eq!(error.to_status().code(), tonic::Code::Unavailable);
         assert!(error.to_string().contains("shutting down"), "{error}");
+    }
+
+    /// The guard's default is the case it was built for: nobody wrote anything, so the client
+    /// vanished.
+    #[test]
+    fn an_untouched_guard_records_an_abandonment() {
+        let (state, detail) = Unrecorded::AbandonedByClient.terminal();
+        assert_eq!(state, QueryState::Failed);
+        assert_eq!(detail, ABANDONED);
+        assert!(
+            state.is_terminal(),
+            "the whole point of the guard is that the row stops being active"
+        );
+    }
+
+    /// A cancellation whose terminal write failed must reach `cancelled`, carrying the same reason
+    /// the write would have carried — **not** `failed` with the abandonment prose.
+    ///
+    /// This is the assertion the fix exists for. Standing the guard down there would leave the row
+    /// in `running` forever (this coordinator is alive, so `crate::reaper` will not take it), and
+    /// leaving it armed with the *default* would record a query somebody deliberately stopped as one
+    /// whose client hung up. Both are wrong, and this is the third option.
+    #[test]
+    fn a_guard_told_about_a_cancellation_records_the_cancellation() {
+        let unrecorded = Unrecorded::Cancelled("cancelled: by alice".to_string());
+        let (state, detail) = unrecorded.terminal();
+        assert_eq!(
+            state,
+            QueryState::Cancelled,
+            "recording a cancelled query as abandoned by its client is the lie this avoids"
+        );
+        assert_eq!(
+            detail, "cancelled: by alice",
+            "the reason must survive, or the row cannot say who stopped it"
+        );
+        assert!(state.is_terminal(), "the row must stop being active");
+        assert!(
+            state.may_carry_an_error(),
+            "`queries_error_only_when_unsuccessful` must permit the reason this writes"
+        );
+    }
+
+    /// With no services database there is no row, so "the cancellation was recorded" is vacuously
+    /// true — and it must report that rather than `false`, which would ask `run_query` to leave a
+    /// guard armed that cannot exist without a database either.
+    #[tokio::test]
+    async fn a_cancellation_with_no_row_to_write_counts_as_recorded() {
+        let coordinator =
+            Coordinator::new(SessionContext::new(), None, CoordinatorConfig::default());
+        assert!(
+            coordinator
+                .mark_cancelled(None, "cancelled: by alice")
+                .await,
+            "no id and no database means nothing was left active"
+        );
+        assert!(
+            coordinator
+                .mark_cancelled(Some(7), "cancelled: by alice")
+                .await,
+            "an id without a database still names no row this process can write"
+        );
     }
 }

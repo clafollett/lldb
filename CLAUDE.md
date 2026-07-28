@@ -51,7 +51,8 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   shared CLI/logging config (`config.rs`), Postgres services DB / control plane (`services.rs` +
   `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
   (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
-  front ends share (`engine.rs`), admission control (`scheduler.rs`), query history
+  front ends share (`engine.rs`), admission control (`scheduler.rs`) and the cancellation that
+  hands a slot back (`cancel.rs`), query history
   (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
   (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
   credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — and the per-account
@@ -298,6 +299,46 @@ workers and no Flight. With no services DB there is no row, no background task a
 anything — `CoordinatorRegistration::start_if_configured` is that rule as a function, so it is
 testable without a database.
 
+## Cancellation returns the slot, and that is the whole point
+
+`cancel.rs` + `do_action("cancel", <query id>)` stop a query that already holds an admission slot.
+Hanging up only ever removed a *queued* one; a running query held its slot for its full duration and
+the queue behind it waited. Five things to keep straight.
+
+1. **A slot comes back by dropping a future, not by calling anything.** There is still no
+   `QuerySlot::release()`. `server.rs` runs the admit-and-execute future in a `tokio::select!`
+   against the cancellation signal, so a cancel drops that future and `QuerySlot`'s `Drop` hands the
+   permit to the next waiter — the same mechanism that already survived failures and panics.
+   Aborting a `JoinHandle` is the shape to reject: it kills the task from outside and leaves nobody
+   to write the history row.
+2. **There is no third writer to a `queries` row.** The `do_action` handler only *signals*; the task
+   that already owns the row is what writes `cancelled`, from the same `run_query` frame that writes
+   every other terminal state. So `reaper.rs`'s asymmetry is unchanged — coordinator unconditional,
+   reaper CAS — and cancellation composes with it by landing on the other side of the reaper's
+   predicate: `cancelled` is terminal, therefore outside `state IN ('queued','running')`, in both
+   the scan and the recheck. `query_log::active_states_sql` is now the single spelling of that set,
+   spliced into the reaper's predicate so a future state cannot drift out of it.
+3. **Worker-side work is NOT cancelled.** No cancel crosses the Flight boundary. Dropping the
+   coordinator's streams resets them, so a worker still *streaming* stops when its send fails, but a
+   stage already materializing into the `StageCache` runs to completion — the cache decouples
+   producing from consuming on purpose. The honest claim is: the coordinator's slot comes back
+   immediately and deterministically; worker CPU drains on its own, promptly and unboundedly.
+4. **Cancelling is its own privilege**, `CANCEL` on the warehouse whose slot it frees — not `USAGE`,
+   which every submitter holds and which would make the grant decorative. A query belonging to
+   another account is refused as `NOT_FOUND`, identical to an unknown id, because query ids are
+   consecutive integers from one sequence shared by every tenant and a distinguishable denial would
+   let anyone map the id space. Within the account, a missing grant *is* `PERMISSION_DENIED`.
+5. **The handle is the history row's id, so cancellation follows the services DB.** No
+   `--metadata-*` → no id → nothing to name a query by, and the registry stays empty. `cargo run`
+   still needs no Postgres, and a single-node user hangs up.
+
+Migration `0007` is what makes a fifth state storable, and it widens **three** constraints:
+`queries_state_check`, `queries_error_only_when_failed` (renamed
+`queries_error_only_when_unsuccessful` — a cancelled row must be able to say *who* cancelled it, and
+only `failed` could carry prose before) and `grants_privilege_check`. Note what adding a privilege
+under an existing wildcard does: every pre-existing `ALL ON WAREHOUSE …` grant now also confers
+`CANCEL`.
+
 ## The reaper acts on that lease, and only on it
 
 `reaper.rs` + `lldb-qe-reap` are liveness's first consumer: they resolve `queries` rows left in
@@ -418,6 +459,13 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_scheduler
 
+# Cancelling a running query (`cancel.rs`). The acceptance assertion is that the QUEUE ADVANCES:
+# a warehouse of size 1, one query held on a gated (but otherwise real) worker, one queued behind
+# it, and after the cancel the queued one must start AND return its answer. Also: the cross-account
+# refusal is indistinguishable from an unknown id, USAGE is not permission to cancel, and a
+# cancelled row is never taken by the reaper. Same three-way gating.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_cancel
+
 # Coordinator liveness (`liveness.rs`): registers, renews, is promptly not-live on a clean exit and
 # not-live within MISSED_RENEWALS_BEFORE_DEAD intervals after a kill — and, the assertion that makes
 # a reaper safe to build, a LIVE coordinator running a query that outlives the threshold is never
@@ -442,6 +490,12 @@ cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
 cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb \
   grant --role analyst --privilege SELECT --object-type namespace --object-name lldb.sales
+# Privileges: SELECT | INSERT | DELETE | UPDATE | USAGE | CANCEL | ALL. CANCEL is held on a
+# warehouse and permits stopping any query running on it; USAGE (which every submitter needs)
+# deliberately does not imply it, and ALL does.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb@localhost/lldb \
+  grant --role oncall --privilege CANCEL --object-type warehouse --object-name analytics
 cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb show
 

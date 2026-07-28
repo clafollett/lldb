@@ -21,7 +21,9 @@
 //!   the happy path. That distinction is the single most important line in this file: a slot
 //!   released only on success leaks one permit per failed query, and a server that leaks permits
 //!   degrades to serial and then stops accepting work entirely. `Drop` runs on the error path, on
-//!   an early `?`, and on a panic.
+//!   an early `?`, on a panic — and on a **cancelled future**, which is what makes
+//!   [`crate::cancel`] work without this module knowing it exists: stopping a query is dropping the
+//!   future that holds the guard, and the permit goes straight to the next waiter in line.
 //! - **Fairness** is tokio's: `Semaphore::acquire` is FIFO, so waiters are admitted in submission
 //!   order and a stream of cheap queries cannot indefinitely jump the expensive one that arrived
 //!   first. The fast path uses `try_acquire`, which cannot barge a waiter because a released
@@ -48,8 +50,10 @@
 //!
 //! Also absent, and worth naming:
 //!
-//! - **No priorities, no preemption, no cost model.** FIFO is the entire policy. A query that has
-//!   been admitted runs to completion; nothing evicts it to make room.
+//! - **No priorities, no preemption, no cost model.** FIFO is the entire policy. Nothing here
+//!   evicts an admitted query to make room for a better one; a query gives its slot back when it
+//!   ends, or when somebody explicitly stops it ([`crate::cancel`]), and never because the
+//!   scheduler decided so.
 //! - **No per-tenant fairness.** The queue is per *warehouse*. Two tenants sharing a warehouse
 //!   share one FIFO line, so a burst from one delays the other by its own length. Warehouses are
 //!   already the isolation boundary this system offers; a second fairness dimension inside one
@@ -58,8 +62,6 @@
 //!   on it. Resizing the warehouse row changes the desired *compute*, and takes effect for
 //!   admission on the next coordinator restart — [`Scheduler::admission_for`] logs a warning when
 //!   it sees a size it is not honouring, so the drift is visible rather than silent.
-//! - **No cancellation.** Dropping the future that awaits [`Admission::acquire`] removes a waiter
-//!   (that much is tokio's), but there is no way to cancel a query that has already started.
 //!
 //! # Why this is testable without a database or a network
 //!
@@ -339,6 +341,10 @@ impl Drop for QueuePlace {
 /// Deliberately has no `release()` method. The only way to give a slot back is to drop the guard,
 /// which happens on every exit path a query has — success, `?`, panic, or a cancelled future — so
 /// there is no path on which a caller can forget.
+///
+/// That last case is not hypothetical since [`crate::cancel`]: stopping a running query is
+/// implemented as dropping the future that holds this guard, so "the queue behind a cancelled query
+/// advances" is a property of *this* type rather than of anything cancellation had to add.
 #[derive(Debug)]
 pub struct QuerySlot {
     admission: Arc<Admission>,

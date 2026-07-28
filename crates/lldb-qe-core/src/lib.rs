@@ -25,6 +25,7 @@
 //! | [`warehouse`]    | Virtual warehouses: named, resizable, suspend/resume compute pools    | 5 |
 //! | [`engine`]       | Running one query: plan → distribute → collect, shared by both front ends | 5 |
 //! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
+//! | [`cancel`]       | Stopping a running query, so its admission slot goes back to the warehouse | 5 |
 //! | [`query_log`]    | Query history: what ran, when, and how it ended                       | 5 |
 //! | [`liveness`]     | Coordinator registration and renewal: telling a dead coordinator from a slow one | 5 |
 //! | [`reaper`]       | Resolving history rows whose coordinator is gone — the first consumer of that answer | 5 |
@@ -53,6 +54,7 @@ pub const GIT_SHA: &str = env!("LLDB_GIT_SHA");
 pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
 
 pub mod auth;
+pub mod cancel;
 pub mod catalog;
 pub mod config;
 pub mod discovery;
@@ -83,6 +85,7 @@ pub mod tpch;
 pub mod warehouse;
 
 pub use auth::{ApiKey, AuthError, FleetAuth, NewToken, Principal, Role, User};
+pub use cancel::{CANCEL_ACTION, Cancellation, QueryRegistry, RunningQuery};
 pub use catalog::{apply_manifest, register_listing_tables};
 pub use config::{StorageArgs, init_tracing};
 pub use discovery::{
@@ -118,7 +121,8 @@ pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use scheduler::{Admission, AdmissionError, AdmissionLimits, QuerySlot, Scheduler};
 pub use server::{
-    Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query, submit_query_as,
+    Coordinator, CoordinatorConfig, QueryRequest, cancel_query, serve_coordinator, submit_query,
+    submit_query_as,
 };
 pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
 pub use session::{build_session, register_tpch_parquet};

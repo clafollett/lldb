@@ -58,10 +58,12 @@
 //!   catalog *name* would then be visible to every tenant, and the boundary would go back to being
 //!   a grant check rather than a structure. Each account's context is still built once and still
 //!   shared across that account's concurrent queries.
-//! - **No cancellation, no partial results.** Batches are collected whole before they are
-//!   returned, which is what makes stage reassignment safe (see
-//!   [`crate::flight::fetch_partition_with_failover`] for why a half-delivered partition cannot be
-//!   resumed).
+//! - **No cancellation channel of its own, and no partial results.** Stopping a query is done by
+//!   dropping the future that called into here — [`crate::cancel`] owns the mechanism and
+//!   [`crate::server`] owns the wiring — so nothing in this module has to know about it. Batches
+//!   are still collected whole before they are returned, which is what makes stage reassignment
+//!   safe (see [`crate::flight::fetch_partition_with_failover`] for why a half-delivered partition
+//!   cannot be resumed) and is also why a cancelled query never delivers a partial answer.
 //!
 //! # The result cache sits *above* the policy, not beside it
 //!

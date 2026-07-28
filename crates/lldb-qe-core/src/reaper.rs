@@ -131,7 +131,9 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 
 use crate::liveness::{LIVE_PREDICATE, MISSED_RENEWALS_BEFORE_DEAD};
-use crate::query_log::{MAX_ERROR_LEN, QUERY_COLUMNS, QueryRecord, QueryRow, query_from_row};
+use crate::query_log::{
+    MAX_ERROR_LEN, QUERY_COLUMNS, QueryRecord, QueryRow, active_states_sql, query_from_row,
+};
 use crate::services::ServicesDb;
 
 /// Rows one sweep will resolve, when the caller does not say otherwise.
@@ -232,7 +234,7 @@ pub struct ReapedQuery {
 /// Columns are table-qualified throughout because this string is spliced into a statement with two
 /// tables in scope and, in the sweep, into a subquery over `queries` nested inside an `UPDATE` of
 /// `queries`. Unqualified names would resolve by accident rather than by intent.
-const STRANDED_PREDICATE: &str = "queries.state IN ('queued', 'running') \
+const STRANDED_PREDICATE: &str = "queries.state IN ({ACTIVE}) \
      AND queries.coordinator IS NOT NULL \
      AND queries.coordinator_incarnation IS NOT NULL \
      AND NOT EXISTS ( \
@@ -241,10 +243,19 @@ const STRANDED_PREDICATE: &str = "queries.state IN ('queued', 'running') \
                 AND coordinators.incarnation = queries.coordinator_incarnation \
                 AND {LIVE})";
 
-/// [`STRANDED_PREDICATE`] with the liveness rule spliced in. A function rather than a `const`
-/// because `LIVE_PREDICATE` is itself a `const` in another module.
+/// [`STRANDED_PREDICATE`] with the liveness rule and the active-state set spliced in. A function
+/// rather than a `const` because both come from other modules.
+///
+/// `{ACTIVE}` is [`active_states_sql`] rather than a literal `'queued', 'running'` for the same
+/// reason `{LIVE}` is not re-spelled here: a state added to [`crate::query_log::QueryState`] that a
+/// query can be *stranded in* must reach this predicate, and the failure mode of it not doing so is
+/// silent — rows in that state would simply never be resolved by anything, forever. The converse is
+/// covered too: a terminal state (`cancelled`, since #38) is excluded by construction, so a query
+/// somebody deliberately stopped can never look abandoned to a sweep.
 fn stranded_predicate() -> String {
-    STRANDED_PREDICATE.replace("{LIVE}", LIVE_PREDICATE)
+    STRANDED_PREDICATE
+        .replace("{ACTIVE}", &active_states_sql())
+        .replace("{LIVE}", LIVE_PREDICATE)
 }
 
 /// Optional narrowing to one tenant, as a bind rather than a branch — `NULL` means every account.
@@ -457,6 +468,7 @@ mod tests {
         // definitions of "alive" would disagree and nothing in the build would notice.
         assert!(predicate.contains(LIVE_PREDICATE), "{predicate}");
         assert!(!predicate.contains("{LIVE}"), "unsubstituted placeholder");
+        assert!(!predicate.contains("{ACTIVE}"), "unsubstituted placeholder");
         for age_comparison in [
             "queries.submitted_at <",
             "queries.started_at <",
@@ -469,6 +481,33 @@ mod tests {
                  age; reaping on `{age_comparison}` kills live work: {predicate}"
             );
         }
+    }
+
+    /// A query somebody deliberately stopped must never look abandoned to a sweep.
+    ///
+    /// Issue #38 added a fifth state and this is the interaction it has with this module — verified
+    /// rather than assumed, and stated as a rule over *every* state so a sixth one cannot slip
+    /// through: a reapable row is exactly a non-terminal one. `cancelled` is terminal, so it is
+    /// excluded from both halves of the compare-and-swap by construction, and the race that
+    /// worried the issue (a query cancelled at the same moment its coordinator dies) resolves the
+    /// same way either interleaving falls — the sweep either sees a row still `running` and reaps
+    /// it, or sees `cancelled` and skips it. Both end terminal, and neither loses an admission
+    /// slot, because the slot was returned by dropping the future long before either write.
+    #[test]
+    fn every_terminal_state_is_outside_the_reapable_predicate() {
+        use crate::query_log::QUERY_STATES;
+        let predicate = stranded_predicate();
+        for state in QUERY_STATES {
+            let quoted = format!("'{}'", state.as_str());
+            assert_eq!(
+                predicate.contains(&quoted),
+                !state.is_terminal(),
+                "a reapable row is exactly a non-terminal one; `{state}` is on the wrong side of \
+                 that: {predicate}"
+            );
+        }
+        // Named explicitly as well, because this is the one the issue asks about by name.
+        assert!(!predicate.contains("'cancelled'"), "{predicate}");
     }
 
     #[test]
