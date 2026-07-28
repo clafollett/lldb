@@ -237,12 +237,9 @@ services:
         (lldb-qe-auth user create --name demo || true) &&
         (lldb-qe-auth role create --name analyst || true) &&
         lldb-qe-auth role assign --role analyst --user demo &&
-        lldb-qe-auth grant --role analyst --privilege ALL
-          --object-type catalog --object-name shared &&
-        lldb-qe-auth grant --role analyst --privilege USAGE
-          --object-type warehouse --object-name analytics &&
-        lldb-qe-auth grant --role analyst --privilege USAGE
-          --object-type warehouse --object-name etl &&
+        lldb-qe-auth grant --role analyst --privilege ALL --object-type catalog --object-name shared &&
+        lldb-qe-auth grant --role analyst --privilege USAGE --object-type warehouse --object-name analytics &&
+        lldb-qe-auth grant --role analyst --privilege USAGE --object-type warehouse --object-name etl &&
         lldb-qe-auth show
     environment:
       <<: *metadata-env
