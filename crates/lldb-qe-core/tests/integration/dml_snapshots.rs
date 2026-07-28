@@ -42,6 +42,7 @@ use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableSource,
 };
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 use tokio::sync::Barrier;
 
@@ -200,7 +201,7 @@ async fn start_worker(
 ) -> Result<(SessionContext, Lakehouse)> {
     let (ctx, storage) = build_session(StorageConfig::InMemory).await?;
     let m = manifest(catalog_name, url, warehouse);
-    let mut lakes = apply_manifest(&ctx, &storage, &m).await?;
+    let mut lakes = apply_manifest(&ctx, &storage, &m, &TenantScope::untenanted()).await?;
     assert_eq!(lakes.len(), 1, "one catalog in, one lakehouse out");
     Ok((ctx, lakes.remove(0)))
 }
@@ -478,7 +479,13 @@ async fn concurrent_writers_neither_lose_nor_double_apply() -> Result<()> {
         let warehouse = warehouse.path().to_path_buf();
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
-            let lake = Lakehouse::open_sql(&catalog, &url, warehouse.to_str().unwrap()).await?;
+            let lake = Lakehouse::open_sql(
+                &catalog,
+                &TenantScope::untenanted(),
+                &url,
+                warehouse.to_str().unwrap(),
+            )
+            .await?;
             // Released together, so the reads genuinely overlap rather than queueing politely.
             barrier.wait().await;
             let out = dml::execute(&lake, &format!("UPDATE {NS}.{TABLE} SET qty = qty + 1"))
@@ -565,7 +572,13 @@ async fn concurrent_deletes_of_different_rows_both_land() -> Result<()> {
         let warehouse = warehouse.path().to_path_buf();
         let barrier = barrier.clone();
         tasks.push(tokio::spawn(async move {
-            let lake = Lakehouse::open_sql(&catalog, &url, warehouse.to_str().unwrap()).await?;
+            let lake = Lakehouse::open_sql(
+                &catalog,
+                &TenantScope::untenanted(),
+                &url,
+                warehouse.to_str().unwrap(),
+            )
+            .await?;
             barrier.wait().await;
             let out = dml::execute(&lake, &format!("DELETE FROM {NS}.{TABLE} WHERE id = {id}"))
                 .await?

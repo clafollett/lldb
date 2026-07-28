@@ -110,8 +110,9 @@ use tonic::transport::{Channel, Server};
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, Principal, bearer_header, bearer_token};
-use crate::engine::{BoxResolver, execute_query_cached, resolve_fleet, total_rows};
-use crate::lakehouse::Lakehouse;
+use crate::engine::{
+    BoxResolver, TenantSession, TenantSessions, execute_query_cached, resolve_fleet, total_rows,
+};
 use crate::query_log::QueryRecord;
 use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
@@ -326,12 +327,27 @@ impl Default for CoordinatorConfig {
     }
 }
 
-/// The long-running coordinator: a session, a scheduler, and optionally a control plane.
+/// The long-running coordinator: its tenants' sessions, a scheduler, and optionally a control
+/// plane.
 ///
-/// Held behind an `Arc` and shared by every in-flight request. Nothing in here is per-query state,
-/// which is what makes serving N queries from one of these correct rather than lucky.
+/// Held behind an `Arc` and shared by every in-flight request. **Nothing in here is per-query
+/// state**, which is what makes serving N queries from one of these correct rather than lucky.
+///
+/// That sentence used to be true because everything here was immutable after construction. It is
+/// still true, but for a slightly weaker and more interesting reason, and pretending otherwise
+/// would be the kind of stale invariant that gets someone into trouble: [`TenantSessions`] is a
+/// *mutable memo*. It builds an account's [`SessionContext`] the first time that account submits a
+/// query and keeps it. What makes that safe is that a session is a pure function of `(account,
+/// storage config, catalog source)` — no part of a query, its ticket, its warehouse or its
+/// credential reaches it — so the map is a cache of a deterministic computation rather than
+/// accumulated request state. Per-*tenant* is not per-query. Anything genuinely per-query still
+/// lives on the stack of [`Self::run_query`], and anything that starts depending on the *order*
+/// queries arrived in has broken the invariant even if it compiles.
 pub struct Coordinator {
-    ctx: SessionContext,
+    /// One [`SessionContext`] per account. See [`TenantSessions`] for why a single process-wide
+    /// context is the wrong answer here: `register_catalog` is global to a context, so one context
+    /// serving every tenant would make every tenant's catalog *name* visible to every other one.
+    sessions: TenantSessions,
     db: Option<ServicesDb>,
     config: CoordinatorConfig,
     scheduler: Scheduler,
@@ -341,14 +357,31 @@ pub struct Coordinator {
     /// The cross-query result cache, when one is configured. `None` disables it entirely, which is
     /// also what a server with no services database gets.
     result_cache: Option<ResultCache>,
-    /// The catalog's lakehouse handles — what the cache versions its inputs against. Empty means
-    /// nothing is cacheable, which is correct for a snapshot-less catalog like the TPC-H seed.
-    lakehouses: Vec<Lakehouse>,
 }
 
 impl Coordinator {
-    /// A coordinator serving `ctx`'s catalog, recording history in `db` when there is one.
+    /// A coordinator serving one fixed session to every caller, recording history in `db` when
+    /// there is one.
+    ///
+    /// The **single-tenant** constructor. It is right for a process with no control plane, and for
+    /// an embedding that builds its own context; it is wrong for a multi-tenant front door, which
+    /// wants [`Self::multi_tenant`] so that each account gets its own catalogs rather than sharing
+    /// one. Kept as `new` because a fixed session is what every caller that hand-registers tables
+    /// means, and because a server *with* a services database now names the other one explicitly.
     pub fn new(ctx: SessionContext, db: Option<ServicesDb>, config: CoordinatorConfig) -> Self {
+        Self::multi_tenant(
+            TenantSessions::fixed(TenantSession::new(ctx, Vec::new())),
+            db,
+            config,
+        )
+    }
+
+    /// A coordinator over `sessions`, which decides how tenants are kept apart.
+    pub fn multi_tenant(
+        sessions: TenantSessions,
+        db: Option<ServicesDb>,
+        config: CoordinatorConfig,
+    ) -> Self {
         let scheduler = Scheduler::new(AdmissionLimits {
             max_concurrent: config
                 .max_concurrent_queries
@@ -356,13 +389,12 @@ impl Coordinator {
             max_queued: config.max_queued_queries,
         });
         Self {
-            ctx,
+            sessions,
             db,
             config,
             scheduler,
             resolver: None,
             result_cache: None,
-            lakehouses: Vec::new(),
         }
     }
 
@@ -372,14 +404,16 @@ impl Coordinator {
         self
     }
 
-    /// Serve repeat queries from `cache`, versioned against `lakehouses`.
+    /// Serve repeat queries from `cache`.
     ///
-    /// Both together or neither: a cache with no lakehouses can never build a key, so it would sit
-    /// there counting skips. The pair comes from one [`build_query_session`](crate::engine::build_query_session)
-    /// call, which is the only place that can produce a consistent one.
-    pub fn with_result_cache(mut self, cache: ResultCache, lakehouses: Vec<Lakehouse>) -> Self {
+    /// The lakehouses the cache versions against are **not** passed here any more, and that is the
+    /// fix rather than a simplification: they now come from the same [`TenantSession`] the query
+    /// plans in, so a query's key can only ever be versioned against the catalogs that query
+    /// actually read. Handing them in separately was what made it possible to pair a cache with
+    /// another tenant's handles — which does not fail, it just stops caching (see
+    /// [`ResultCache::catalog_mismatch_count`]).
+    pub fn with_result_cache(mut self, cache: ResultCache) -> Self {
         self.result_cache = Some(cache);
-        self.lakehouses = lakehouses;
         self
     }
 
@@ -639,12 +673,15 @@ impl Coordinator {
         )
         .await?;
         // The tenant is `target.account_id` — the one resolved from the credential, never the one
-        // the ticket claimed — so one account can never be served another's cached rows. The
-        // object-level grant check happens inside, between planning and the cache lookup.
+        // the ticket claimed — so one account can never be served another's cached rows, and now
+        // also never planned against another's catalogs: this is where a per-account session is
+        // selected, and it is selected by the same id. The object-level grant check happens inside,
+        // between planning and the cache lookup.
+        let session = self.sessions.for_account(target.account_id).await?;
         execute_query_cached(
-            &self.ctx,
+            session.ctx(),
             self.result_cache.as_ref(),
-            &self.lakehouses,
+            session.lakehouses(),
             target.account_id,
             authorization,
             sql,

@@ -436,6 +436,7 @@ mod tests {
     use crate::remote::{deserialize_plan, serialize_plan};
     use crate::scan_split::split_scan;
     use crate::storage::StorageConfig;
+    use crate::tenancy::TenantScope;
     use crate::{TableSource, apply_manifest, build_session};
 
     const NS: &str = "sales";
@@ -480,7 +481,8 @@ mod tests {
     async fn seeded(warehouse: &Path, rows: usize) -> Result<(SessionContext, Lakehouse)> {
         let (ctx, storage) = build_session(StorageConfig::Local(warehouse.to_path_buf())).await?;
         let manifest = manifest(warehouse);
-        let mut lakes = apply_manifest(&ctx, &storage, &manifest).await?;
+        let mut lakes =
+            apply_manifest(&ctx, &storage, &manifest, &TenantScope::untenanted()).await?;
         if rows > 0 {
             let values = (0..rows)
                 .map(|i| format!("({i}, 'row-{i}')"))

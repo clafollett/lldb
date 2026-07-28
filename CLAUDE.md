@@ -52,8 +52,9 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
   (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
   front ends share (`engine.rs`), admission control (`scheduler.rs`), query history
-  (`query_log.rs`), the long-running coordinator (`server.rs`), and access control — identity and
-  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`)
+  (`query_log.rs`), the long-running coordinator (`server.rs`), access control — identity and
+  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — and the per-account
+  catalog/warehouse partitioning those two rest on (`tenancy.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
   migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
@@ -216,9 +217,42 @@ only proves membership of the deployment: `LLDB_FLEET_TOKEN`, constant-time comp
 set and open-with-a-loud-warning if not. Per-request identity at the worker boundary is a follow-on,
 not something this already does.
 
-Be honest about the limit: `iceberg_tables` is owned by `iceberg-catalog-sql` and is **not**
-partitioned by account, so tenant isolation over table data is what the grant check enforces and
-nothing else. Physically separate per-account catalogs are their own issue.
+## A catalog per tenant — the boundary the grant check no longer carries alone
+
+`iceberg_tables` is owned by `iceberg-catalog-sql`, so no migration of ours can add an `account_id`
+column to it. `tenancy.rs` partitions it anyway, with the column that is already there: **an account
+gets its own catalog name and its own warehouse root** (`TenantScope`), and `catalog_name` is the
+leading primary-key column of both of that crate's tables and appears in the `WHERE` clause of every
+statement it issues. Three rules follow, and the second is the one that is easy to get wrong.
+
+1. **The two knobs move together, always.** A table's location is `{warehouse}/{namespace}/{table}`
+   — the catalog name is *not* in it. Scoping the name without the root gives two tenants clean
+   separation in Postgres and the same directory on disk, which is worse than scoping neither
+   because it looks separated.
+2. **A lakehouse has two catalog names and they are not interchangeable.** `catalog_name()` is what
+   SQL says (the manifest's declared name, the same for every tenant, what a grant is written
+   against); `iceberg_catalog_name()` is what storage says (`acct_<id>__<declared>`, the row
+   discriminator). `dml.rs`'s pointer swap uses the storage one; `result_cache.rs`'s input
+   versioning uses the SQL one. Swapping either does not fail — DML would target one shared row, and
+   the cache would silently stop firing forever, which is why `ResultCache::catalog_mismatch_count`
+   exists and is asserted to be zero.
+3. **A session is per account, not per process** (`engine::TenantSessions`). `register_catalog` is
+   global to a `SessionContext`, so one context holding every tenant's catalog would make every
+   tenant's catalog *name* visible to every other one — isolation back to a check rather than a
+   structure. `engine.rs`'s "one context, shared across concurrent queries" claim is about
+   concurrency and still holds; the unit changed, not the property. `Coordinator` therefore holds a
+   lazily-built memo of sessions, which is per-*tenant* state and still not per-*query* state.
+
+**Tenancy follows the services DB**, like auth: no `--metadata-*` → no accounts → `TenantScope::
+untenanted()` → the catalog names and warehouse paths the manifest literally declares. `cargo run`
+still needs no Postgres.
+
+Be honest about what this buys: **layout, not access.** Since #28 a resolved plan names data files
+by absolute path and a worker reads them with its own credentials, so any worker that can read
+tenant A's plan can read tenant B's files if handed a plan naming them. Per-request identity at the
+worker boundary is the other half and is its own issue. Listing tables are also outside the boundary
+entirely — they have no catalog row and no warehouse — so a multi-tenant manifest should declare
+`format = "iceberg"`.
 
 The other operator binaries — `lldb-qe-coordinator`, `lldb-qe-warehouse`, `lldb-qe-auth`,
 `lldb-qe-migrate` — are **not** access-controlled and cannot usefully be: their credential is the
@@ -331,6 +365,13 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # and re-granting turns the next run straight back into a hit). Same three-way gating. Confirm the
 # fix's teeth by moving the check below the lookup in `result_cache.rs` — this must then fail.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration cache_grant_ordering
+
+# A catalog per tenant: two accounts own the SAME qualified table name from ONE manifest, and a
+# catalog-wide grant — held by both — still reaches only its own account's rows. Asserted against
+# the live `iceberg_tables` (two rows, distinct `catalog_name`, distinct `metadata_location`), so
+# scoping the name without the warehouse root fails it on the file paths rather than passing.
+# Same three-way gating.
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration tenant_catalogs
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```

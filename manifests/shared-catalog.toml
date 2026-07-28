@@ -17,6 +17,19 @@
 # `iceberg_namespace_properties`) the first time it is opened; they are NOT part of
 # `crates/lldb-qe-core/migrations/`, which owns the services schema and nothing else.
 #
+# ONE MANIFEST, ONE CATALOG PER TENANT. The `name` and `warehouse` below are what SQL and an
+# operator see; they are not what lands in the database. A process running for account 7 opens this
+# as catalog `acct_7__shared` under `file:///var/lib/lldb/warehouse/acct_7`, so two accounts
+# applying this same file get two catalogs and two directories while both still writing
+# `SELECT ... FROM shared.sales.orders`. That is the point: the manifest stays portable and the
+# tenants stay apart. With no services database configured there are no accounts, so the names here
+# are used verbatim — see `crates/lldb-qe-core/src/tenancy.rs`.
+#
+# Corollary worth knowing before adding a table: `format = "listing"` is OUTSIDE that boundary. A
+# listing table is a bare path in DataFusion's default catalog with no catalog row and no warehouse
+# to partition, so every tenant reading one reads the same files. A multi-tenant manifest wants
+# Iceberg tables (the default).
+#
 #   cargo run -p lldb-qe-coordinator -- \
 #     --manifest manifests/shared-catalog.toml \
 #     --metadata-url postgres://lldb@localhost/lldb \

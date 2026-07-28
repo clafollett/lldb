@@ -69,10 +69,16 @@
 //!   in-SQL `GRANT`, so there is nobody to delegate to yet.
 //! - **No deny rules.** Grants are purely additive, so "is this allowed" is a search for one
 //!   covering grant and never an ordering problem between allow and deny.
-//! - **No physical tenant separation of the catalog.** See [`crate::auth`]'s module docs: the
-//!   Iceberg SQL catalog's tables are owned by `iceberg-catalog-sql` and are not partitioned by
-//!   account, so isolation between tenants is what the check below enforces, not something the
-//!   storage layout guarantees.
+//! - **No cross-tenant reach to refuse.** This used to read "no physical tenant separation of the
+//!   catalog", and it was the most important caveat here: one shared catalog meant a catalog-wide
+//!   grant to account B really did name account A's tables, and this check was the only thing
+//!   between them. It is not any more — [`crate::tenancy`] gives each account its own catalog and
+//!   warehouse root, and a session registers only its own tenant's catalogs, so another tenant's
+//!   tables do not resolve at all. What that changes about *this* module is nothing: `covers_object`
+//!   is unchanged, and a `Catalog` grant is still a one-segment name covering everything beneath it.
+//!   What it changes about the *system* is that the check is now a second line rather than the only
+//!   one. Do not read that as slack — a grant is still the only thing that decides what a user may
+//!   touch **within** their tenant, which is most of what this module is for.
 
 use std::collections::BTreeSet;
 use std::fmt;

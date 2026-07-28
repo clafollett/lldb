@@ -49,9 +49,15 @@
 //! - **No admission control, no query id, no history.** This is the execution path; the scheduler
 //!   ([`crate::scheduler`]) and the history ([`crate::query_log`]) wrap it. A one-shot invocation
 //!   legitimately has neither.
-//! - **No catalog caching between calls.** [`build_query_session`] is called once per process, not
-//!   once per query. Sharing one [`SessionContext`] across concurrent queries is safe and is
-//!   exactly what the server does.
+//! - **No catalog caching between calls.** [`build_query_session`] is called once per *tenant*,
+//!   not once per query. Sharing one [`SessionContext`] across concurrent queries is safe and is
+//!   exactly what the server does — that property is about concurrency, and it is unchanged.
+//!   What changed is the *unit*: a long-running server now holds one context per account
+//!   ([`TenantSessions`]), because a single process-wide context would have to register every
+//!   tenant's catalog into it and `register_catalog` is global to a context. Every tenant's
+//!   catalog *name* would then be visible to every tenant, and the boundary would go back to being
+//!   a grant check rather than a structure. Each account's context is still built once and still
+//!   shared across that account's concurrent queries.
 //! - **No cancellation, no partial results.** Batches are collected whole before they are
 //!   returned, which is what makes stage reassignment safe (see
 //!   [`crate::flight::fetch_partition_with_failover`] for why a half-delivered partition cannot be
@@ -65,11 +71,12 @@
 //! Putting it here rather than in each binary is the same argument the rest of this module makes:
 //! a cache the one-shot honours and the server does not is two engines again.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, bail};
 use datafusion::arrow::record_batch::RecordBatch;
@@ -91,6 +98,8 @@ use crate::result_cache::{ResultCache, execute_cached};
 use crate::session::{build_session, register_tpch_parquet};
 use crate::staging::plan_distributed;
 use crate::storage::StorageConfig;
+use crate::tenancy::TenantScope;
+use tokio::sync::OnceCell;
 
 /// Where a session's tables come from.
 ///
@@ -120,11 +129,12 @@ pub type BoxResolver = Arc<
         + 'static,
 >;
 
-/// Build a session with `config`'s storage backend and `catalog`'s tables registered, returning it
-/// alongside the [`Lakehouse`] handles the catalog produced.
+/// Build a session with `config`'s storage backend and `catalog`'s tables registered — for one
+/// tenant — returning it alongside the [`Lakehouse`] handles the catalog produced.
 ///
-/// One per process. A [`SessionContext`] is `Clone` and internally shared, so concurrent queries
-/// on one context is the intended usage, not a liberty.
+/// One per tenant, not one per query. A [`SessionContext`] is `Clone` and internally shared, so
+/// concurrent queries on one context is the intended usage, not a liberty; `scope` is what decides
+/// how many such contexts a process has (see [`TenantSessions`] and [`crate::tenancy`]).
 ///
 /// The lakehouses are returned rather than dropped because they are the only thing that can answer
 /// "what snapshot is this table at", which is what makes a result-cache key safe to trust. The
@@ -133,12 +143,13 @@ pub type BoxResolver = Arc<
 pub async fn build_query_session(
     config: StorageConfig,
     catalog: &CatalogSource,
+    scope: &TenantScope,
 ) -> Result<(SessionContext, Vec<Lakehouse>)> {
     let (ctx, storage) = build_session(config).await?;
     let lakehouses = match catalog {
         CatalogSource::Manifest(path) => {
             let manifest = Manifest::from_path(path)?;
-            apply_manifest(&ctx, &storage, &manifest)
+            apply_manifest(&ctx, &storage, &manifest, scope)
                 .await
                 .with_context(|| format!("applying catalog manifest {}", path.display()))?
         }
@@ -150,6 +161,159 @@ pub async fn build_query_session(
         }
     };
     Ok((ctx, lakehouses))
+}
+
+/// One tenant's query session: a [`SessionContext`] with that tenant's catalogs registered, and
+/// the [`Lakehouse`] handles behind them.
+///
+/// The pair travels together because it has to be consistent: the lakehouses are what version the
+/// result-cache key, and versioning one context's query against another context's catalogs would
+/// produce a key that names tables the query never read.
+pub struct TenantSession {
+    ctx: SessionContext,
+    lakehouses: Vec<Lakehouse>,
+}
+
+impl TenantSession {
+    /// Wrap an already-built context and its lakehouses.
+    pub fn new(ctx: SessionContext, lakehouses: Vec<Lakehouse>) -> Self {
+        Self { ctx, lakehouses }
+    }
+
+    /// The DataFusion session queries plan and run in.
+    pub fn ctx(&self) -> &SessionContext {
+        &self.ctx
+    }
+
+    /// The catalogs behind it — what the result cache versions its inputs against.
+    pub fn lakehouses(&self) -> &[Lakehouse] {
+        &self.lakehouses
+    }
+}
+
+/// Every tenant's session, produced on demand and then kept.
+///
+/// # Why a map instead of one context
+///
+/// `register_catalog` is global to a [`SessionContext`]. A single process-wide context serving
+/// every tenant would therefore have to hold every tenant's catalog, and catalog listing would
+/// show `acct_43` to account 42 — refused by [`crate::rbac`] when queried, but *visible*. Isolation
+/// that depends on a check rather than on absence is exactly what per-tenant catalogs exist to
+/// replace, so rebuilding it one layer up would close the issue in name only. One context per
+/// account means another tenant's catalog is not merely denied, it is not there.
+///
+/// # This is per-*tenant* state, not per-query state
+///
+/// Which is the property that matters for holding one of these behind an `Arc` and sharing it
+/// across every in-flight request. A session is a pure function of `(account, storage config,
+/// catalog source)` — nothing about a *query* enters it — so memoizing it is caching a
+/// computation, not accumulating request state. Two concurrent queries for one account share a
+/// context exactly as every concurrent query shared the single context before, and two queries for
+/// different accounts share nothing.
+///
+/// # The costs, stated rather than discovered
+///
+/// - **Sessions are never evicted.** A deployment with a very large number of *active* accounts
+///   holds a context and a catalog handle for each. That is bounded by tenants who have actually
+///   run a query on this process, not by the size of the `accounts` table, and each one's
+///   Postgres pool is capped (see `CATALOG_POOL_MAX_CONNECTIONS` in [`crate::lakehouse`]) — but it
+///   is unbounded in principle, and an eviction policy is the follow-on if it ever bites.
+/// - **First query per tenant pays for the build**, which for a `sql` catalog means opening the
+///   catalog and applying the manifest. Subsequent queries do not.
+pub struct TenantSessions {
+    source: SessionSource,
+}
+
+enum SessionSource {
+    /// One session for every caller.
+    ///
+    /// The single-tenant shape, and the honest name for it. It is what a process with no control
+    /// plane gets — there are no accounts, so there is nothing to key on — and what a caller that
+    /// hand-builds a context (tests, a bespoke embedding) gets. It is *not* safe for a
+    /// multi-tenant front door, which is why the multi-tenant constructor is the other one and
+    /// this one says so out loud.
+    Fixed(Arc<TenantSession>),
+    /// A session per account, built from these ingredients the first time that account is seen.
+    PerAccount {
+        storage: StorageConfig,
+        catalog: CatalogSource,
+        /// Keyed by `Option<i64>` so a server with no services database — which resolves no
+        /// account and therefore has exactly one tenant — shares the `None` entry instead of
+        /// needing a separate code path.
+        ///
+        /// `OnceCell` inside the map, not a value: the sync `Mutex` is held only long enough to
+        /// hand out the cell, so two accounts build concurrently and two queries for the *same*
+        /// account build once. Holding the map's lock across the build would serialize every
+        /// tenant's first query behind every other tenant's.
+        built: Mutex<HashMap<Option<i64>, PendingSession>>,
+    },
+}
+
+/// One account's slot in the session map: shared, and initialized exactly once however many
+/// queries for that account race to be first.
+type PendingSession = Arc<OnceCell<Arc<TenantSession>>>;
+
+impl TenantSessions {
+    /// One session, used for every account. See [`SessionSource::Fixed`] for when that is right.
+    pub fn fixed(session: TenantSession) -> Self {
+        Self {
+            source: SessionSource::Fixed(Arc::new(session)),
+        }
+    }
+
+    /// A session per account, built lazily from `storage` + `catalog`.
+    pub fn per_account(storage: StorageConfig, catalog: CatalogSource) -> Self {
+        Self {
+            source: SessionSource::PerAccount {
+                storage,
+                catalog,
+                built: Mutex::new(HashMap::new()),
+            },
+        }
+    }
+
+    /// This account's session, building it if this is the first query for that account.
+    pub async fn for_account(&self, account_id: Option<i64>) -> Result<Arc<TenantSession>> {
+        match &self.source {
+            SessionSource::Fixed(session) => Ok(Arc::clone(session)),
+            SessionSource::PerAccount {
+                storage,
+                catalog,
+                built,
+            } => {
+                let cell = {
+                    let mut map = built.lock().expect("tenant session map is not poisoned");
+                    Arc::clone(map.entry(account_id).or_default())
+                };
+                let session = cell
+                    .get_or_try_init(|| async {
+                        let scope = TenantScope::for_account(account_id);
+                        tracing::info!(tenant = %scope, "building this tenant's query session");
+                        let (ctx, lakehouses) =
+                            build_query_session(storage.clone(), catalog, &scope)
+                                .await
+                                .with_context(|| {
+                                    format!("building the query session for tenant {scope}")
+                                })?;
+                        Ok::<_, anyhow::Error>(Arc::new(TenantSession::new(ctx, lakehouses)))
+                    })
+                    .await?;
+                Ok(Arc::clone(session))
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for TenantSessions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.source {
+            SessionSource::Fixed(_) => f.write_str("TenantSessions::Fixed"),
+            SessionSource::PerAccount { built, .. } => {
+                let built = built.lock().map(|m| m.len()).unwrap_or(0);
+                write!(f, "TenantSessions::PerAccount {{ built: {built} }}")
+            }
+        }
+    }
 }
 
 /// The coordinator's in-memory object store is per-process, so a remote worker can never see data
@@ -363,6 +527,69 @@ mod tests {
     use super::*;
     use datafusion::physical_plan::empty::EmptyExec;
     use datafusion::prelude::SessionContext;
+
+    /// A manifest declaring nothing, so a session can be built with no database, no data files and
+    /// no catalog server — enough to assert the *lifecycle*, which is what this is about.
+    fn empty_manifest(dir: &std::path::Path) -> Result<CatalogSource> {
+        let path = dir.join("empty.toml");
+        std::fs::write(&path, "catalogs = []\n")?;
+        Ok(CatalogSource::Manifest(path))
+    }
+
+    #[tokio::test]
+    async fn a_fixed_source_serves_every_account_the_same_session() -> Result<()> {
+        // The single-tenant shape, asserted as such rather than assumed: it hands the *same*
+        // session to two different accounts, which is exactly why it is the wrong choice for a
+        // multi-tenant front door and why the constructor for that one has a different name.
+        let sessions = TenantSessions::fixed(TenantSession::new(SessionContext::new(), Vec::new()));
+        let a = sessions.for_account(Some(1)).await?;
+        let b = sessions.for_account(Some(2)).await?;
+        assert!(Arc::ptr_eq(&a, &b));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_per_account_source_builds_one_session_per_account_and_keeps_it() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let sessions = TenantSessions::per_account(
+            StorageConfig::Local(dir.path().to_path_buf()),
+            empty_manifest(dir.path())?,
+        );
+
+        // Two accounts, two sessions — the property the whole design rests on, since a shared
+        // context would have to hold both tenants' catalogs.
+        let a = sessions.for_account(Some(1)).await?;
+        let b = sessions.for_account(Some(2)).await?;
+        assert!(!Arc::ptr_eq(&a, &b));
+
+        // …and one session per account, not one per query. Building a `sql` catalog per query
+        // would open a Postgres pool per query, so this is a cost assertion as much as a
+        // correctness one.
+        let a_again = sessions.for_account(Some(1)).await?;
+        assert!(Arc::ptr_eq(&a, &a_again));
+
+        // No account resolved — a server with no services database — is its own entry rather than
+        // a special case, and is not shared with any tenant's.
+        let none = sessions.for_account(None).await?;
+        assert!(!Arc::ptr_eq(&none, &a));
+        assert!(Arc::ptr_eq(&none, &sessions.for_account(None).await?));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_session_that_will_not_build_is_an_error_naming_its_tenant() {
+        // A refusal has to say *whose* session failed: with one context per process there was only
+        // one thing it could have been, and with N there is not.
+        let sessions = TenantSessions::per_account(
+            StorageConfig::Local("/definitely/not/a/directory".into()),
+            CatalogSource::Manifest("/definitely/not/a/manifest.toml".into()),
+        );
+        let Err(err) = sessions.for_account(Some(42)).await else {
+            panic!("neither the storage root nor the manifest exists");
+        };
+        let chain = format!("{err:#}");
+        assert!(chain.contains("acct_42"), "{chain}");
+    }
 
     #[test]
     fn a_plan_with_no_remote_leaves_is_not_distributed() {

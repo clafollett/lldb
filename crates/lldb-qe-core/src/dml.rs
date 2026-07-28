@@ -501,9 +501,14 @@ pub async fn execute_statement(lake: &Lakehouse, stmt: &DmlStatement) -> Result<
 
         let staged = stage(&table, stmt).await?;
         let pool = commit_point.pool().await?;
+        // The *storage* name, not the SQL one. This `UPDATE` names a row in `iceberg_tables`,
+        // whose `catalog_name` column is what keeps one tenant's tables out of another's — using
+        // the name SQL says would make every tenant's `DELETE` target the same row. The statement
+        // above resolved against `catalog_name()` for the opposite reason: that one is about what
+        // the user typed. See [`Lakehouse`].
         if swap_metadata_pointer(
             pool,
-            lake.catalog_name(),
+            lake.iceberg_catalog_name(),
             &ns,
             &table_name,
             &staged.base_location,

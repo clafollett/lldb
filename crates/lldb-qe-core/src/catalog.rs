@@ -19,6 +19,17 @@
 //! re-seeded. Re-running the loading `INSERT` would append a second copy of the source data and
 //! commit a new snapshot, making a query's answer depend on how many times the fleet had
 //! booted. Only tables this call actually created are seeded.
+//!
+//! # Iceberg tables are tenant-scoped; listing tables are not
+//!
+//! Every catalog here is opened for a [`TenantScope`], so an Iceberg table lands in a catalog and
+//! a warehouse root belonging to one account (see [`crate::tenancy`]). **Listing tables are
+//! different and cannot be otherwise**: a `ListingTable` is a plain path registered under a bare
+//! name in DataFusion's default catalog, with no catalog row and no warehouse to partition. Two
+//! tenants applying a manifest that declares one are reading the same files. That is not a
+//! regression — it is the same reason the result cache refuses to version a listing table — but it
+//! does mean a manifest that mixes the two only isolates half of itself, and a multi-tenant
+//! deployment should declare its tables `format = "iceberg"`.
 
 use anyhow::{Context, Result};
 use datafusion::arrow::datatypes::{Field, Schema as ArrowSchema};
@@ -28,6 +39,7 @@ use iceberg::NamespaceIdent;
 use crate::lakehouse::Lakehouse;
 use crate::manifest::{Manifest, TableDef, TableFormat, TableSource};
 use crate::storage::Storage;
+use crate::tenancy::TenantScope;
 
 /// Register plain-parquet `ListingTable`s in the default catalog under bare names.
 ///
@@ -48,12 +60,20 @@ pub async fn register_listing_tables(
     Ok(())
 }
 
-/// Materialize every catalog in `m`. Returns the opened [`Lakehouse`] handles (one per catalog
-/// that has Iceberg tables) so callers can inspect snapshots afterward.
+/// Materialize every catalog in `m` for one tenant. Returns the opened [`Lakehouse`] handles (one
+/// per catalog that has Iceberg tables) so callers can inspect snapshots afterward.
+///
+/// `scope` is an explicit parameter rather than something defaulted, and that is deliberate: it
+/// decides whether these tables land in a catalog of this tenant's own or in one shared with every
+/// other tenant on the deployment, and there is no safe guess. [`TenantScope::untenanted`] is the
+/// single-node answer — see [`crate::tenancy`]. Nothing about the *manifest* changes: the catalog
+/// keeps the name it declares as far as SQL is concerned, so the same manifest materializes the
+/// same-looking catalog for every tenant.
 pub async fn apply_manifest(
     ctx: &SessionContext,
     storage: &Storage,
     m: &Manifest,
+    scope: &TenantScope,
 ) -> Result<Vec<Lakehouse>> {
     let mut lakehouses = Vec::new();
 
@@ -84,6 +104,7 @@ pub async fn apply_manifest(
         // Iceberg tables: create each, register the catalog, then seed from sources.
         let lake = Lakehouse::open(
             &catalog.name,
+            scope,
             &catalog.backend,
             catalog.warehouse.as_deref(),
         )

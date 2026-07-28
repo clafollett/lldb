@@ -104,6 +104,7 @@ use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use lldb_qe_core::lakehouse::Lakehouse;
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
     CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, DmlOutcome, ResultCacheArgs, ServicesArgs,
     StorageArgs, build_query_session, dml, execute_query_cached, init_tracing,
@@ -280,7 +281,12 @@ async fn main() -> Result<()> {
             subdir: cli.tpch_subdir.clone(),
         },
     };
-    let (ctx, lakehouses) = build_query_session(config, &catalog).await?;
+    // One invocation, one tenant — so this binary needs no session map: it builds the single
+    // session for the account it resolved above and exits with it. With no services database
+    // `account_id` is `None`, which is `TenantScope::untenanted()` and therefore the catalog names
+    // and warehouse paths the manifest literally declares. See `lldb_qe_core::tenancy`.
+    let scope = TenantScope::for_account(account_id);
+    let (ctx, lakehouses) = build_query_session(config, &catalog, &scope).await?;
 
     // DELETE/UPDATE are answered here and return, before any worker is discovered. Distributing a
     // write would mean N processes racing to commit the same snapshot for one statement, which is
@@ -333,6 +339,13 @@ async fn main() -> Result<()> {
 /// distributed path. A DML statement whose table belongs to no configured catalog is an **error**,
 /// not a fall-through: `ctx.sql` would answer it with DataFusion's generic "unsupported logical
 /// plan", which tells an operator nothing about the manifest they forgot to pass.
+///
+/// **Asking every lakehouse in turn is only safe because they all belong to one tenant**, and that
+/// is now a fact rather than an accident: `lakehouses` comes from a single
+/// `build_query_session(_, _, scope)` call for the account this invocation resolved, so every
+/// handle here is scoped to that account's catalogs (see `lldb_qe_core::tenancy`). Handing this
+/// function a mixed set would turn "which catalog owns this table" into a search across tenants —
+/// which is why the multi-tenant front door keeps one session per account rather than one list.
 async fn run_dml(lakehouses: &[Lakehouse], sql: &str) -> Result<Option<DmlOutcome>> {
     let Some(stmt) = dml::parse(sql)? else {
         return Ok(None);

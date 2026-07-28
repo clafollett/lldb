@@ -66,12 +66,14 @@ use anyhow::{Context, Result};
 use datafusion::arrow::record_batch::RecordBatch;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::prelude::SessionContext;
+use lldb_qe_core::engine::{TenantSession, TenantSessions};
 use lldb_qe_core::rbac::{ObjectRef, Privilege};
 use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig};
 use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query_as,
 };
 use lldb_qe_core::services::ServicesDb;
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
     DEFAULT_WAREHOUSE_ENDPOINT, StageCache, StorageConfig, apply_manifest, build_session,
     serve_worker_with_cache,
@@ -155,7 +157,14 @@ struct Harness {
     db: ServicesDb,
     url: String,
     tenant: Tenant,
+    /// The catalog name **SQL** uses — the manifest's declared name. This is what the query below
+    /// spells and what the grant is written against; under [`TenantScope::account`] it is the same
+    /// word for every tenant.
     catalog: String,
+    /// The catalog name **storage** uses — `acct_<id>__<declared>`, the `iceberg_tables` row
+    /// discriminator. Only cleanup wants this one; asking for it by any other name would delete
+    /// nothing and leave this run's rows behind.
+    iceberg_catalog: String,
     coordinator: Arc<Coordinator>,
     /// The coordinator's Flight server, retained for the same reason [`Fleet`] retains its
     /// workers': dropping a `JoinHandle` detaches the task rather than stopping it, so a coordinator
@@ -197,7 +206,7 @@ impl Harness {
             .context("deleting the test account")?;
         for table in ["iceberg_tables", "iceberg_namespace_properties"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE catalog_name = $1"))
-                .bind(&self.catalog)
+                .bind(&self.iceberg_catalog)
                 .execute(self.db.pool())
                 .await
                 .with_context(|| format!("cleaning up {table}"))?;
@@ -250,8 +259,28 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
     let (ctx, storage) =
         build_session(StorageConfig::Local(warehouse.path().to_path_buf())).await?;
     let catalog = unique_name("cgo").replace('-', "_");
-    let lakehouses =
-        apply_manifest(&ctx, &storage, &manifest(&catalog, url, warehouse.path())).await?;
+    // The tenant's own scope, not `untenanted()`: this account exists, so this is the shape a
+    // multi-tenant front door materializes. It also makes the test able to tell the two catalog
+    // names apart — `catalog_name()` stays the declared word the SQL and the grant below spell,
+    // while `iceberg_catalog_name()` becomes `acct_<id>__<declared>`. Were `result_cache.rs` to
+    // version its inputs against the storage-facing name, the lookup would find nothing and step 2
+    // would fail on a miss rather than pass quietly. Under `untenanted()` the two names are the
+    // same string and nothing here could distinguish them.
+    let scope = TenantScope::account(tenant.account_id);
+    let lakehouses = apply_manifest(
+        &ctx,
+        &storage,
+        &manifest(&catalog, url, warehouse.path()),
+        &scope,
+    )
+    .await?;
+    assert_eq!(
+        lakehouses.len(),
+        1,
+        "one catalog in, one lakehouse out — and the cache versions its key against this handle, \
+         so an empty list here would make the query uncacheable and every hit assertion below \
+         vacuous"
+    );
 
     // One commit, so the table has a snapshot to version the cache key against. Written on the
     // coordinator's own context, which is where a write belongs.
@@ -269,9 +298,14 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
+    // `multi_tenant` + `TenantSessions::fixed`, not `Coordinator::new`: the single-tenant
+    // constructor wraps the context in a `TenantSession` with **no lakehouses**, and the result
+    // cache versions its key against the lakehouses of the session a query plans in. Built that
+    // way this coordinator would be a coordinator whose queries are never cacheable, and every
+    // hit/miss claim below would be a claim about nothing.
     let coordinator = Arc::new(
-        Coordinator::new(
-            ctx,
+        Coordinator::multi_tenant(
+            TenantSessions::fixed(TenantSession::new(ctx, lakehouses)),
             Some(db.clone()),
             CoordinatorConfig {
                 // A tenant that does not exist, so any path still falling back to the configured
@@ -286,7 +320,7 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
             },
         )
         .with_resolver(resolver)
-        .with_result_cache(cache, lakehouses),
+        .with_result_cache(cache),
     );
     assert!(
         coordinator.requires_authentication(),
@@ -304,6 +338,7 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
         db,
         url: format!("http://{addr}"),
         tenant,
+        iceberg_catalog: scope.iceberg_catalog_name(&catalog),
         catalog,
         coordinator,
         server,
@@ -340,6 +375,21 @@ async fn ordering_body(h: &Harness) -> Result<()> {
     assert_eq!(cache.hit_count(), 0);
     assert_eq!(cache.execution_count(), 1);
     assert_eq!(cache.store_count(), 1, "a small result must be cached");
+    // The query was *keyed*, not merely not-found: a query the cache declines to version at all
+    // counts as a skip and never as a miss, and the one way this cache stops working without
+    // anything failing is a catalog whose lakehouse handle is absent or another tenant's. Both at
+    // zero is what makes every hit assertion below a claim about something.
+    assert_eq!(
+        cache.skip_count(),
+        0,
+        "the query must be genuinely cacheable — a skip here would make the rest of this file \
+         assert nothing"
+    );
+    assert_eq!(
+        cache.catalog_mismatch_count(),
+        0,
+        "the session's lakehouse handles must be the ones this query's catalog resolves through"
+    );
     assert!(
         h.fleet.executions() > 0,
         "the query must have been dispatched to a worker — if it never left the coordinator, \
