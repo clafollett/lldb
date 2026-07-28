@@ -67,6 +67,18 @@
 //! writes to disk writes into its own `tempfile::tempdir()`. The database-gated files name their
 //! rows with a pid + nanosecond suffix, which was always required to survive a shared CI server
 //! and is unaffected by the process count.
+//!
+//! ## Teardown is a `Drop` guard, and that is a consequence of this file
+//!
+//! One binary is one process, so anything a test does not give back is held for the whole run
+//! rather than for a second or two. Two things used not to be given back — a spawned Flight server
+//! (a dropped `JoinHandle` *detaches* its task, and every server here is spawned with a
+//! `pending()` shutdown that never resolves) and, on a *failing* run, the rows a test wrote (a
+//! `cleanup().await?` at the end of a body is unwound past by the assertion that failed). Neither
+//! was a bug when it was written: separate binaries meant process exit reclaimed the socket, and
+//! failure-path cleanup was ceremony. Issue #48 is that premise changing, and the fix is two guards
+//! in [`support`] — [`support::Servers`] and [`support::DbCleanup`]. **A new test that starts a
+//! server or writes a row uses them; it does not hand-roll a `cleanup()`.**
 
 mod support;
 

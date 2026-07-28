@@ -31,11 +31,17 @@ use lldb_qe_core::distributed::{GroupCount, extract_group_counts};
 use lldb_qe_core::{FlightReaderExec, discover_workers, flight, plan_distributed};
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 /// Start an in-process worker on a random `127.0.0.1` port; returns its `http://` URL.
-async fn start_worker() -> anyhow::Result<String> {
+///
+/// The handle goes into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_worker(workers: &mut Servers) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    workers.spawn(async move {
         flight::serve_worker(listener, SessionContext::new())
             .await
             .expect("worker serve");
@@ -115,10 +121,11 @@ async fn distributes_across_all_discovered_workers() -> anyhow::Result<()> {
     let path = seed_parquet(tmp.path(), 2000, 6)?;
 
     // Three in-process workers on distinct ports.
+    let mut servers = Servers::new();
     let endpoints = vec![
-        start_worker().await?,
-        start_worker().await?,
-        start_worker().await?,
+        start_worker(&mut servers).await?,
+        start_worker(&mut servers).await?,
+        start_worker(&mut servers).await?,
     ];
 
     // Discovery resolves each literal `127.0.0.1:port` to itself, so the fleet is exactly the three.
@@ -169,7 +176,11 @@ async fn fewer_workers_fan_out_less() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = seed_parquet(tmp.path(), 1500, 5)?;
 
-    let endpoints = vec![start_worker().await?, start_worker().await?];
+    let mut servers = Servers::new();
+    let endpoints = vec![
+        start_worker(&mut servers).await?,
+        start_worker(&mut servers).await?,
+    ];
     let fleet = discover_workers(&endpoints).await?;
     assert_eq!(fleet.len(), 2);
 

@@ -32,6 +32,12 @@ fn distributed_vs_single(c: &mut Criterion) {
         for _ in 0..2 {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
+            // Deliberately detached, unlike the integration tests (#48). Dropping a `JoinHandle`
+            // does not cancel its task, so these two workers live until the process exits — which
+            // is exactly what this benchmark wants: they must outlive every sample, and the process
+            // runs one benchmark and stops. The reason it is a leak in `tests/integration` is that
+            // #44 made that a single long-lived process shared by two dozen files; a bench harness
+            // is still the one-binary-one-job shape those files used to have.
             tokio::spawn(async move {
                 flight::serve_worker(listener, SessionContext::new())
                     .await

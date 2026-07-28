@@ -34,19 +34,28 @@ use datafusion::prelude::{ParquetReadOptions, SessionConfig, SessionContext};
 use lldb_qe_core::{FlightReaderExec, StageCache, flight, plan_distributed};
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 /// One result row, rendered column-by-column as text so any schema can be compared.
 type Row = Vec<String>;
 
 /// Start an in-process worker on a random port; returns its URL.
-async fn start_worker() -> anyhow::Result<String> {
-    start_worker_with_cache(Arc::new(StageCache::new())).await
+async fn start_worker(workers: &mut Servers) -> anyhow::Result<String> {
+    start_worker_with_cache(workers, Arc::new(StageCache::new())).await
 }
 
 /// Start an in-process worker sharing `cache`, so the test can read its data-movement counters.
-async fn start_worker_with_cache(cache: Arc<StageCache>) -> anyhow::Result<String> {
+///
+/// The handle goes into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port — and the `StageCache` above — for the rest of the run.
+async fn start_worker_with_cache(
+    workers: &mut Servers,
+    cache: Arc<StageCache>,
+) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    workers.spawn(async move {
         flight::serve_worker_with_cache(listener, SessionContext::new(), cache)
             .await
             .expect("worker serve");
@@ -211,7 +220,11 @@ async fn join_feeding_a_group_by_matches_single_node() -> anyhow::Result<()> {
     let a = seed_table(tmp.path(), "a", 2, 300, 12)?;
     let b = seed_table(tmp.path(), "b", 2, 200, 12)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
     let ctx = shuffling_ctx();
     register(&ctx, &[("a", &a), ("b", &b)]).await?;
 
@@ -234,7 +247,11 @@ async fn two_joins_in_one_plan_match_single_node() -> anyhow::Result<()> {
     let b = seed_table(tmp.path(), "b", 2, 60, 30)?;
     let c = seed_table(tmp.path(), "c", 2, 60, 30)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
     let ctx = shuffling_ctx();
     register(&ctx, &[("a", &a), ("b", &b), ("c", &c)]).await?;
 
@@ -255,7 +272,11 @@ async fn union_all_of_two_aggregates_matches_single_node() -> anyhow::Result<()>
     let a = seed_table(tmp.path(), "a", 2, 500, 7)?;
     let b = seed_table(tmp.path(), "b", 2, 400, 5)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
     let ctx = shuffling_ctx();
     register(&ctx, &[("a", &a), ("b", &b)]).await?;
 
@@ -295,9 +316,10 @@ async fn broadcast_join_matches_single_node_without_shuffling_the_large_side() -
 
     // --- broadcast: collect-left thresholds left at their defaults.
     let cache = Arc::new(StageCache::new());
+    let mut fleet = Servers::new();
     let workers = vec![
-        start_worker_with_cache(Arc::clone(&cache)).await?,
-        start_worker_with_cache(Arc::clone(&cache)).await?,
+        start_worker_with_cache(&mut fleet, Arc::clone(&cache)).await?,
+        start_worker_with_cache(&mut fleet, Arc::clone(&cache)).await?,
     ];
     let ctx = broadcasting_ctx();
     register(&ctx, &[("big", &big), ("small", &small)]).await?;
@@ -318,9 +340,10 @@ async fn broadcast_join_matches_single_node_without_shuffling_the_large_side() -
 
     // --- the same query shuffled, for contrast: now both sides move.
     let shuffle_cache = Arc::new(StageCache::new());
+    let mut shuffle_fleet = Servers::new();
     let shuffle_workers = vec![
-        start_worker_with_cache(Arc::clone(&shuffle_cache)).await?,
-        start_worker_with_cache(Arc::clone(&shuffle_cache)).await?,
+        start_worker_with_cache(&mut shuffle_fleet, Arc::clone(&shuffle_cache)).await?,
+        start_worker_with_cache(&mut shuffle_fleet, Arc::clone(&shuffle_cache)).await?,
     ];
     let shuffle_ctx = shuffling_ctx();
     register(&shuffle_ctx, &[("big", &big), ("small", &small)]).await?;
@@ -358,10 +381,11 @@ async fn distributed_order_by_matches_single_node_ordering() -> anyhow::Result<(
     let tmp = tempfile::tempdir()?;
     let t = seed_table(tmp.path(), "t", 3, 400, 9)?;
 
+    let mut fleet = Servers::new();
     let workers = vec![
-        start_worker().await?,
-        start_worker().await?,
-        start_worker().await?,
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
     ];
     let ctx = shuffling_ctx();
     register(&ctx, &[("t", &t)]).await?;
@@ -400,7 +424,11 @@ async fn windowed_aggregate_matches_single_node() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let t = seed_table(tmp.path(), "t", 2, 300, 8)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
     let ctx = shuffling_ctx();
     register(&ctx, &[("t", &t)]).await?;
 
@@ -426,7 +454,11 @@ async fn windowed_aggregate_matches_single_node() -> anyhow::Result<()> {
 /// Half a distributed plan and a right answer beats a whole one and a wrong answer.
 #[tokio::test]
 async fn shapes_that_fall_back_still_answer_correctly() -> anyhow::Result<()> {
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
 
     // (a) A MemTable aggregate: no file scan to slice, so nothing is shipped at all.
     let ctx = shuffling_ctx();

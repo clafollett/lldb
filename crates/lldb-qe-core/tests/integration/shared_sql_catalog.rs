@@ -44,6 +44,8 @@ use lldb_qe_core::manifest::{
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
+use crate::support::{Cleanup, DbCleanup};
+
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -279,6 +281,12 @@ async fn two_workers_share_one_catalog() -> Result<()> {
     // A name no other run — or concurrent copy of this run — will pick. `iceberg_tables` is
     // keyed by catalog_name, so this is what keeps runs from seeing each other.
     let catalog = format!("lldb_test_{}_{}", std::process::id(), nanos());
+    // `iceberg_tables` / `iceberg_namespace_properties` belong to `iceberg-catalog-sql` and may be
+    // shared with a real catalog on the database we were handed, so they are never dropped — just
+    // emptied of the uniquely-named catalog this run invented. Registered here rather than deleted
+    // at the end so a failing assertion below still takes them with it; see `support::DbCleanup`.
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.add(Cleanup::IcebergCatalog(catalog.clone()));
     // One warehouse directory, shared by every worker: the local-filesystem stand-in for the
     // shared object storage a real fleet would have.
     let warehouse = tempfile::tempdir()?;
@@ -395,20 +403,6 @@ async fn two_workers_share_one_catalog() -> Result<()> {
         .context("worker D")?;
     assert_eq!(count_rows(&ctx_d, &catalog, "orders").await?, 5);
     assert_eq!(count_rows(&ctx_d, &catalog, "returns").await?, 0);
-
-    // ---- Cleanup: this run's rows only ------------------------------------------------------
-    // `iceberg_tables` / `iceberg_namespace_properties` belong to `iceberg-catalog-sql` and may
-    // be shared with a real catalog on the database we were handed, so they are never dropped —
-    // just emptied of the uniquely-named catalog this run invented.
-    let pool = sqlx::postgres::PgPool::connect(url).await?;
-    for table in ["iceberg_tables", "iceberg_namespace_properties"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE catalog_name = $1"))
-            .bind(&catalog)
-            .execute(&pool)
-            .await
-            .with_context(|| format!("cleaning up {table}"))?;
-    }
-    pool.close().await;
 
     // Keep the warehouse alive until here: dropping it earlier would delete the metadata the
     // assertions above depend on.

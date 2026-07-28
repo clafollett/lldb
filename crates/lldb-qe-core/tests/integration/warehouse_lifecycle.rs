@@ -18,7 +18,7 @@
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration warehouse_lifecycle
 //!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration warehouse_lifecycle -- --nocapture
 
-use crate::support::{self, resolve_target, unique_name};
+use crate::support::{self, DbCleanup, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use lldb_qe_core::discovery::DEFAULT_WAREHOUSE_ENDPOINT;
 use lldb_qe_core::services::ServicesDb;
@@ -44,11 +44,18 @@ async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lifecycle_round_trips_and_illegal_moves_are_refused() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("lifecycle").await? else {
+    let Some((db, target)) = db_or_skip("lifecycle").await? else {
         return Ok(());
     };
+    let url = target
+        .url()
+        .expect("db_or_skip returns a connected database");
 
     let account = db.create_account(&unique_name("wh-acct")).await?;
+    // Registered as soon as the row exists rather than deleted at the end, so an assertion failing
+    // below still takes it with it — see `support::DbCleanup`.
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(account.id);
 
     // ---- Two warehouses of different sizes, side by side --------------------------------------
     // The first acceptance criterion, as a control-plane fact: one account, two independently
@@ -212,16 +219,18 @@ async fn the_lifecycle_round_trips_and_illegal_moves_are_refused() -> Result<()>
     );
     assert!(db.warehouse_by_name(account.id, &small).await?.is_none());
 
-    delete_account(&db, account.id).await?;
     db.close().await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_accounts_can_own_the_same_warehouse_name() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("tenancy").await? else {
+    let Some((db, target)) = db_or_skip("tenancy").await? else {
         return Ok(());
     };
+    let url = target
+        .url()
+        .expect("db_or_skip returns a connected database");
 
     // The tenancy criterion. `UNIQUE (account_id, name)` — not `UNIQUE (name)` — is what makes a
     // warehouse handle meaningful *per tenant*, and it is the reason every lookup in the API
@@ -229,6 +238,9 @@ async fn two_accounts_can_own_the_same_warehouse_name() -> Result<()> {
     let shared_name = unique_name("wh-shared");
     let alice = db.create_account(&unique_name("wh-alice")).await?;
     let bob = db.create_account(&unique_name("wh-bob")).await?;
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(alice.id);
+    cleanup.account(bob.id);
 
     let alice_wh = db
         .create_warehouse(alice.id, &shared_name, 2, WarehouseState::Running)
@@ -285,18 +297,22 @@ async fn two_accounts_can_own_the_same_warehouse_name() -> Result<()> {
         "one tenant's deletion must not touch another's"
     );
 
-    delete_account(&db, bob.id).await?;
     db.close().await;
     Ok(())
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_schema_itself_refuses_an_illegal_warehouse() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("constraints").await? else {
+    let Some((db, target)) = db_or_skip("constraints").await? else {
         return Ok(());
     };
+    let url = target
+        .url()
+        .expect("db_or_skip returns a connected database");
 
     let account = db.create_account(&unique_name("wh-cons")).await?;
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(account.id);
     let name = unique_name("wh-cons-a");
 
     // The migration is only worth anything if it holds against SQL that bypasses the Rust API —
@@ -337,13 +353,14 @@ async fn the_schema_itself_refuses_an_illegal_warehouse() -> Result<()> {
     .context("the 0002 migration must add warehouses.updated_at")?;
     assert_eq!(nullable, "NO");
 
-    delete_account(&db, account.id).await?;
     db.close().await;
     Ok(())
 }
 
-/// Remove a test tenant, which cascades to its warehouses. Every test calls this; a failed
-/// assertion earlier in a test leaves rows behind, which the unique naming makes harmless.
+/// Remove a test tenant, which cascades to its warehouses.
+///
+/// Routine teardown is `support::DbCleanup`'s job now; this survives for the one call that is an
+/// *assertion* — deleting one tenant mid-test to watch the other's warehouse survive.
 async fn delete_account(db: &ServicesDb, id: i64) -> Result<()> {
     sqlx::query("DELETE FROM accounts WHERE id = $1")
         .bind(id)

@@ -46,6 +46,8 @@ use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 use tokio::sync::Barrier;
 
+use crate::support::{Cleanup, DbCleanup};
+
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -259,17 +261,14 @@ async fn insert(ctx: &SessionContext, catalog: &str, values: &str) -> Result<()>
 
 /// Remove only this run's catalog rows. `iceberg_tables` belongs to `iceberg-catalog-sql` and may
 /// be shared with a real catalog on the database we were handed, so it is never dropped.
-async fn cleanup(url: &str, catalog: &str) -> Result<()> {
-    let pool = sqlx::postgres::PgPool::connect(url).await?;
-    for table in ["iceberg_tables", "iceberg_namespace_properties"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE catalog_name = $1"))
-            .bind(catalog)
-            .execute(&pool)
-            .await
-            .with_context(|| format!("cleaning up {table}"))?;
-    }
-    pool.close().await;
-    Ok(())
+///
+/// A `Drop` guard registered at the top of a test rather than a call at the bottom: an assertion
+/// that fails unwinds straight past the bottom, so the old shape cleaned up after a *passing* run
+/// and left a failing one's rows behind. See [`DbCleanup`].
+fn cleanup(url: &str, catalog: &str) -> DbCleanup {
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.add(Cleanup::IcebergCatalog(catalog.to_string()));
+    cleanup
 }
 
 /// The commit in `dml.rs` binds `iceberg_tables`' columns by name, and those names are private
@@ -319,6 +318,7 @@ async fn delete_and_update_commit_snapshots_a_later_read_sees() -> Result<()> {
     };
 
     let catalog = format!("lldb_dml_{}_{}", std::process::id(), nanos());
+    let _cleanup = cleanup(url, &catalog);
     let warehouse = tempfile::tempdir()?;
     let (ctx, lake) = start_worker(&catalog, url, warehouse.path()).await?;
     // `start_worker` has now created the catalog's tables, so this is the first moment the
@@ -435,7 +435,6 @@ async fn delete_and_update_commit_snapshots_a_later_read_sees() -> Result<()> {
         vec![(99, Some("back".into()), Some(1))]
     );
 
-    cleanup(url, &catalog).await?;
     drop(ctx_b);
     warehouse.close()?;
     Ok(())
@@ -461,6 +460,7 @@ async fn concurrent_writers_neither_lose_nor_double_apply() -> Result<()> {
     };
 
     let catalog = format!("lldb_dmlrace_{}_{}", std::process::id(), nanos());
+    let _cleanup = cleanup(url, &catalog);
     let warehouse = tempfile::tempdir()?;
     let (ctx, lake) = start_worker(&catalog, url, warehouse.path()).await?;
     insert(&ctx, &catalog, "(1, 'a', 0), (2, 'b', 0), (3, 'c', 0)").await?;
@@ -538,7 +538,6 @@ async fn concurrent_writers_neither_lose_nor_double_apply() -> Result<()> {
         );
     }
 
-    cleanup(url, &catalog).await?;
     warehouse.close()?;
     Ok(())
 }
@@ -552,6 +551,7 @@ async fn concurrent_deletes_of_different_rows_both_land() -> Result<()> {
     };
 
     let catalog = format!("lldb_dmldel_{}_{}", std::process::id(), nanos());
+    let _cleanup = cleanup(url, &catalog);
     let warehouse = tempfile::tempdir()?;
     let (ctx, _lake) = start_worker(&catalog, url, warehouse.path()).await?;
     insert(
@@ -603,7 +603,6 @@ async fn concurrent_deletes_of_different_rows_both_land() -> Result<()> {
         "both deletes must survive — a lost one leaves 2 or 3 behind"
     );
 
-    cleanup(url, &catalog).await?;
     warehouse.close()?;
     Ok(())
 }

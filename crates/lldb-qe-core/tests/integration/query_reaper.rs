@@ -38,7 +38,7 @@ use lldb_qe_core::query_log::{QueryState, peak_concurrency};
 use lldb_qe_core::reaper::{DEFAULT_REAP_BATCH, ReapReason};
 use lldb_qe_core::services::ServicesDb;
 
-use crate::support::{Target, resolve_target, unique_name};
+use crate::support::{Cleanup, DbCleanup, Target, resolve_target, unique_name};
 
 /// The fastest cadence the schema can express, so the threshold under test is 3s.
 const RENEW: Duration = Duration::from_secs(1);
@@ -57,21 +57,19 @@ async fn database(target: &Target) -> Result<Option<ServicesDb>> {
     Ok(Some(db))
 }
 
-/// Delete exactly what a test made: its account (queries cascade with it) and its slot.
-async fn clean_up(db: &ServicesDb, account_id: i64, slots: &[&str]) -> Result<()> {
-    for slot in slots {
-        sqlx::query("DELETE FROM coordinators WHERE slot = $1")
-            .bind(slot)
-            .execute(db.pool())
-            .await
-            .context("deleting the test coordinator registration")?;
-    }
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(account_id)
-        .execute(db.pool())
-        .await
-        .context("deleting the test account")?;
-    Ok(())
+/// Delete exactly what a test made: its account (queries cascade with it) and its slots.
+///
+/// A `Drop` guard rather than a call at the end of each body, and registered at the top of each
+/// test rather than the bottom: an assertion that fails unwinds straight past anything written down
+/// there, so the old shape cleaned up after a *passing* run and left a failing one's rows for the
+/// re-run you are about to do while debugging. See [`DbCleanup`].
+fn clean_up(target: &Target, account_id: i64, slots: &[&str]) -> DbCleanup {
+    let mut cleanup = DbCleanup::new(target.url().expect("a connected database"));
+    cleanup.add(Cleanup::CoordinatorSlots(
+        slots.iter().map(|s| s.to_string()).collect(),
+    ));
+    cleanup.account(account_id);
+    cleanup
 }
 
 /// Block until the control plane stops believing `identity` is live — i.e. until its lease expires.
@@ -108,6 +106,7 @@ async fn a_dead_coordinators_queries_are_resolved() -> Result<()> {
     let account = db.create_account(&unique_name("reap-dead")).await?;
     let identity = CoordinatorIdentity::new(unique_name("reap-dead"));
     let slot = identity.slot().to_string();
+    let _cleanup = clean_up(&target, account.id, &[&slot]);
 
     let registration = CoordinatorRegistration::start(db.clone(), identity.clone(), RENEW).await?;
     let queued = db
@@ -214,7 +213,7 @@ async fn a_dead_coordinators_queries_are_resolved() -> Result<()> {
         "a second sweep must be a no-op: {second:?}"
     );
 
-    clean_up(&db, account.id, &[&slot]).await
+    Ok(())
 }
 
 /// The case a slot-only rule gets exactly backwards: a coordinator that died and was **replaced on
@@ -237,6 +236,7 @@ async fn a_replaced_coordinators_rows_are_reaped_though_its_slot_is_live() -> Re
     };
     let account = db.create_account(&unique_name("reap-restart")).await?;
     let slot = unique_name("reap-restart");
+    let _cleanup = clean_up(&target, account.id, &[&slot]);
 
     // The process that dies, with a query in flight.
     let first = CoordinatorIdentity::new(&slot);
@@ -289,7 +289,7 @@ async fn a_replaced_coordinators_rows_are_reaped_though_its_slot_is_live() -> Re
     );
 
     second_registration.shut_down().await;
-    clean_up(&db, account.id, &[&slot]).await
+    Ok(())
 }
 
 /// **The hazard, and the reason this issue is dangerous rather than fiddly.**
@@ -312,6 +312,7 @@ async fn a_live_coordinators_long_running_query_is_never_reaped() -> Result<()> 
     let account = db.create_account(&unique_name("reap-live")).await?;
     let identity = CoordinatorIdentity::new(unique_name("reap-live"));
     let slot = identity.slot().to_string();
+    let _cleanup = clean_up(&target, account.id, &[&slot]);
 
     let registration = CoordinatorRegistration::start(db.clone(), identity.clone(), RENEW).await?;
     let long = db
@@ -385,7 +386,7 @@ async fn a_live_coordinators_long_running_query_is_never_reaped() -> Result<()> 
         "a terminal row is never eligible, whatever happened to its coordinator"
     );
 
-    clean_up(&db, account.id, &[&slot]).await
+    Ok(())
 }
 
 /// The second-writer problem, in both orderings.
@@ -409,6 +410,7 @@ async fn a_reaper_never_clobbers_a_terminal_state() -> Result<()> {
     let account = db.create_account(&unique_name("reap-race")).await?;
     let identity = CoordinatorIdentity::new(unique_name("reap-race"));
     let slot = identity.slot().to_string();
+    let _cleanup = clean_up(&target, account.id, &[&slot]);
 
     // A coordinator that is registered and then killed: every row below is genuinely reapable, so
     // nothing in this test passes because the sweep had nothing to do.
@@ -539,7 +541,7 @@ async fn a_reaper_never_clobbers_a_terminal_state() -> Result<()> {
         assert_eq!(row.result_rows, Some(1), "round {round}: {row:?}");
     }
 
-    clean_up(&db, account.id, &[&slot]).await
+    Ok(())
 }
 
 /// Why the bug matters: the instrument, before and after.
@@ -562,6 +564,7 @@ async fn peak_concurrency_over_reaped_history_reports_the_true_bound() -> Result
     let account = db.create_account(&unique_name("reap-peak")).await?;
     let dead = CoordinatorIdentity::new(unique_name("reap-peak-dead"));
     let live = CoordinatorIdentity::new(unique_name("reap-peak-live"));
+    let _cleanup = clean_up(&target, account.id, &[dead.slot(), live.slot()]);
 
     let doomed = CoordinatorRegistration::start(db.clone(), dead.clone(), RENEW).await?;
     let stranded = db
@@ -607,7 +610,7 @@ async fn peak_concurrency_over_reaped_history_reports_the_true_bound() -> Result
     assert_eq!(after.len(), 4);
 
     healthy.shut_down().await;
-    clean_up(&db, account.id, &[dead.slot(), live.slot()]).await
+    Ok(())
 }
 
 /// The honest limit, asserted so nobody has to take it on trust.
@@ -625,6 +628,7 @@ async fn a_row_whose_writer_cannot_be_judged_is_never_reaped() -> Result<()> {
         return Ok(());
     };
     let account = db.create_account(&unique_name("reap-unknown")).await?;
+    let _cleanup = clean_up(&target, account.id, &[]);
 
     // No coordinator at all: `submit_query(.., None)` is what an embedding with no registration
     // writes, and there has never been a `coordinators` row to judge it by.
@@ -669,5 +673,5 @@ async fn a_row_whose_writer_cannot_be_judged_is_never_reaped() -> Result<()> {
         QueryState::Queued
     );
 
-    clean_up(&db, account.id, &[]).await
+    Ok(())
 }

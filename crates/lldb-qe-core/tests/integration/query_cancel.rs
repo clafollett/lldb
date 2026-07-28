@@ -63,7 +63,7 @@ use tokio::sync::watch;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::support::{resolve_target, unique_name};
+use crate::support::{self, DbCleanup, Servers, resolve_target, unique_name};
 
 /// One slot, so "the queue advanced" is a fact about one permit rather than a statistic.
 const WAREHOUSE_SIZE: i32 = 1;
@@ -77,7 +77,11 @@ const WAREHOUSE_SIZE: i32 = 1;
 const PATIENCE: Duration = Duration::from_secs(60);
 
 /// Skip-or-connect, shared by every test in this file.
-async fn db_or_skip(what: &str) -> Result<Option<ServicesDb>> {
+///
+/// The [`support::Target`] comes back with the connection rather than being dropped here: under
+/// `LLDB_DOCKER=1` it *owns* the throwaway container, so dropping it would remove the database the
+/// caller is about to use. Its URL is also what a caller's [`DbCleanup`] connects with.
+async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
         eprintln!(
@@ -88,7 +92,7 @@ async fn db_or_skip(what: &str) -> Result<Option<ServicesDb>> {
     };
     let db = ServicesDb::connect(url).await?;
     db.migrate().await.context("applying migrations")?;
-    Ok(Some(db))
+    Ok(Some((db, target)))
 }
 
 // ---------------------------------------------------------------------------
@@ -215,6 +219,20 @@ struct Harness {
     /// Opens the worker's gate. Held for the life of the harness.
     release: watch::Sender<bool>,
     arrived: Arc<AtomicUsize>,
+    /// The coordinator and the gated worker. Declared before `_cleanup` so they stop before the
+    /// rows they write to are deleted; see [`Servers`].
+    _servers: Servers,
+    /// The account, deleted on the way out however the test ended — see [`DbCleanup`].
+    _cleanup: DbCleanup,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        // Whatever is still parked on the worker is released, so no test leaves a task wedged in a
+        // shared binary. In `Drop` rather than at the end of a body for `DbCleanup`'s reason: a
+        // failing assertion is exactly when something is most likely to still be parked.
+        self.release.send_replace(true);
+    }
 }
 
 impl Harness {
@@ -224,9 +242,14 @@ impl Harness {
     /// The workload is `SELECT <n>` — no table, therefore no `SELECT` grant and no parquet to seed.
     /// That is not a shortcut around access control: it keeps this file's subject *cancellation*,
     /// and the grant that is actually under test here (`CANCEL`) is issued and revoked below.
-    async fn start(db: ServicesDb, tag: &str) -> Result<Self> {
+    async fn start(db: ServicesDb, url: &str, tag: &str) -> Result<Self> {
         let account = db.create_account(&unique_name(tag)).await?;
         let warehouse_name = unique_name(&format!("wh-{tag}"));
+
+        // Registered before anything else can fail, so an error or a panic anywhere below still
+        // takes this account — and everything the schema cascades from it — with it.
+        let mut cleanup = DbCleanup::new(url);
+        cleanup.account(account.id);
 
         let user = db.create_user(account.id, "cancel-test").await?;
         let role = db.create_role(account.id, "cancel-test").await?;
@@ -258,7 +281,8 @@ impl Harness {
 
         let (release, open) = watch::channel(false);
         let arrived = Arc::new(AtomicUsize::new(0));
-        let worker = start_gated_worker(open, Arc::clone(&arrived)).await?;
+        let mut servers = Servers::new();
+        let worker = start_gated_worker(&mut servers, open, Arc::clone(&arrived)).await?;
         let authority = format!("{warehouse_name}.lldb.local:50051");
         let resolver = cloud_map(authority, vec![worker]);
 
@@ -283,7 +307,7 @@ impl Harness {
         );
 
         let serving = Arc::clone(&coordinator);
-        tokio::spawn(async move {
+        servers.spawn(async move {
             serve_coordinator(listener, serving, std::future::pending::<()>())
                 .await
                 .expect("coordinator serve");
@@ -300,6 +324,8 @@ impl Harness {
             token,
             release,
             arrived,
+            _servers: servers,
+            _cleanup: cleanup,
         })
     }
 
@@ -384,22 +410,11 @@ impl Harness {
     fn open_the_gate(&self) {
         self.release.send_replace(true);
     }
-
-    async fn cleanup(&self) -> Result<()> {
-        // Whatever is still parked on the worker is released first, so no test leaves a task
-        // wedged in a shared binary.
-        self.open_the_gate();
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(self.account_id)
-            .execute(self.db.pool())
-            .await
-            .context("deleting the test account")?;
-        Ok(())
-    }
 }
 
 /// Start a [`GatedWorker`] on an ephemeral port and return its address.
 async fn start_gated_worker(
+    servers: &mut Servers,
     open: watch::Receiver<bool>,
     arrived: Arc<AtomicUsize>,
 ) -> Result<SocketAddr> {
@@ -410,7 +425,7 @@ async fn start_gated_worker(
         open,
         arrived,
     };
-    tokio::spawn(async move {
+    servers.spawn(async move {
         Server::builder()
             .add_service(FlightServiceServer::new(worker))
             .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
@@ -439,13 +454,16 @@ fn cloud_map(authority: String, addrs: Vec<SocketAddr>) -> BoxResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_running_query_returns_its_slot_and_the_queue_advances() -> Result<()> {
-    let Some(db) = db_or_skip("cancellation").await? else {
+    let Some((db, target)) = db_or_skip("cancellation").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "cancel").await?;
-    let result = cancellation_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness releases the gate and deletes its rows in `Drop`, so a
+    // failing assertion below still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "cancel").await?;
+    cancellation_body(&harness).await
 }
 
 async fn cancellation_body(harness: &Harness) -> Result<()> {
@@ -629,17 +647,17 @@ async fn cancellation_body(harness: &Harness) -> Result<()> {
 /// neither the other account nor its user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_cannot_cancel_another_accounts_query() -> Result<()> {
-    let Some(db) = db_or_skip("cross-account cancellation").await? else {
+    let Some((db, target)) = db_or_skip("cross-account cancellation").await? else {
         return Ok(());
     };
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
     // Two tenants, two coordinators — but the *cancel* is sent to the coordinator that is running
     // the victim, so the only thing standing between the two is the credential.
-    let victim = Harness::start(db.clone(), "victim").await?;
-    let attacker = Harness::start(db, "attacker").await?;
-    let result = cross_account_body(&victim, &attacker).await;
-    victim.cleanup().await?;
-    attacker.cleanup().await?;
-    result
+    let victim = Harness::start(db.clone(), url, "victim").await?;
+    let attacker = Harness::start(db, url, "attacker").await?;
+    cross_account_body(&victim, &attacker).await
 }
 
 async fn cross_account_body(victim: &Harness, attacker: &Harness) -> Result<()> {
@@ -706,13 +724,14 @@ async fn cross_account_body(victim: &Harness, attacker: &Harness) -> Result<()> 
 /// has already proven which tenant they are and naming the missing grant leaks nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_needs_the_cancel_grant_and_usage_is_not_enough() -> Result<()> {
-    let Some(db) = db_or_skip("the cancel grant").await? else {
+    let Some((db, target)) = db_or_skip("the cancel grant").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "grant").await?;
-    let result = grant_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    let harness = Harness::start(db, url, "grant").await?;
+    grant_body(&harness).await
 }
 
 async fn grant_body(harness: &Harness) -> Result<()> {
@@ -794,16 +813,16 @@ async fn grant_body(harness: &Harness) -> Result<()> {
 /// settles deterministically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_query_is_never_reaped() -> Result<()> {
-    let Some(db) = db_or_skip("the reaper interaction").await? else {
+    let Some((db, target)) = db_or_skip("the reaper interaction").await? else {
         return Ok(());
     };
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
     let account = db.create_account(&unique_name("reap-cancel")).await?;
-    let result = reaper_body(&db, account.id).await;
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(account.id)
-        .execute(db.pool())
-        .await?;
-    result
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(account.id);
+    reaper_body(&db, account.id).await
 }
 
 async fn reaper_body(db: &ServicesDb, account_id: i64) -> Result<()> {
@@ -856,13 +875,14 @@ async fn reaper_body(db: &ServicesDb, account_id: i64) -> Result<()> {
 /// this repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_coordinator_advertises_the_cancel_action() -> Result<()> {
-    let Some(db) = db_or_skip("action discovery").await? else {
+    let Some((db, target)) = db_or_skip("action discovery").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "actions").await?;
-    let result = actions_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    let harness = Harness::start(db, url, "actions").await?;
+    actions_body(&harness).await
 }
 
 async fn actions_body(harness: &Harness) -> Result<()> {

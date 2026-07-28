@@ -40,7 +40,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::support::{self, resolve_target, unique_name};
+use crate::support::{self, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use arrow_flight::Ticket;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -108,12 +108,16 @@ fn seed_tables(dir: &Path) -> Result<()> {
 
 /// Start `count` in-process workers with the ambient (open) fleet credential — the worker boundary
 /// gets its own test below; here the subject is the *coordinator's* front door.
-async fn start_workers(count: usize) -> Result<Vec<SocketAddr>> {
+///
+/// The handles go into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_workers(servers: &mut Servers, count: usize) -> Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(count);
     for _ in 0..count {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(async move {
+        servers.spawn(async move {
             flight::serve_worker(listener, SessionContext::new())
                 .await
                 .expect("worker serve");
@@ -153,21 +157,33 @@ struct Harness {
     url: String,
     a: Tenant,
     b: Tenant,
+    /// The coordinator and the workers behind it. Declared before `_cleanup` so they are aborted
+    /// before the rows they might still be writing to are deleted; see [`Servers`].
+    _servers: Servers,
+    /// Both accounts, deleted on the way out — including when an assertion panicked, which is the
+    /// whole reason this is a field and not a `cleanup()` call at the end of each body. See
+    /// [`DbCleanup`].
+    _cleanup: DbCleanup,
     _tmp: tempfile::TempDir,
 }
 
 impl Harness {
-    async fn start(db: ServicesDb) -> Result<Self> {
+    async fn start(db: ServicesDb, url: &str) -> Result<Self> {
         let tmp = tempfile::tempdir()?;
         seed_tables(tmp.path())?;
 
         let a = provision(&db, "acct-a").await?;
         let b = provision(&db, "acct-b").await?;
 
+        let mut cleanup = DbCleanup::new(url);
+        cleanup.account(a.account_id);
+        cleanup.account(b.account_id);
+
         // One fleet behind both warehouses. Deliberate: if isolation depended on the two tenants
         // resolving to *different* workers, this test would prove nothing about access control.
         // They share compute, and are still kept apart.
-        let workers = start_workers(WAREHOUSE_SIZE as usize).await?;
+        let mut servers = Servers::new();
+        let workers = start_workers(&mut servers, WAREHOUSE_SIZE as usize).await?;
         let resolver = cloud_map(
             vec![
                 format!("{}.lldb.local:50051", a.warehouse),
@@ -220,7 +236,7 @@ impl Harness {
             "a coordinator with a services database must require a credential"
         );
 
-        tokio::spawn(async move {
+        servers.spawn(async move {
             serve_coordinator(listener, coordinator, std::future::pending::<()>())
                 .await
                 .expect("coordinator serve");
@@ -231,20 +247,10 @@ impl Harness {
             url: format!("http://{addr}"),
             a,
             b,
+            _servers: servers,
+            _cleanup: cleanup,
             _tmp: tmp,
         })
-    }
-
-    /// Delete both accounts, which cascades to users, keys, roles, grants, warehouses and history.
-    async fn cleanup(&self) -> Result<()> {
-        for id in [self.a.account_id, self.b.account_id] {
-            sqlx::query("DELETE FROM accounts WHERE id = $1")
-                .bind(id)
-                .execute(self.db.pool())
-                .await
-                .context("deleting a test account")?;
-        }
-        Ok(())
     }
 }
 
@@ -366,13 +372,16 @@ fn scalar(batches: &[RecordBatch]) -> Result<i64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unauthenticated_is_rejected_and_authenticated_is_scoped_to_its_account() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("authentication").await? else {
+    let Some((db, target)) = db_or_skip("authentication").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db).await?;
-    let result = authentication_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body below still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url).await?;
+    authentication_body(&harness).await
 }
 
 async fn authentication_body(harness: &Harness) -> Result<()> {
@@ -506,13 +515,14 @@ async fn authentication_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_role_without_select_cannot_query_until_the_grant_is_added() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("grants").await? else {
+    let Some((db, target)) = db_or_skip("grants").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db).await?;
-    let result = grant_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    let harness = Harness::start(db, url).await?;
+    grant_body(&harness).await
 }
 
 async fn grant_body(harness: &Harness) -> Result<()> {
@@ -650,13 +660,14 @@ async fn grant_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_accounts_cannot_see_or_query_each_others_objects() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("tenant isolation").await? else {
+    let Some((db, target)) = db_or_skip("tenant isolation").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db).await?;
-    let result = isolation_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    let harness = Harness::start(db, url).await?;
+    isolation_body(&harness).await
 }
 
 async fn isolation_body(harness: &Harness) -> Result<()> {
@@ -830,7 +841,8 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let serving = secret.clone();
-    tokio::spawn(async move {
+    let mut servers = Servers::new();
+    servers.spawn(async move {
         flight::serve_worker_with_auth(
             listener,
             SessionContext::new(),
@@ -942,7 +954,8 @@ async fn a_malformed_credential_is_refused_even_when_anonymous_is_allowed() -> R
         !coordinator.requires_authentication(),
         "the flag is the whole point of this test"
     );
-    tokio::spawn(async move {
+    let mut servers = Servers::new();
+    servers.spawn(async move {
         serve_coordinator(listener, coordinator, std::future::pending::<()>())
             .await
             .expect("coordinator serve");

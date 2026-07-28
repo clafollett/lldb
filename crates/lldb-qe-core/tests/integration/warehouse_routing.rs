@@ -43,6 +43,8 @@ use lldb_qe_core::{
 };
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 /// A warehouse row as the services database would hand it back, without needing one.
 fn warehouse(name: &str, size: i32, state: WarehouseState) -> Warehouse {
     let now = Utc::now();
@@ -59,12 +61,16 @@ fn warehouse(name: &str, size: i32, state: WarehouseState) -> Warehouse {
 
 /// Start `count` in-process workers and return their `SocketAddr`s — the stand-ins for a
 /// warehouse's ECS tasks.
-async fn start_warehouse_tasks(count: usize) -> Result<Vec<SocketAddr>> {
+///
+/// The handles go into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_warehouse_tasks(servers: &mut Servers, count: usize) -> Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(count);
     for _ in 0..count {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(async move {
+        servers.spawn(async move {
             flight::serve_worker(listener, SessionContext::new())
                 .await
                 .expect("worker serve");
@@ -157,8 +163,9 @@ async fn two_warehouses_of_different_sizes_run_independently() -> Result<()> {
 
     let small = warehouse("wh-small", 1, WarehouseState::Running);
     let large = warehouse("wh-large", 3, WarehouseState::Running);
-    let small_tasks = start_warehouse_tasks(small.size as usize).await?;
-    let large_tasks = start_warehouse_tasks(large.size as usize).await?;
+    let mut servers = Servers::new();
+    let small_tasks = start_warehouse_tasks(&mut servers, small.size as usize).await?;
+    let large_tasks = start_warehouse_tasks(&mut servers, large.size as usize).await?;
     let resolve = cloud_map(vec![
         (authority(&small.name), small_tasks.clone()),
         (authority(&large.name), large_tasks.clone()),
@@ -229,7 +236,8 @@ async fn resizing_a_warehouse_changes_the_observed_parallelism() -> Result<()> {
     let name = "wh-elastic";
     // Four tasks exist; the warehouse's size decides how many of them are registered under its
     // name at any moment, exactly as an ECS `desiredCount` does.
-    let tasks = start_warehouse_tasks(4).await?;
+    let mut servers = Servers::new();
+    let tasks = start_warehouse_tasks(&mut servers, 4).await?;
 
     let ctx = distributing_ctx();
     ctx.register_parquet(
@@ -298,7 +306,8 @@ async fn a_query_never_resolves_a_warehouse_it_was_not_routed_to() -> Result<()>
     // warehouse `b`'s registration. With one name per warehouse that is structural, and this
     // pins it — a regression that dropped the name from the template would show up here as a
     // successful resolution instead of an error.
-    let tasks = start_warehouse_tasks(1).await?;
+    let mut servers = Servers::new();
+    let tasks = start_warehouse_tasks(&mut servers, 1).await?;
     let resolve = cloud_map(vec![(authority("wh-registered"), tasks)]);
 
     let stranger = warehouse("wh-unregistered", 2, WarehouseState::Running);

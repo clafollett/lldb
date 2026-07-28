@@ -82,7 +82,7 @@ use lldb_qe_core::{
 
 use crate::auth_rbac::{Tenant, cloud_map, db_or_skip, provision, status_of};
 use crate::result_cache_db::{NS, insert_rows, manifest};
-use crate::support::unique_name;
+use crate::support::{Cleanup, DbCleanup, Servers, unique_name};
 
 /// Workers behind the tenant's warehouse. More than one so "the fleet" is not a euphemism for "a
 /// worker"; the warehouse row is resized to match so the size/fleet mismatch warning stays quiet.
@@ -96,41 +96,34 @@ const WORKERS: usize = 2;
 struct Fleet {
     addrs: Vec<SocketAddr>,
     caches: Vec<Arc<StageCache>>,
-    servers: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        for server in &self.servers {
-            server.abort();
-        }
-    }
+    /// The workers themselves, stopped when this fleet is dropped — see [`Servers`].
+    _servers: Servers,
 }
 
 impl Fleet {
     async fn start() -> Result<Self> {
         let mut addrs = Vec::with_capacity(WORKERS);
         let mut caches = Vec::with_capacity(WORKERS);
-        let mut servers = Vec::with_capacity(WORKERS);
+        let mut servers = Servers::new();
         for _ in 0..WORKERS {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             addrs.push(listener.local_addr()?);
             let cache = Arc::new(StageCache::new());
             let served = Arc::clone(&cache);
-            servers.push(tokio::spawn(async move {
+            servers.spawn(async move {
                 // A bare `SessionContext`: no catalog, no credential, no warehouse path. A worker
                 // reads only what the plan names, which for a resolved Iceberg scan is the data
                 // files the coordinator pinned into it.
                 serve_worker_with_cache(listener, SessionContext::new(), served)
                     .await
                     .expect("worker serve");
-            }));
+            });
             caches.push(cache);
         }
         Ok(Self {
             addrs,
             caches,
-            servers,
+            _servers: servers,
         })
     }
 
@@ -162,25 +155,15 @@ struct Harness {
     /// spells and what the grant is written against; under [`TenantScope::account`] it is the same
     /// word for every tenant.
     catalog: String,
-    /// The catalog name **storage** uses — `acct_<id>__<declared>`, the `iceberg_tables` row
-    /// discriminator. Only cleanup wants this one; asking for it by any other name would delete
-    /// nothing and leave this run's rows behind.
-    iceberg_catalog: String,
     coordinator: Arc<Coordinator>,
     /// The coordinator's Flight server, retained for the same reason [`Fleet`] retains its
-    /// workers': dropping a `JoinHandle` detaches the task rather than stopping it, so a coordinator
-    /// spawned with a `pending()` shutdown would hold its listening socket for the rest of the
-    /// process. Since #44 that process is the whole `integration` binary — one test's leaked
-    /// listener now outlives its test and accumulates across every test that follows.
-    server: tokio::task::JoinHandle<()>,
+    /// workers' — see [`Servers`].
+    _server: Servers,
     fleet: Fleet,
+    /// The account and the run's `iceberg_tables` rows, deleted on the way out whether the body
+    /// below passed or panicked. See [`DbCleanup`].
+    _cleanup: DbCleanup,
     _warehouse: tempfile::TempDir,
-}
-
-impl Drop for Harness {
-    fn drop(&mut self) {
-        self.server.abort();
-    }
 }
 
 impl Harness {
@@ -194,25 +177,6 @@ impl Harness {
 
     fn request(&self, sql: &str) -> QueryRequest {
         QueryRequest::new(sql.to_string()).on_warehouse(self.tenant.warehouse.clone())
-    }
-
-    /// Delete this run's rows: the account cascades to users, keys, roles, grants, warehouses,
-    /// history and cached results, and the Iceberg catalog's own tables are cleaned by name because
-    /// they may be shared with a real catalog on this database.
-    async fn cleanup(&self) -> Result<()> {
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(self.tenant.account_id)
-            .execute(self.db.pool())
-            .await
-            .context("deleting the test account")?;
-        for table in ["iceberg_tables", "iceberg_namespace_properties"] {
-            sqlx::query(&format!("DELETE FROM {table} WHERE catalog_name = $1"))
-                .bind(&self.iceberg_catalog)
-                .execute(self.db.pool())
-                .await
-                .with_context(|| format!("cleaning up {table}"))?;
-        }
-        Ok(())
     }
 }
 
@@ -235,10 +199,10 @@ async fn a_revoked_grant_refuses_a_query_whose_answer_is_already_cached() -> Res
         .url()
         .expect("db_or_skip only returns a connected database")
         .to_string();
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // `ordering_body` still cleans up after itself. See `support::DbCleanup`.
     let harness = start(db, &url).await?;
-    let result = ordering_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    ordering_body(&harness).await
 }
 
 async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
@@ -329,21 +293,33 @@ async fn start(db: ServicesDb, url: &str) -> Result<Harness> {
     );
 
     let served = Arc::clone(&coordinator);
-    let server = tokio::spawn(async move {
+    let mut server = Servers::new();
+    server.spawn(async move {
         serve_coordinator(listener, served, std::future::pending::<()>())
             .await
             .expect("coordinator serve");
     });
 
+    // The account cascades to users, keys, roles, grants, warehouses, history and cached results.
+    // The Iceberg catalog's own tables are named separately because `iceberg-catalog-sql` owns them
+    // and they may be shared with a real catalog on this database — and by the **storage** name,
+    // `acct_<id>__<declared>`, which is the discriminator those rows actually carry. Asking by the
+    // declared name would delete nothing and leave this run's rows behind.
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(tenant.account_id);
+    cleanup.add(Cleanup::IcebergCatalog(
+        scope.iceberg_catalog_name(&catalog),
+    ));
+
     Ok(Harness {
         db,
         url: format!("http://{addr}"),
         tenant,
-        iceberg_catalog: scope.iceberg_catalog_name(&catalog),
         catalog,
         coordinator,
-        server,
+        _server: server,
         fleet,
+        _cleanup: cleanup,
         _warehouse: warehouse,
     })
 }

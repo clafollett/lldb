@@ -55,6 +55,8 @@ use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Code, Request, Response, Status, Streaming};
 
+use crate::support::Servers;
+
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
 
 /// A Flight worker that never serves anything: it counts every `do_get` and answers with the status
@@ -141,10 +143,14 @@ impl FlightService for FaultyWorker {
 }
 
 /// Start a real, healthy in-process worker on a random `127.0.0.1` port.
-async fn start_worker() -> anyhow::Result<String> {
+///
+/// The handle goes into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_worker(servers: &mut Servers) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    servers.spawn(async move {
         flight::serve_worker(listener, SessionContext::new())
             .await
             .expect("worker serve");
@@ -154,7 +160,10 @@ async fn start_worker() -> anyhow::Result<String> {
 
 /// Start a worker that accepts connections and then fails every `do_get` with `code`. Returns its
 /// URL and the request counter.
-async fn start_faulty_worker(code: Code) -> anyhow::Result<(String, Arc<AtomicUsize>)> {
+async fn start_faulty_worker(
+    servers: &mut Servers,
+    code: Code,
+) -> anyhow::Result<(String, Arc<AtomicUsize>)> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
     let requests = Arc::new(AtomicUsize::new(0));
@@ -162,7 +171,7 @@ async fn start_faulty_worker(code: Code) -> anyhow::Result<(String, Arc<AtomicUs
         requests: Arc::clone(&requests),
         code,
     };
-    tokio::spawn(async move {
+    servers.spawn(async move {
         Server::builder()
             .add_service(FlightServiceServer::new(service))
             .serve_with_incoming(TcpListenerStream::new(listener))
@@ -275,10 +284,11 @@ async fn a_stage_whose_primary_is_gone_is_reassigned_and_the_answer_is_correct()
 
     // The middle worker is a port nothing listens on: its slice's pull is refused at connect time,
     // and its fallbacks (the rest of the fleet, rotated) are healthy.
+    let mut servers = Servers::new();
     let fleet = vec![
-        start_worker().await?,
+        start_worker(&mut servers).await?,
         dead_worker().await?,
-        start_worker().await?,
+        start_worker(&mut servers).await?,
     ];
 
     let distributed = run_distributed(&ctx, &fleet).await?;
@@ -307,8 +317,13 @@ async fn a_worker_that_fails_mid_rpc_is_reassigned_and_the_answer_is_correct() -
 
     // `UNAVAILABLE` from a worker that *did* accept the connection: the shape of a task that died
     // or drained while serving, rather than one that was never there.
-    let (faulty, requests) = start_faulty_worker(Code::Unavailable).await?;
-    let fleet = vec![start_worker().await?, faulty, start_worker().await?];
+    let mut servers = Servers::new();
+    let (faulty, requests) = start_faulty_worker(&mut servers, Code::Unavailable).await?;
+    let fleet = vec![
+        start_worker(&mut servers).await?,
+        faulty,
+        start_worker(&mut servers).await?,
+    ];
 
     let distributed = run_distributed(&ctx, &fleet).await?;
 
@@ -337,8 +352,13 @@ async fn a_fatal_error_is_surfaced_immediately_not_replayed_across_the_fleet() -
     // a plan that will not deserialize. Every worker runs the identical build, so every worker would
     // answer identically: retrying would turn one clear bug into a fleet-wide load spike and bury
     // the cause under a target-exhaustion message.
-    let (faulty, requests) = start_faulty_worker(Code::InvalidArgument).await?;
-    let fleet = vec![start_worker().await?, faulty.clone(), start_worker().await?];
+    let mut servers = Servers::new();
+    let (faulty, requests) = start_faulty_worker(&mut servers, Code::InvalidArgument).await?;
+    let fleet = vec![
+        start_worker(&mut servers).await?,
+        faulty.clone(),
+        start_worker(&mut servers).await?,
+    ];
 
     let plan = ctx.sql(SQL).await?.create_physical_plan().await?;
     let dist = plan_distributed(plan, &fleet)?;

@@ -15,7 +15,7 @@
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration services_db
 //!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration services_db -- --nocapture
 
-use crate::support::{resolve_target, unique_name};
+use crate::support::{DbCleanup, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use lldb_qe_core::services::ServicesDb;
 
@@ -61,6 +61,12 @@ async fn services_database_migrates_and_scopes_a_warehouse() -> Result<()> {
     // ---- Accounts --------------------------------------------------------------------------
     let name = unique_account_name("acct");
     let created = db.create_account(&name).await?;
+    // Registered now, not deleted at the end: an assertion failing anywhere below unwinds past any
+    // cleanup written down there, and would leave this account behind for the re-run. See
+    // `support::DbCleanup`. It is idempotent, so the explicit delete further down — which is an
+    // assertion about the cascade, not just tidying — still stands.
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(created.id);
     assert_eq!(created.name, name);
     assert!(created.id > 0, "identity column produced {}", created.id);
 
@@ -134,7 +140,7 @@ async fn services_database_migrates_and_scopes_a_warehouse() -> Result<()> {
         "a warehouse must not be creatable under a nonexistent account"
     );
 
-    // ---- Cleanup, which is also the cascade assertion ---------------------------------------
+    // ---- The cascade, asserted (and not only cleanup) ---------------------------------------
     sqlx::query("DELETE FROM accounts WHERE id = $1")
         .bind(created.id)
         .execute(db.pool())
