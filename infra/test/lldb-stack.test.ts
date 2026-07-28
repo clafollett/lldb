@@ -428,6 +428,35 @@ describe('services database', () => {
   });
 });
 
+describe('transport security', () => {
+  // Issue #33 ships TLS in the engine and a KNOWN GAP in this stack: certificates are mounted
+  // files, and Fargate has no first-class way to mount a Secrets Manager value, so provisioning
+  // them is its own piece of work (see the comment above the warehouse loop in lldb-stack.ts).
+  //
+  // These two assertions pin the shape of that gap so it stays honest. It is deliberately *not*
+  // asserted that TLS is off forever — the day certificates land, the first test changes and the
+  // second should still hold.
+  test('no TLS certificates are configured yet, and none are faked', () => {
+    for (const container of containers(synth())) {
+      const env = Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
+      expect(env.LLDB_TLS_CERT).toBeUndefined();
+      expect(env.LLDB_TLS_KEY).toBeUndefined();
+    }
+  });
+
+  test('the stack never pre-emptively opts out of the plaintext guard', () => {
+    // `LLDB_ALLOW_PLAINTEXT` is what lets a process serve a plaintext port while checking a
+    // credential. Nothing here checks one today, so setting it would buy nothing — and would
+    // silently disarm the guard for whoever later sets LLDB_FLEET_TOKEN (issue #19's gap) and would
+    // otherwise have been stopped. If a future change needs it, it should be an explicit line in
+    // the stack and an explicit edit to this test, not an inheritance.
+    for (const container of containers(synth())) {
+      const env = Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
+      expect(env.LLDB_ALLOW_PLAINTEXT).toBeUndefined();
+    }
+  });
+});
+
 describe('cost posture', () => {
   test('warehouse traffic always rides the free S3 gateway endpoint', () => {
     // True in every egress mode: the per-GB-heavy traffic must never cross a NAT.

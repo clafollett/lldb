@@ -133,6 +133,23 @@ x-metadata-env: &metadata-env
 x-fleet-env: &fleet-env
   LLDB_FLEET_TOKEN: ${LLDB_FLEET_TOKEN:-compose-demo-fleet-secret}
 
+# Transport security (issue #33) — and this cluster deliberately has none.
+#
+# Every Flight port here is PLAINTEXT, so the fleet secret above and any API key you issue cross
+# this Docker network in the clear. That is fine for a laptop demo on a private bridge network and
+# it is *not* fine anywhere else, which is exactly why it has to be said out loud here rather than
+# happening by omission: a worker that requires LLDB_FLEET_TOKEN, and a query server that has a
+# services database, both REFUSE TO START on a plaintext port unless this variable says the
+# operator meant it. Delete it and the cluster stops coming up — that is the guard working.
+#
+# To run this cluster with TLS instead: mount a certificate, a key and the CA that signed them into
+# every container and set LLDB_TLS_CERT / LLDB_TLS_KEY / LLDB_TLS_CA to their paths (plus
+# LLDB_TLS_DOMAIN if the certificate's name is not the address dialed), change every `http://` in
+# the commands below to `https://`, and drop this. The engine reads certificates; it does not
+# generate them — see crates/lldb-qe-core/src/tls.rs for why that is deliberate.
+x-plaintext-env: &plaintext-env
+  LLDB_ALLOW_PLAINTEXT: "true"
+
 # How `--warehouse <name>` becomes an address here. Compose's DNS serves bare network aliases
 # with no namespace suffix, so the template has no `.lldb.local` — the CDK stack sets
 # `http://{warehouse}.lldb.local:50051` for the same flag. One template, two spellings of DNS.
@@ -290,7 +307,7 @@ services:
     # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
     # and the same metadata files — the coordinator planned against.
     environment:
-      <<: [*s3-env, *metadata-env, *fleet-env]
+      <<: [*s3-env, *metadata-env, *fleet-env, *plaintext-env]
     volumes:
       - warehouse:/var/lib/lldb/warehouse
     networks:
@@ -316,7 +333,7 @@ services:
     # #8, and the moment a worker resolves a table by name it must read the same catalog rows —
     # and the same metadata files — the coordinator planned against.
     environment:
-      <<: [*s3-env, *metadata-env, *fleet-env]
+      <<: [*s3-env, *metadata-env, *fleet-env, *plaintext-env]
     volumes:
       - warehouse:/var/lib/lldb/warehouse
     networks:
@@ -343,7 +360,7 @@ services:
     image: ${LLDB_IMAGE:-lldb:latest}
     command: ["lldb-qe-worker", "--bind", "0.0.0.0:50051"]
     environment:
-      <<: [*s3-env, *metadata-env, *fleet-env]
+      <<: [*s3-env, *metadata-env, *fleet-env, *plaintext-env]
     volumes:
       # Same shared Iceberg metadata as every other role. A warehouse is a separate pool of
       # *compute*, not of storage — the whole point is that `analytics` and `etl` read one
@@ -415,7 +432,7 @@ services:
     ports:
       - "50050:50050"
     environment:
-      <<: [*s3-env, *metadata-env, *warehouse-env, *fleet-env]
+      <<: [*s3-env, *metadata-env, *warehouse-env, *fleet-env, *plaintext-env]
     volumes:
       - ./manifests:/manifests:ro
       - warehouse:/var/lib/lldb/warehouse

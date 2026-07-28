@@ -107,8 +107,8 @@ use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
     CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, DmlOutcome, ResultCacheArgs, ServicesArgs,
-    StorageArgs, build_query_session, dml, execute_query_cached, init_tracing,
-    reject_inmemory_storage, resolve_fleet,
+    StorageArgs, TlsClientArgs, build_query_session, dml, execute_query_cached, init_tracing,
+    install_client_trust, reject_inmemory_storage, resolve_fleet,
 };
 
 #[derive(Debug, Parser)]
@@ -174,6 +174,13 @@ struct Cli {
 
     #[command(flatten)]
     result_cache: ResultCacheArgs,
+
+    /// This binary is a Flight **client** and nothing else — it binds no port — so it takes the
+    /// dialing half of the TLS surface and not the serving half. `--tls-cert` / `--tls-key` and
+    /// `--allow-plaintext` would have nothing to apply to here, and a flag that does nothing is
+    /// worse than a flag that is absent. See `lldb_qe_core::tls`.
+    #[command(flatten)]
+    tls: TlsClientArgs,
 }
 
 #[tokio::main]
@@ -184,6 +191,12 @@ async fn main() -> Result<()> {
         version = lldb_qe_core::BUILD_VERSION,
         "starting lldb-qe-coordinator"
     );
+
+    // What this process trusts when it dials a worker. Installed before anything dials, once, from
+    // this invocation's own flags — a worker dial is issued from inside a serialized plan and so
+    // can carry nothing per-call (see `lldb_qe_core::tls`). With no `--tls-ca` this is inert:
+    // `http://` worker URLs never consult it.
+    install_client_trust(cli.tls.to_trust()?);
 
     let config = cli.storage.to_config()?;
     // The coordinator always ships plans to a separate worker process. The in-memory object

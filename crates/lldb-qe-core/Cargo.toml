@@ -19,6 +19,7 @@ object_store.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
+rustls.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
@@ -47,6 +48,9 @@ tracing-subscriber.workspace = true
 # has no business on `ServicesDb`'s public API, so it needs sqlx/chrono in its own right.
 sqlx.workspace = true
 chrono.workspace = true
+# The TLS integration tests mint their own self-signed certificate; see the workspace manifest for
+# why that is a dev-dependency rather than a committed PEM.
+rcgen.workspace = true
 
 [[bench]]
 name = "tpch"

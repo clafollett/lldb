@@ -57,6 +57,23 @@
 //! What this proves is "you are part of this deployment", *not* "you are user X" — see
 //! [`crate::auth`] for the scope of that claim and for what per-request worker identity would take.
 //!
+//! # …and over what
+//!
+//! That secret used to cross the wire in the clear, which made it readable and replayable by
+//! anyone on the path. [`crate::tls`] is the answer: a worker serves TLS when it is given a
+//! certificate, and **refuses to bind a plaintext port at all when `LLDB_FLEET_TOKEN` is set and
+//! `--allow-plaintext` is not** — a checked credential on an unencrypted port has to be chosen, not
+//! defaulted into. A worker with no fleet token has no secret to leak and keeps binding plaintext
+//! with no configuration, which is what `cargo run -p lldb-qe-worker` depends on.
+//!
+//! The client half is ambient for exactly the reason the credential is, and the same argument
+//! applies verbatim: a [`FlightReaderExec`] is serialized into a plan, so nothing per-call can
+//! travel with it. [`crate::tls::dial`] reads this process's installed trust and encrypts iff the
+//! worker URL says `https://`.
+//!
+//! TLS is *server* authentication only. It does not tell a worker which fleet member is calling —
+//! `LLDB_FLEET_TOKEN` is still the only thing that does, and is deliberately untouched here.
+//!
 //! [`FlightReaderExec`]: crate::remote::FlightReaderExec
 //!
 //! Note: coordinator and worker MUST run the identical DataFusion build — serialized plans
@@ -81,12 +98,13 @@ use datafusion::prelude::SessionContext;
 use futures::{Stream, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, FleetAuth, bearer_header, bearer_token};
 use crate::retry::{Retriability, RetryPolicy, classify};
 use crate::stage_cache::{MaterializedStage, StageCache, stage_id_of};
+use crate::tls::ServerTls;
 
 /// Boxed tonic response stream.
 type TonicStream<T> = Pin<Box<dyn Stream<Item = Result<T, Status>> + Send + 'static>>;
@@ -255,9 +273,31 @@ pub async fn serve_worker_with_auth(
     cache: Arc<StageCache>,
     auth: FleetAuth,
 ) -> Result<()> {
+    serve_worker_with(listener, ctx, cache, auth, ServerTls::plaintext()).await
+}
+
+/// Like [`serve_worker_with_auth`] but also choosing what the port is served *over*.
+///
+/// The full-fidelity entry point, and the one `lldb-qe-worker` calls. Both postures — the
+/// credential and the transport — are logged from here rather than from the binary so that an
+/// in-process test worker and the real one report the identical two lines; a warning only one of
+/// them prints is a warning nobody can rely on.
+///
+/// Note the asymmetry, and that it is deliberate: `tls` says what this worker *serves*, while what
+/// it presents when it dials **another** worker (the worker-to-worker shuffle) comes from
+/// [`crate::tls::client_trust`], because that dial happens inside a plan that was serialized
+/// somewhere else. See [`crate::tls`].
+pub async fn serve_worker_with(
+    listener: TcpListener,
+    ctx: SessionContext,
+    cache: Arc<StageCache>,
+    auth: FleetAuth,
+    tls: ServerTls,
+) -> Result<()> {
     auth.log_posture();
+    tls.log_posture("worker");
     let service = FlightServiceServer::new(WorkerFlightService::new_with_auth(ctx, cache, auth));
-    Server::builder()
+    tls.configure(Server::builder())?
         .add_service(service)
         .serve_with_incoming(TcpListenerStream::new(listener))
         .await
@@ -590,11 +630,12 @@ pub async fn fetch_stream_with_auth(
         ticket: encode_ticket(stage_id, partition, &plan_bytes).into(),
     };
 
-    let channel = Channel::from_shared(worker_url.clone())
-        .with_context(|| format!("invalid worker url {worker_url}"))?
-        .connect()
+    // Encrypted iff the URL says `https://`, against this process's installed CA. There is no
+    // negotiation and no fallback: a downgrade a client can be talked into is not transport
+    // security. See [`crate::tls`].
+    let channel = crate::tls::dial(&worker_url)
         .await
-        .with_context(|| format!("connecting to worker {worker_url}"))?;
+        .with_context(|| format!("dialing worker {worker_url}"))?;
     let mut client = FlightServiceClient::new(channel);
 
     // The credential rides in the request metadata, never in the ticket: a ticket is hashed into a

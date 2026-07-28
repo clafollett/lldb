@@ -63,6 +63,10 @@
 //!    assertion the server can check, not an input it obeys.
 //! 3. Every object the query's logical plan touches is checked against the caller's grants before
 //!    the plan is staged, dispatched, or answered from the result cache. See [`crate::rbac`].
+//! 4. That credential travels inside TLS. A token on an unencrypted channel is a token anyone on
+//!    the path can read and replay indefinitely, so a coordinator that is *checking* credentials
+//!    (i.e. one with a services database) will not bind a plaintext port unless an operator
+//!    explicitly asks for one. See [`crate::tls`].
 //!
 //! **Whether authentication is enforced follows the services database**, because that is where
 //! accounts, users, keys and grants live. With no `--metadata-*` there is nothing to authenticate
@@ -91,12 +95,17 @@
 //!   detached submit — `do_action("submit")` returning a id, then `do_get` on a ticket naming it —
 //!   is expressible in Flight and would need a place to park results; it is not needed to serve
 //!   concurrent queries, so it is not here.
-//! - **No transport security.** The credential above crosses the wire in plaintext unless the
-//!   deployment terminates TLS in front of this port. A bearer token on an unencrypted channel is a
-//!   token anyone on the path can replay; tonic supports TLS and wiring it is a deployment
-//!   decision, not a code one, but nothing here forces it.
+//! - **No proof of *which* peer is calling.** Transport security is in place and is server
+//!   authenticated only: this port serves TLS when it is given a certificate, and **refuses to bind
+//!   a plaintext one at all** while a services database is configured unless `--allow-plaintext`
+//!   says so (see [`crate::tls`] for the rule and why it keys on that). So the bearer token above
+//!   is no longer readable or replayable by someone on the path — but nothing here verifies a
+//!   *client* certificate. mTLS, and the question of whether it should replace the worker
+//!   boundary's shared secret, is a separate decision and is not what this does; `LLDB_FLEET_TOKEN`
+//!   is untouched and is still the only thing proving fleet membership.
 //! - **No per-request identity at the worker boundary.** Workers authenticate the *fleet*, not the
-//!   user (see [`crate::auth`]). A compromised coordinator can still ask a worker for anything.
+//!   user (see [`crate::auth`]). A compromised coordinator can still ask a worker for anything, and
+//!   TLS does not change what claim a shared deployment secret makes.
 //! - **No cancellation of another coordinator's query, and none of the fleet's work.** A cancel is
 //!   answered by the process that is running the query and refused as "not running here" by any
 //!   other, and the workers executing its stages are not told (see [`crate::cancel`] for both, and
@@ -130,7 +139,7 @@ use datafusion::prelude::SessionContext;
 use futures::{Stream, TryStreamExt};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::{Channel, Server};
+use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, Principal, bearer_header, bearer_token};
@@ -147,6 +156,7 @@ use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
 use crate::scheduler::{Admission, AdmissionError, AdmissionLimits, DEFAULT_FLEET_KEY, Scheduler};
 use crate::services::ServicesDb;
+use crate::tls::ServerTls;
 use crate::warehouse::Warehouse;
 
 /// Boxed tonic response stream.
@@ -1432,8 +1442,29 @@ pub async fn serve_coordinator<F>(
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
+    serve_coordinator_with_tls(listener, coordinator, ServerTls::plaintext(), shutdown).await
+}
+
+/// [`serve_coordinator`], also choosing what the port is served *over*.
+///
+/// The entry point `lldb-qe-server` calls. Whether `tls` may be
+/// [`ServerTls::Plaintext`](crate::tls::ServerTls::Plaintext) at all is decided before we get here,
+/// by [`crate::tls::TlsArgs::resolve_server`] — a coordinator with a services database is checking
+/// bearer tokens, and a plaintext port under that condition has to be asked for. The posture is
+/// logged from in here, next to the credential posture, so every process that serves this port
+/// reports both the same way.
+pub async fn serve_coordinator_with_tls<F>(
+    listener: TcpListener,
+    coordinator: Arc<Coordinator>,
+    tls: ServerTls,
+    shutdown: F,
+) -> Result<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    tls.log_posture("coordinator");
     let service = FlightServiceServer::new(CoordinatorFlightService::new(Arc::clone(&coordinator)));
-    Server::builder()
+    tls.configure(Server::builder())?
         .add_service(service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async move {
             shutdown.await;
@@ -1645,11 +1676,12 @@ pub async fn submit_query_as(
     request: &QueryRequest,
     token: Option<&str>,
 ) -> Result<SubmittedQuery> {
-    let channel = Channel::from_shared(server_url.to_string())
-        .with_context(|| format!("invalid coordinator url {server_url}"))?
-        .connect()
+    // TLS iff `server_url` says `https://`, verified against this process's installed CA. A client
+    // that wants an encrypted submission asks for one by URL; there is no negotiation, and a
+    // coordinator serving TLS refuses a plaintext client rather than obliging it.
+    let channel = crate::tls::dial(server_url)
         .await
-        .with_context(|| format!("connecting to coordinator {server_url}"))?;
+        .with_context(|| format!("dialing coordinator {server_url}"))?;
     let mut client = FlightServiceClient::new(channel);
 
     let mut grpc_request = Request::new(Ticket {
@@ -1695,11 +1727,9 @@ pub async fn submit_query_as(
 /// reaches `cancelled` — the terminal write happens as the query's own task unwinds. A caller that
 /// needs to observe the end state polls [`ServicesDb::query_by_id`](crate::services::ServicesDb).
 pub async fn cancel_query(server_url: &str, query_id: i64, token: Option<&str>) -> Result<()> {
-    let channel = Channel::from_shared(server_url.to_string())
-        .with_context(|| format!("invalid coordinator url {server_url}"))?
-        .connect()
+    let channel = crate::tls::dial(server_url)
         .await
-        .with_context(|| format!("connecting to coordinator {server_url}"))?;
+        .with_context(|| format!("dialing coordinator {server_url}"))?;
     let mut client = FlightServiceClient::new(channel);
 
     let mut grpc_request = Request::new(Action {
