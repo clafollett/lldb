@@ -52,6 +52,7 @@ use anyhow::{Context, Result};
 use datafusion::arrow::array::Int64Array;
 use datafusion::prelude::SessionContext;
 use lldb_qe_core::engine::TenantSessions;
+use lldb_qe_core::liveness::CoordinatorIdentity;
 use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
 use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig};
 use lldb_qe_core::server::{
@@ -294,7 +295,7 @@ async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_ins
                     // default instead of the credential's account fails loudly rather than by luck.
                     default_account: "nobody".to_string(),
                     workers: workers.iter().map(|a| format!("http://{a}")).collect(),
-                    coordinator_id: format!("tenant-catalogs-{addr}"),
+                    coordinator: CoordinatorIdentity::new(format!("tenant-catalogs-{addr}")),
                     ..CoordinatorConfig::default()
                 },
             )

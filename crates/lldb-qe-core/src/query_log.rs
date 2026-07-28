@@ -35,7 +35,11 @@
 //!   `queued`) forever — nothing here sweeps them. That is why every row records the
 //!   `coordinator` that owns it: a reaper is a later issue, and it will need to know whose rows
 //!   to touch. Treat a `running` row from a coordinator that is no longer alive as unknown, not
-//!   as running.
+//!   as running. Since [`crate::liveness`], "is that coordinator alive" is a question with an
+//!   answer — the row records the writing process as a `(coordinator, coordinator_incarnation)`
+//!   pair, so a coordinator that died and was replaced *on the same address* is distinguishable
+//!   from one that is still running. Nothing here acts on that answer; the sweep is still a later
+//!   issue.
 //! - **No result storage.** [`QueryRecord::result_rows`] is a count, not a cache. The batches are
 //!   streamed to the client and dropped.
 //! - **No tenancy enforcement.** Callers pass the `account_id` they resolved; nothing here checks
@@ -55,6 +59,7 @@ use std::str::FromStr;
 use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 
+use crate::liveness::CoordinatorIdentity;
 use crate::services::ServicesDb;
 
 /// Longest error message stored on a query row.
@@ -161,8 +166,14 @@ pub struct QueryRecord {
     pub finished_at: Option<DateTime<Utc>>,
     /// Why it failed. Truncated to [`MAX_ERROR_LEN`].
     pub error: Option<String>,
-    /// The coordinator process that scheduled it. See the module docs on why this matters.
+    /// The coordinator **slot** that scheduled it — stable across that coordinator's restarts.
+    /// See the module docs on why this matters.
     pub coordinator: Option<String>,
+    /// The coordinator **process** that scheduled it ([`crate::liveness::CoordinatorIdentity`]'s
+    /// incarnation). `None` for history written before this existed, and for an embedding that
+    /// never registered — which reads as "liveness says nothing about this row's writer", and is
+    /// deliberately not the same thing as "its writer is dead".
+    pub coordinator_incarnation: Option<String>,
     /// Rows returned. `None` unless the query succeeded.
     pub result_rows: Option<i64>,
 }
@@ -185,7 +196,8 @@ impl QueryRecord {
 
 /// The column list every query lookup returns, in the order [`QueryRow`] expects.
 const QUERY_COLUMNS: &str = "id, account_id, warehouse_id, sql_text, state, submitted_at, \
-                             started_at, finished_at, error, coordinator, result_rows";
+                             started_at, finished_at, error, coordinator, \
+                             coordinator_incarnation, result_rows";
 
 /// The raw row shape. Named so the `query_as` turbofishes below stay readable.
 type QueryRow = (
@@ -197,6 +209,7 @@ type QueryRow = (
     DateTime<Utc>,
     Option<DateTime<Utc>>,
     Option<DateTime<Utc>>,
+    Option<String>,
     Option<String>,
     Option<String>,
     Option<i64>,
@@ -217,6 +230,7 @@ fn query_from_row(row: QueryRow) -> Result<QueryRecord> {
         finished_at,
         error,
         coordinator,
+        coordinator_incarnation,
         result_rows,
     ) = row;
     let state = state
@@ -233,6 +247,7 @@ fn query_from_row(row: QueryRow) -> Result<QueryRecord> {
         finished_at,
         error,
         coordinator,
+        coordinator_incarnation,
         result_rows,
     })
 }
@@ -260,21 +275,28 @@ impl ServicesDb {
     /// minutes for a slot and then gets cancelled is exactly the query an operator needs to see,
     /// and a row that only appears once execution starts cannot show it. The cost is one INSERT
     /// on the submit path, which is dwarfed by planning.
+    ///
+    /// `coordinator` is the writer's full identity, not just its name: the slot alone cannot tell a
+    /// coordinator that restarted onto the same address from the one it replaced, so a reader
+    /// asking "did the process that wrote this row survive" needs the incarnation too. See
+    /// [`crate::liveness`].
     pub async fn submit_query(
         &self,
         account_id: i64,
         warehouse_id: Option<i64>,
         sql_text: &str,
-        coordinator: Option<&str>,
+        coordinator: Option<&CoordinatorIdentity>,
     ) -> Result<QueryRecord> {
         let row = sqlx::query_as::<_, QueryRow>(&format!(
-            "INSERT INTO queries (account_id, warehouse_id, sql_text, state, coordinator) \
-             VALUES ($1, $2, $3, 'queued', $4) RETURNING {QUERY_COLUMNS}"
+            "INSERT INTO queries \
+                 (account_id, warehouse_id, sql_text, state, coordinator, coordinator_incarnation) \
+             VALUES ($1, $2, $3, 'queued', $4, $5) RETURNING {QUERY_COLUMNS}"
         ))
         .bind(account_id)
         .bind(warehouse_id)
         .bind(sql_text)
-        .bind(coordinator)
+        .bind(coordinator.map(CoordinatorIdentity::slot))
+        .bind(coordinator.map(CoordinatorIdentity::incarnation))
         .fetch_one(self.pool())
         .await
         .with_context(|| format!("recording a submitted query for account {account_id}"))?;
@@ -456,6 +478,7 @@ mod tests {
             finished_at: end.map(|e| epoch + TimeDelta::seconds(e)),
             error: None,
             coordinator: Some("test".to_string()),
+            coordinator_incarnation: Some("test-incarnation".to_string()),
             result_rows: Some(0),
         }
     }
