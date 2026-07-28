@@ -27,6 +27,7 @@
 //! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
 //! | [`query_log`]    | Query history: what ran, when, and how it ended                       | 5 |
 //! | [`liveness`]     | Coordinator registration and renewal: telling a dead coordinator from a slow one | 5 |
+//! | [`reaper`]       | Resolving history rows whose coordinator is gone — the first consumer of that answer | 5 |
 //! | [`server`]       | The long-running coordinator: concurrent queries over one Flight port  | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
@@ -65,6 +66,7 @@ pub mod liveness;
 pub mod manifest;
 pub mod query_log;
 pub mod rbac;
+pub mod reaper;
 pub mod remote;
 pub mod result_cache;
 pub mod retry;
@@ -107,6 +109,7 @@ pub use manifest::{
 };
 pub use query_log::{QueryRecord, QueryState};
 pub use rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization, Requirement};
+pub use reaper::{DEFAULT_REAP_BATCH, ReapReason, ReapedQuery};
 pub use remote::{FlightReaderExec, LldbCodec};
 pub use result_cache::{
     ResultCache, ResultCacheArgs, ResultCacheConfig, ResultCacheKey, TableInput, execute_cached,

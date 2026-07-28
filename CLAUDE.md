@@ -52,14 +52,15 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
   (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
   front ends share (`engine.rs`), admission control (`scheduler.rs`), query history
-  (`query_log.rs`), coordinator liveness (`liveness.rs`), the long-running coordinator
-  (`server.rs`), access control — identity and
+  (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
+  (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
   credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — and the per-account
   catalog/warehouse partitioning those two rest on (`tenancy.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
   migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
-  `lldb-qe-auth` (users, API keys, roles, grants) and `lldb-qe-server` (the long-running query
+  `lldb-qe-auth` (users, API keys, roles, grants), `lldb-qe-reap` (resolve query-history rows
+  stranded by a coordinator that died) and `lldb-qe-server` (the long-running query
   scheduler — the *only* binary here that authenticates)
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
 - `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
@@ -297,6 +298,41 @@ workers and no Flight. With no services DB there is no row, no background task a
 anything — `CoordinatorRegistration::start_if_configured` is that rule as a function, so it is
 testable without a database.
 
+## The reaper acts on that lease, and only on it
+
+`reaper.rs` + `lldb-qe-reap` are liveness's first consumer: they resolve `queries` rows left in
+`queued`/`running` by a coordinator that died, marking them `failed` with a reason that
+distinguishes **never started** (`started_at IS NULL`) from **died mid-flight**. Four things to
+keep straight.
+
+1. **Eligibility is the `(slot, incarnation)` pair, never age.** A legitimately long-running query
+   is indistinguishable from an abandoned one by age, so a rule containing "…and it has been
+   running for more than N minutes" kills live work. A row is reapable only when no *live*
+   `coordinators` row matches **both** its slot and its incarnation — which is exactly the case a
+   slot-only rule gets wrong: a coordinator that died and restarted onto the same address has a
+   live slot, and its stranded rows would be judged live forever.
+   `query_reaper::a_live_coordinators_long_running_query_is_never_reaped` sweeps repeatedly for
+   several multiples of the threshold against a running query, then kills the coordinator and
+   demands the same row *is* taken — so "never reaped" cannot mean "reaps nothing".
+2. **There are now two writers to a query row, and they are asymmetric.** `query_log.rs`'s
+   single-writer justification is gone: the owning coordinator writes **unconditionally** (it is
+   the authority on its own query), and the reaper writes a **CAS** — its `UPDATE` repeats the whole
+   reapable predicate in its own `WHERE`, so a row that moved under it is skipped. Both interleavings
+   of "reap" and "succeeded" end at `succeeded`. Do not "simplify" that repeated predicate away;
+   `a_reaper_never_clobbers_a_terminal_state` is what fails if you do.
+3. **`finished_at` is the writer's last renewal, not `now()`.** `now()` would claim the query ran
+   right up to the sweep, which re-creates the `peak_concurrency` bias the reaper exists to remove.
+   Where the registration is gone or the slot has been taken over it falls back to `now()` — an
+   over-estimate, stated rather than hidden.
+4. **The honest limits.** A NULL `coordinator_incarnation` (history predating the column, a writer
+   that never registered) is never reaped — liveness *says nothing* about that row, which is not
+   "dead". And a row stranded by the insert-to-guard window on a coordinator that is *still alive*
+   waits until that incarnation goes away; closing that gap belongs on the submit path, not here.
+
+It runs **out of process**, on purpose — a coordinator sweeping at startup would have a fleet
+restarting together reaping each other's live queries. The sweep is bounded by a `LIMIT`
+(result_cache's rule), idempotent, and safe to run concurrently with itself.
+
 ## The result cache is keyed, never invalidated
 
 `result_cache.rs` answers a repeat query from Postgres instead of the fleet. Its key is
@@ -389,6 +425,13 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # `renew_interval_secs` is whole seconds, so the shortest threshold that can exist is 3s and a test
 # that outlives it must really take that long.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration coordinator_liveness
+# Reaping stranded query rows (`reaper.rs`). A one-shot, like `lldb-qe-migrate`: schedule it
+# (cron / an ECS scheduled task) at whatever interval you want stranded rows resolved within.
+# Idempotent, bounded by --limit, and --dry-run shows what it would take without writing.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-reap -- \
+  --metadata-url postgres://lldb@localhost/lldb --dry-run
+LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_reaper
+
 # Accounts, API keys, roles, grants. Same operator-tool posture as `lldb-qe-warehouse`: its
 # credential IS the Postgres password, so treat that as the deployment's root credential. The token
 # `key create` prints is shown exactly once and stored nowhere.

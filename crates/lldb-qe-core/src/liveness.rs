@@ -110,8 +110,13 @@
 //! [`ServicesDb::is_coordinator_live`], [`ServicesDb::live_coordinators`],
 //! [`ServicesDb::list_coordinators`]. Whatever acts on the answer runs out of process, as a one-shot
 //! in the style of `lldb-qe-migrate`, which is how this repo already treats anything that mutates
-//! state the whole fleet shares. A reaper is one of those and is a separate issue; nothing here
-//! writes to `queries`.
+//! state the whole fleet shares. Nothing here writes to `queries`.
+//!
+//! [`crate::reaper`] is the first thing to take that answer up, as `lldb-qe-reap`. It is worth
+//! reading as the proof that this shape holds: the predicate is used verbatim (`LIVE_PREDICATE` is
+//! spliced into its statement rather than re-spelled), the `(slot, incarnation)` pair is what makes
+//! its decision correct rather than plausible, and the resulting sweep is a one-shot binary that no
+//! coordinator ever calls.
 //!
 //! The one thing a coordinator does with the predicate is *log* it, once, at startup: how many peers
 //! the control plane believes are live. That is a read, it cannot reap anything, and it makes the
@@ -295,10 +300,16 @@ type CoordinatorRowTuple = (
     Option<String>,
 );
 
-/// The liveness predicate, in SQL. `$n` is the missed-renewal multiple; the interval comes from the
+/// The liveness predicate, in SQL. `$1` is the missed-renewal multiple; the interval comes from the
 /// row, so every coordinator is judged by its own cadence (decision 3).
-const LIVE_PREDICATE: &str = "shutdown_at IS NULL \
-     AND last_seen_at > now() - make_interval(secs => renew_interval_secs::DOUBLE PRECISION * $1)";
+///
+/// Shared with [`crate::reaper`], which splices it into a correlated subquery over `queries` —
+/// hence the table-qualified column names, which are redundant in this module's own single-table
+/// statements and load-bearing there. Two spellings of "alive" would eventually disagree and
+/// nothing in the build would notice, so there is exactly one.
+pub(crate) const LIVE_PREDICATE: &str = "coordinators.shutdown_at IS NULL \
+     AND coordinators.last_seen_at > now() - make_interval(secs => \
+         coordinators.renew_interval_secs::DOUBLE PRECISION * $1)";
 
 impl From<CoordinatorRowTuple> for CoordinatorRow {
     fn from(row: CoordinatorRowTuple) -> Self {
