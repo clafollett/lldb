@@ -52,10 +52,17 @@
 #     --manifest /manifests/empty.toml --sql "SELECT 42"
 #
 #   # the lifecycle: the CLI writes desired state, compose applies it
-#   docker compose run --rm warehouse-setup lldb-qe-warehouse list
-#   docker compose run --rm warehouse-setup lldb-qe-warehouse resize --name etl --size 3
+#   #
+#   # Note the `--entrypoint`. `warehouse-setup` and `auth-setup` are one-shot *scripts*, declared
+#   # as `entrypoint: [/bin/sh, -c, "…"]`, and `docker compose run SERVICE CMD…` overrides a
+#   # service's `command`, not its `entrypoint` — so a trailing command lands as arguments to that
+#   # `sh -c` script and the script runs instead of what you typed. `--entrypoint` replaces it,
+#   # which is what you want when borrowing one of these services for its environment.
+#   docker compose run --rm --entrypoint lldb-qe-warehouse warehouse-setup list
+#   docker compose run --rm --entrypoint lldb-qe-warehouse warehouse-setup \
+#     resize --name etl --size 3
 #   docker compose up -d --scale worker-etl=3          # ← apply it; parallelism changes, no rebuild
-#   docker compose run --rm warehouse-setup lldb-qe-warehouse suspend --name etl
+#   docker compose run --rm --entrypoint lldb-qe-warehouse warehouse-setup suspend --name etl
 #   docker compose up -d --scale worker-etl=0          # ← apply it; the compute is freed
 #
 # That two-step is the design, not an omission: the services database holds *desired* state and
@@ -201,14 +208,25 @@ services:
   # One-shot: declare the demo tenant's identity — a user, a role, and the grants that role needs
   # to read the shared catalog and use both warehouses. It does NOT issue an API key, because a key
   # can only be shown once and a token printed into a compose log is not a credential, it is a
-  # published secret. Issue one yourself when you want to talk to `query-server` for real:
+  # published secret. Issue one yourself when you want to talk to `query-server` for real
+  # (`--entrypoint` for the reason given in the header — this service's entrypoint is the script
+  # below, and a trailing command would be appended to it rather than replacing it):
   #
-  #   docker compose run --rm auth-setup lldb-qe-auth key create --user demo --name cli
-  #   docker compose run --rm auth-setup lldb-qe-auth show
+  #   docker compose run --rm --entrypoint lldb-qe-auth auth-setup key create --user demo --name cli
+  #   docker compose run --rm --entrypoint lldb-qe-auth auth-setup show
   #
   # Everything here is idempotent (`grant` and `role assign` are upserts), except `user create` and
   # `role create` — hence the `|| true`, which keeps a second `up` from failing on rows that are
   # already correct. That is the one place in this file where an error is deliberately ignored.
+  #
+  # Nothing in this file declares `profiles`, so this service is in the default profile and plain
+  # `docker compose up` starts it — and `query-server` below gates on it
+  # (`service_completed_successfully`), so a broken `auth-setup` takes the query server down with
+  # it. That is the good failure mode, and it is why issue #51 (the image did not contain
+  # `lldb-qe-auth`) was a loud break for anyone running the cluster and simultaneously invisible to
+  # CI: the cross-container test starts only minio/minio-setup/worker-1/worker-2 and then runs
+  # `coordinator`, whose dependency chain reaches `db-migrate` and `warehouse-setup` but never here.
+  # `distributed_cluster.rs` now runs this service explicitly for exactly that reason.
   auth-setup:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
@@ -219,12 +237,9 @@ services:
         (lldb-qe-auth user create --name demo || true) &&
         (lldb-qe-auth role create --name analyst || true) &&
         lldb-qe-auth role assign --role analyst --user demo &&
-        lldb-qe-auth grant --role analyst --privilege ALL
-          --object-type catalog --object-name shared &&
-        lldb-qe-auth grant --role analyst --privilege USAGE
-          --object-type warehouse --object-name analytics &&
-        lldb-qe-auth grant --role analyst --privilege USAGE
-          --object-type warehouse --object-name etl &&
+        lldb-qe-auth grant --role analyst --privilege ALL --object-type catalog --object-name shared &&
+        lldb-qe-auth grant --role analyst --privilege USAGE --object-type warehouse --object-name analytics &&
+        lldb-qe-auth grant --role analyst --privilege USAGE --object-type warehouse --object-name etl &&
         lldb-qe-auth show
     environment:
       <<: *metadata-env
