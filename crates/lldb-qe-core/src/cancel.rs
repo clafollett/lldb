@@ -39,10 +39,13 @@
 //!
 //! 1. **It is per coordinator process.** The registry holds the queries *this* process is running.
 //!    A cancel for a query owned by another coordinator is answered "not running here" rather than
-//!    forwarded, for the same reason admission is per process ([`crate::scheduler`]): there is no
-//!    shared state between coordinators, and inventing one for cancellation alone would be half of
-//!    fleet-wide admission built in the wrong place. Send the cancel to the coordinator whose
-//!    `queries.coordinator` value names it.
+//!    forwarded, and this is the one boundary here that fleet-wide admission ([`crate::scheduler`],
+//!    [`crate::fleet_admission`]) did **not** move. Admission became shared state because a *count*
+//!    can live in Postgres; stopping a query cannot, because it means dropping the future that
+//!    holds the guard, and only the process running that future can drop it. Forwarding a cancel
+//!    over the wire is a different feature — coordinator-to-coordinator RPC — and not a consequence
+//!    of the limit being shared. Send the cancel to the coordinator whose `queries.coordinator`
+//!    value names it.
 //! 2. **The handle is the history row's id**, which means cancellation needs a services database.
 //!    Without one a query has no id (`QueryOutcome::query_id` is `None`), so there is nothing to
 //!    name it by and the registry stays empty. Consistent with the rest of the system — no control

@@ -68,7 +68,9 @@
 # plans a query, runs it, prints, exits — that is what the cross-container smoke test drives.
 # `query-server` is the long-running scheduler (issue #18): it holds the catalog open, accepts
 # concurrent submissions on 50050, admits a bounded number per warehouse, queues the rest, and
-# records every query's state and timings in the `queries` table.
+# records every query's state and timings in the `queries` table. That bound is enforced across
+# every coordinator through Postgres (issue #37), not by each of them independently — see the
+# service definition below for the two conditions that make it so.
 #
 # Image/version knobs (both optional):
 #   LLDB_IMAGE  — tag every service runs (default lldb:latest). CI prebuilds a cached, versioned
@@ -360,9 +362,14 @@ services:
   #     'SELECT id, state, warehouse_id, started_at - submitted_at AS queued, \
   #             finished_at - started_at AS ran FROM queries ORDER BY id DESC LIMIT 10'
   #
-  # IMPORTANT: admission control is per *process*. Scaling this service to two replicas doubles
-  # the number of queries a warehouse will run at once, because neither replica can see the other.
-  # See crates/lldb-qe-core/src/scheduler.rs.
+  # Admission control is fleet-wide: this service's replicas share each warehouse's concurrency
+  # limit through `admission_slots` in Postgres rather than each enforcing their own, so scaling it
+  # buys availability without changing how much work the warehouse does. Two conditions, both met
+  # here: a services database must be configured, and each replica must have its own
+  # `--coordinator-id` (a claim's expiry is its holder's liveness registration, and two replicas
+  # sharing one id cost one of them that registration). To scale, give each replica a distinct id —
+  # `--scale query-server=N` alone would hand them all `compose-query-server` below.
+  # See crates/lldb-qe-core/src/fleet_admission.rs and .../scheduler.rs.
   query-server:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
@@ -377,8 +384,10 @@ services:
       # The coordinator's *deployment slot* — stable across restarts, which the default (the bound
       # address, `0.0.0.0:50050`) is not meaningfully: it would be identical for every replica of
       # this service, and two coordinators sharing a slot cost one of them its liveness
-      # registration. The per-process half of the identity is minted at startup and is not
-      # configurable. See crates/lldb-qe-core/src/liveness.rs.
+      # registration — and a coordinator with no registration holds no fleet-wide admission slots,
+      # so it silently falls back to bounding the warehouse by itself. The per-process half of the
+      # identity is minted at startup and is not configurable.
+      # See crates/lldb-qe-core/src/liveness.rs.
       - "--coordinator-id"
       - "compose-query-server"
       # This cluster is a demo you are expected to be able to query the moment it comes up, and an

@@ -18,23 +18,30 @@
 //! records it `queued`, waits for an admission slot on that warehouse, runs the query across the
 //! warehouse's fleet, streams Arrow back and marks the row terminal. The design — transport,
 //! admission, lifecycle, and the things it deliberately does not do — is documented on
-//! [`lldb_qe_core::server`] and [`lldb_qe_core::scheduler`]. Read those before deploying more than
-//! one of these against a single warehouse: **admission control is per process.**
+//! [`lldb_qe_core::server`] and [`lldb_qe_core::scheduler`]. **Admission control is fleet-wide**
+//! when a services database is configured: two of these against one warehouse share its limit
+//! rather than doubling it (see [`lldb_qe_core::fleet_admission`]).
 //!
 //! ```text
 //!   lldb-qe-server --workers http://worker-1:50051,http://worker-2:50051 \
 //!     --manifest /manifests/tpch.toml --metadata-host postgres --bind 0.0.0.0:50050
 //! ```
 //!
-//! With no `--metadata-*` it still runs; it just has no accounts, no warehouses, no history and no
-//! liveness registration — the same bargain every other binary here strikes (see CLAUDE.md).
+//! With no `--metadata-*` it still runs; it just has no accounts, no warehouses, no history, no
+//! liveness registration and no shared admission limit — the same bargain every other binary here
+//! strikes (see CLAUDE.md).
 //!
 //! # Liveness
 //!
 //! With a services database, this process registers itself in `coordinators` before it serves and
 //! renews on an interval, so the rest of the fleet can tell a coordinator that died from one that is
-//! merely busy. It deregisters on a clean exit. It never acts on another coordinator's liveness —
-//! the design, and the four decisions behind it, are on [`lldb_qe_core::liveness`].
+//! merely busy. It deregisters on a clean exit. The design, and the four decisions behind it, are on
+//! [`lldb_qe_core::liveness`].
+//!
+//! That registration is also what makes fleet-wide admission safe, and why the two are wired
+//! together below: a query slot is held by a *process*, so a claim's expiry is its holder's lease.
+//! A coordinator holding slots without a registration would have them reclaimed the instant it
+//! wrote them, so [`lldb_qe_core::fleet_admission::FleetAdmission`] cannot be built without one.
 //!
 //! # Security posture
 //!
@@ -58,6 +65,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 use lldb_qe_core::engine::TenantSessions;
+use lldb_qe_core::fleet_admission::FleetAdmission;
 use lldb_qe_core::liveness::{
     CoordinatorIdentity, CoordinatorRegistration, DEFAULT_RENEW_INTERVAL, death_threshold,
 };
@@ -120,8 +128,11 @@ struct Cli {
     /// having warehouses. Setting it overrides every warehouse, including ones this server has not
     /// seen yet.
     ///
-    /// Note the scope: this is a limit **per coordinator process**, not fleet-wide. Two servers
-    /// pointed at one warehouse each enforce it independently.
+    /// With a services database this is a limit on the **warehouse**, shared by every coordinator:
+    /// two servers pointed at one warehouse admit this many between them, not each. Without one
+    /// there is nothing to share it through and each process enforces it alone. Set the same value
+    /// on every coordinator — they are not obliged to agree, and if they disagree the warehouse ends
+    /// up bounded by the largest.
     #[arg(long, env = "LLDB_MAX_CONCURRENT_QUERIES")]
     max_concurrent_queries: Option<usize>,
 
@@ -137,9 +148,9 @@ struct Cli {
     /// This is a **deployment slot**, not a process id: it is meant to survive a restart, and the
     /// per-process half of the identity is minted here and never configurable (see
     /// [`lldb_qe_core::liveness`]). Worth setting to something stable — a task id, a hostname —
-    /// when several coordinators write to one services database, because concurrency limits are
-    /// only meaningful within one value of that column, and because two coordinators sharing a slot
-    /// is a misconfiguration that costs one of them its registration.
+    /// when several coordinators write to one services database, because two coordinators sharing a
+    /// slot is a misconfiguration that costs one of them its registration, and a coordinator with
+    /// no registration holds no fleet-wide admission slots.
     #[arg(long, env = "LLDB_COORDINATOR_ID")]
     coordinator_id: Option<String>,
 
@@ -247,8 +258,8 @@ async fn main() -> Result<()> {
         // A read, never an action: this process must not conclude anything *about* its peers, and
         // certainly must not sweep after them at startup — a fleet restarting together would have
         // every member judging the others through a lease none of them had renewed yet. Logging the
-        // count makes the "admission control is per coordinator process" caveat visible in an
-        // operator's logs at the moment it starts being true.
+        // count tells an operator how many coordinators this warehouse's limit is now being shared
+        // with, at the moment that starts being true.
         if let Some(db) = &db {
             match db.live_coordinators().await {
                 Ok(live) => tracing::info!(
@@ -256,7 +267,8 @@ async fn main() -> Result<()> {
                     renew_interval_secs = renew_interval.as_secs(),
                     death_threshold_secs = death_threshold(renew_interval).as_secs(),
                     "coordinator liveness is on (this coordinator included in the count); \
-                     admission control is still per process, so a fleet-wide limit is not implied"
+                     admission slots held by any of these are honoured fleet-wide, and slots held \
+                     by a coordinator that stops renewing become claimable after the threshold"
                 ),
                 Err(error) => tracing::warn!(
                     error = %format!("{error:#}"),
@@ -265,6 +277,12 @@ async fn main() -> Result<()> {
             }
         }
     }
+
+    // Fleet-wide admission follows the registration, which follows the services database: a claim's
+    // expiry *is* its holder's lease, so a coordinator with no registration must not hold slots —
+    // and `start_if_registered` is that rule as a function rather than an `if` here. `None` leaves
+    // the scheduler exactly the per-process module it has always been.
+    let fleet = FleetAdmission::start_if_registered(db.clone(), registration.as_ref());
 
     let mut coordinator = Coordinator::multi_tenant(
         sessions,
@@ -279,6 +297,9 @@ async fn main() -> Result<()> {
             allow_anonymous: cli.allow_anonymous,
         },
     );
+    if let Some(fleet) = fleet.clone() {
+        coordinator = coordinator.with_fleet_admission(fleet);
+    }
     // The result cache is shared by every query this process serves, keyed by the account resolved
     // from the services database rather than the one a ticket claimed — so it can never serve one
     // tenant another's rows. It needs that database, so a server without one simply has no cache.
@@ -297,8 +318,20 @@ async fn main() -> Result<()> {
         incarnation = %identity.incarnation(),
         max_concurrent_queries = ?coordinator.config().max_concurrent_queries,
         max_queued_queries = coordinator.config().max_queued_queries,
-        "lldb-qe-server listening (admission control is per-process, not fleet-wide)"
+        fleet_wide_admission = coordinator.scheduler().is_fleet_wide(),
+        "lldb-qe-server listening"
     );
+    if !coordinator.scheduler().is_fleet_wide() {
+        // Said out loud rather than left to be inferred from a `false` in the line above, because
+        // it is the one posture in which running two of these against one warehouse doubles the
+        // work it does — and the operator who is about to do that is the one reading this log.
+        tracing::warn!(
+            "admission control is PER PROCESS: this coordinator is not registered in a services \
+             database, so it cannot share a warehouse's concurrency limit with any other. Two \
+             coordinators on one warehouse will each admit their own limit. Configure \
+             --metadata-url (LLDB_METADATA_URL) to bound a warehouse fleet-wide."
+        );
+    }
 
     // Ctrl-C / SIGTERM: close the scheduler so queued queries are told the truth immediately,
     // then let tonic drain the ones that are already running. See `serve_coordinator`.

@@ -236,6 +236,12 @@ pub struct QueryRecord {
     pub error: Option<String>,
     /// The coordinator **slot** that scheduled it — stable across that coordinator's restarts.
     /// See the module docs on why this matters.
+    ///
+    /// It attributes a row to its writer; it does **not** scope the concurrency bound. Migration
+    /// `0004` said the opposite ("concurrency limits are only meaningful within one value of this
+    /// column") and `0008` retracts it: since [`crate::fleet_admission`] a warehouse's limit is
+    /// enforced across every coordinator, so [`peak_concurrency`] over an account's whole history
+    /// measures the warehouse rather than one process.
     pub coordinator: Option<String>,
     /// The coordinator **process** that scheduled it ([`crate::liveness::CoordinatorIdentity`]'s
     /// incarnation). `None` for history written before this existed, and for an embedding that

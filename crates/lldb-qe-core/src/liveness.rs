@@ -8,11 +8,14 @@
 //! added `queries.coordinator` explicitly so a future reaper could find a dead coordinator's rows,
 //! a forward reference with nothing behind it.
 //!
-//! Two separate pieces of work need the answer before either can be built: reaping stranded query
-//! rows, and fleet-wide admission control (a slot held by a coordinator that died has to be
+//! Two separate pieces of work needed the answer before either could be built: reaping stranded
+//! query rows, and fleet-wide admission control (a slot held by a coordinator that died has to be
 //! released by *something*). Two implementations of "alive" would disagree about where the line is,
 //! and nothing in the build would notice. So the model is decided once, here, and the four
 //! decisions it turns on are written down below rather than only in the issue that asked for them.
+//! Both consumers now exist — [`crate::reaper`] and [`crate::fleet_admission`] — and both splice
+//! [`LIVE_PREDICATE`] in verbatim rather than re-spelling it, which is what that "once" means in
+//! practice.
 //!
 //! # Decision 1 — what a coordinator registers, and what its identity *is*
 //!
@@ -62,10 +65,18 @@
 //!   is named rather than hidden: past the threshold this coordinator's rows *may* be concluded dead
 //!   by whoever reads this table, so [`CoordinatorRegistration::is_stale`] goes true and the log
 //!   line moves from `warn` to `error`. What that costs today is history rows being resolved
-//!   pessimistically — the queries themselves still answer their clients correctly. If a later
-//!   issue makes liveness load-bearing for something a *client* can observe (fleet-wide admission
-//!   handing out a slot this coordinator still holds), that issue owns re-deciding this, and this
-//!   paragraph is the thing it has to argue against.
+//!   pessimistically — the queries themselves still answer their clients correctly.
+//!
+//!   That last sentence used to end "if a later issue makes liveness load-bearing for something a
+//!   *client* can observe, that issue owns re-deciding this". [`crate::fleet_admission`] is that
+//!   issue, and it did not re-decide it. Its argument, in full: past the threshold another
+//!   coordinator may claim a slot this one is still using — but a coordinator that cannot reach
+//!   Postgres to renew also cannot reach Postgres to *claim*, so it has already fallen back to its
+//!   own local semaphore. Both sides are then bounded by `K` independently and the warehouse's
+//!   worst case is `coordinators × K`, which is exactly what admission control did before it was
+//!   fleet-wide. The cost of continuing to serve is therefore bounded by the bug that was just
+//!   fixed, and never worse than it; refusing to serve through a control-plane hiccup is still the
+//!   worse trade. [`crate::scheduler`]'s module docs carry the same argument from the other end.
 //! - **Another process took the slot.** Zero rows and the row still exists under a different
 //!   incarnation means two processes are configured with one `--coordinator-id`. Re-registering
 //!   would make them flap the slot between each other forever, so this one *stops* renewing, sets
@@ -119,9 +130,9 @@
 //! coordinator ever calls.
 //!
 //! The one thing a coordinator does with the predicate is *log* it, once, at startup: how many peers
-//! the control plane believes are live. That is a read, it cannot reap anything, and it makes the
-//! "admission control is per coordinator process" caveat visible in an operator's logs at the moment
-//! it starts being true.
+//! the control plane believes are live. That is a read, it cannot reap anything, and it tells an
+//! operator how many coordinators this deployment's warehouse limits are being shared with at the
+//! moment that starts being true.
 //!
 //! # No services database is still legal, and that is load-bearing
 //!
@@ -132,10 +143,21 @@
 //! is the whole of that rule — `None` in, `None` out, nothing spawned — and it is a function rather
 //! than an `if` at the call site so the rule can be tested without a database.
 //!
-//! Note what is *not* here as a result: liveness is never consulted on the path that admits or runs
-//! a query. [`crate::scheduler`] does not know this module exists, which is what keeps its bound,
-//! its fairness and its release-on-failure behaviour provable with no Postgres, no workers and no
-//! Flight. "Check the lease, then admit" is the natural shape and it is the wrong one.
+//! Note what is *not* here as a result, and note precisely how [`crate::fleet_admission`] changed
+//! it — because the sentence that used to be here is now half true and half false.
+//!
+//! Still true: **[`crate::scheduler`] does not know this module exists.** It takes a `FleetGate`
+//! trait, and that trait says nothing about leases, incarnations or Postgres — which is what keeps
+//! its bound, its fairness and its release-on-failure behaviour provable with no Postgres, no
+//! workers and no Flight, now including the "two coordinators admit `K` between them" property
+//! itself.
+//!
+//! No longer true: liveness *is* consulted on the path that admits a query, by the gate
+//! [`crate::fleet_admission`] implements — a claim's expiry is its holder's registration, which is
+//! the whole reason that module needed no second lease and no sweep. What makes that acceptable is
+//! that consulting it can only ever produce three answers, and none of them is "refuse": granted,
+//! full, or unreachable-so-admit-locally. "Check the lease, then admit *or fail*" is the shape that
+//! is still wrong, and it is still not built.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

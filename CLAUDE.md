@@ -51,7 +51,8 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   shared CLI/logging config (`config.rs`), Postgres services DB / control plane (`services.rs` +
   `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
   (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
-  front ends share (`engine.rs`), admission control (`scheduler.rs`) and the cancellation that
+  front ends share (`engine.rs`), admission control (`scheduler.rs`) with the fleet-wide bound
+  behind it (`fleet_admission.rs`) and the cancellation that
   hands a slot back (`cancel.rs`), query history
   (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
   (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
@@ -267,6 +268,7 @@ as a multi-tenant entry point; expose `lldb-qe-server`.
 Nothing could tell a dead coordinator from a slow one — no lease, no heartbeat, no `last_seen`.
 `liveness.rs` is that mechanism, and it exists *once* because two later issues (reaping stranded
 query rows, fleet-wide admission) each need the answer and would otherwise each build half of it.
+Both landed and both splice `LIVE_PREDICATE` in verbatim — `reaper.rs` and `fleet_admission.rs`.
 Four decisions, all argued in the module docs:
 
 1. **Identity is a pair.** `--coordinator-id` is ambiguous in both directions: a coordinator that
@@ -293,11 +295,15 @@ Four decisions, all argued in the module docs:
    had renewed. Whatever acts on the answer is a one-shot out of process, in `lldb-qe-migrate`'s
    style; nothing here writes to `queries`.
 
-**Liveness is never a precondition for scheduling.** `scheduler.rs` does not know this module
-exists, which is what keeps its bound, fairness and release-on-failure provable with no Postgres, no
-workers and no Flight. With no services DB there is no row, no background task and no per-query
-anything — `CoordinatorRegistration::start_if_configured` is that rule as a function, so it is
-testable without a database.
+**`scheduler.rs` still does not know this module exists** — it takes a `FleetGate` trait, which is
+what keeps its bound, fairness, release-on-failure *and* the two-coordinator property provable with
+no Postgres, no workers and no Flight. What `fleet_admission.rs` changed is that liveness is now
+consulted on the admit path, by the gate rather than by the scheduler, and it can only ever answer
+granted / full / unreachable-so-admit-locally. Liveness is still never a precondition for
+scheduling: there is no answer it can give that refuses a query. With no services DB there is no
+row, no background task, no fleet gate and no per-query anything —
+`CoordinatorRegistration::start_if_configured` and `FleetAdmission::start_if_registered` are that
+rule as two functions, so both are testable without a database.
 
 ## Cancellation returns the slot, and that is the whole point
 
@@ -373,6 +379,58 @@ keep straight.
 It runs **out of process**, on purpose — a coordinator sweeping at startup would have a fleet
 restarting together reaping each other's live queries. The sweep is bounded by a `LIMIT`
 (result_cache's rule), idempotent, and safe to run concurrently with itself.
+
+## Admission is fleet-wide, and the lease it expires on is the coordinator's
+
+`Admission` was a `tokio::sync::Semaphore` in one process's memory, so two coordinators each
+configured `K = 4` ran up to **8** queries on one warehouse — a limit that was a property of a
+process multiplied by however many were running, which is the number an operator scales for
+*availability*. `fleet_admission.rs` + migration `0008` make it a property of the warehouse. Six
+things to keep straight.
+
+1. **`K` rows, not a counter.** A warehouse of size `K` has slots `0..K-1` in `admission_slots`, and
+   a claim is a row, so over-admission is impossible by construction rather than by argument. The
+   counter shape needs an advisory lock or `SELECT ... FOR UPDATE` — a transaction, three round
+   trips — to arrive somewhere a unique index already is. A claim is **one statement**: pick a
+   claimable slot number, `INSERT ... ON CONFLICT DO UPDATE`, see whether a row comes back. The
+   `ON CONFLICT`'s `WHERE` repeats the whole claimable predicate, which is `reaper.rs`'s
+   compare-and-swap idiom; do not "simplify" it away, it is what makes a lost race a no-op.
+2. **There is no second lease and no expiry column.** A slot is held by a *process*, so its expiry is
+   that process's `coordinators` row — `liveness::LIVE_PREDICATE`, spliced verbatim, matched on the
+   `(slot, incarnation)` **pair** for exactly `reaper.rs`'s reason. That buys one heartbeat per
+   coordinator instead of one per running query, one spelling of "alive" tree-wide, and **no sweep**:
+   a dead coordinator's slots are reclaimed by the next coordinator that wants one. It also means a
+   holder must be *registered*, so `FleetAdmission` cannot be constructed without a
+   `CoordinatorRegistration`.
+3. **The local semaphore stays, as fast path and backstop.** A failed claim admits on the local bound
+   and counts `fleet_degraded`; it never refuses. So a control-plane outage degrades to `N × K` —
+   exactly the old bug, never worse than it — and that is also the answer `liveness.rs`'s decision 2
+   asked a future issue to give: a coordinator that cannot renew also cannot claim, so both sides
+   fall back at the same moment. Local gate first, fleet second, always: nothing holds a fleet lease
+   while waiting for a permit, so there is a strict order and no cycle.
+4. **Both halves come back by dropping the guard.** `QuerySlot` carries the permit *and* the lease,
+   and there is still no `release()`. The permit returns synchronously; the lease is a `DELETE` a
+   destructor cannot await, so it is spawned — best effort, like every `Drop`-issued write here. A
+   leaked lease would be *worse* than the bug this fixed, so two things close it: the `DELETE` is a
+   CAS on `(holder_incarnation, holder_token)` (a coordinator whose slot was reclaimed must not free
+   its successor's), and a coordinator's own rows carrying a token it no longer holds are claimable
+   by its own next claim. The honest residue: a slot leaked by a coordinator that stays alive and
+   never claims on that warehouse again waits for its registration to go away — `reaper.rs`'s bound,
+   argued the same way.
+5. **The costs, stated.** One round trip per admit, on the hottest path. Fleet-wide waiting is
+   *polled* (`FLEET_POLL_INTERVAL`, jittered), so FIFO holds within a coordinator and not between
+   them — `LISTEN`/`NOTIFY` is the next step, not this one. Hand-off across coordinators costs one
+   poll interval. Coordinators that disagree about `K` bound the warehouse by `max(K)`, not by a sum.
+   And a raw `--workers` fleet has no warehouse row, so it keeps per-process admission — there is
+   nothing for two coordinators to agree they are bounding.
+6. **The fleet key is `warehouses.id`, never the name.** Names are unique per *account*, so shared
+   state keyed by one would merge two tenants' concurrency budgets. (The process-local gate is still
+   keyed by name and so two tenants can share a queue — a pre-existing fairness wart, untouched, and
+   the reason the fleet half deliberately does not inherit it.)
+
+`scheduler.rs` takes a `FleetGate` **trait**, not a `ServicesDb`. That is what keeps its bound, its
+fairness, its release-on-failure behaviour and now "two coordinators admit `K`, not `2K`" all
+provable by unit tests with no Postgres, no workers and no Flight.
 
 ## The result cache is keyed, never invalidated
 
@@ -453,8 +511,12 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # Query scheduler. `lldb-qe-coordinator` runs ONE query and exits (compose and the cluster smoke
 # test depend on that, unchanged). `lldb-qe-server` is the long-running shape: concurrent
 # submissions over Arrow Flight, a bounded number running per warehouse, the rest queued, every
-# query recorded in `queries`. Admission control is per COORDINATOR PROCESS, not fleet-wide —
-# two servers on one warehouse each enforce their own limit (crates/lldb-qe-core/src/scheduler.rs).
+# query recorded in `queries`. Admission control is FLEET-WIDE with a services DB: two servers on
+# one warehouse admit K between them, not K each (crates/lldb-qe-core/src/fleet_admission.rs).
+# The `query_scheduler` module carries both acceptance tests — the two-coordinator K-not-2K one
+# (asserted on `peak_concurrency` across every `queries.coordinator` value, which is exactly where
+# a per-process counter is self-consistently wrong), and the one that kills a slot-holder and
+# demands its slots come back.
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --workers http://127.0.0.1:50051 --metadata-url postgres://lldb@localhost/lldb
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_scheduler
