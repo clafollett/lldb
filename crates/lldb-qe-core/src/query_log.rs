@@ -140,11 +140,24 @@ impl QueryState {
 
 /// The non-terminal states, as a SQL literal list: `'queued', 'running'`.
 ///
-/// Written down **once** because four places need exactly this set and they must not drift: the
-/// `list_active_queries` filter below, the partial `queries_active_idx` predicate in `0004`, and
-/// [`crate::reaper`]'s stranded predicate — which is the dangerous one, since a new active state
-/// missing from it would be a state no reaper could ever resolve. Derived from [`QUERY_STATES`], so
-/// a state added to the enum lands here without anyone remembering to.
+/// Written down **once** so the predicates *on this side of the wire* cannot drift: the
+/// `list_active_queries` filter below, and [`crate::reaper`]'s stranded predicate — which is the
+/// dangerous one, since a new active state missing from it would be a state no reaper could ever
+/// resolve. Derived from [`QUERY_STATES`], so a state added to the enum lands in both without
+/// anyone remembering to.
+///
+/// **The partial `queries_active_idx` predicate in `0004` is not one of them, and cannot be.** It is
+/// fixed SQL inside an applied migration, and migrations here are append-only — `sqlx::migrate!`
+/// verifies their checksums, so `0004` can never be edited. Widening the active set therefore
+/// reaches every caller of this function automatically and reaches that index *not at all*:
+/// re-issuing it is a **separate obligation, discharged by a new migration** that drops and
+/// recreates the index with the wider predicate. Nothing here can detect that it was skipped, which
+/// is the reason to say so out loud rather than let this function look like it covers the index too.
+///
+/// Skipping it is a performance bug, not a correctness one, and that asymmetry is why the reaper's
+/// predicate remains the dangerous one: Postgres simply cannot use a partial index whose predicate
+/// no longer covers the filter, so "what is in flight" degrades to a sequential scan over all of
+/// history and still answers correctly.
 pub(crate) fn active_states_sql() -> String {
     states_sql(|state| !state.is_terminal())
 }

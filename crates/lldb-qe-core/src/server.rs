@@ -134,7 +134,7 @@ use crate::engine::{
     BoxResolver, TenantSession, TenantSessions, execute_query_cached, resolve_fleet, total_rows,
 };
 use crate::liveness::CoordinatorIdentity;
-use crate::query_log::QueryRecord;
+use crate::query_log::{QueryRecord, QueryState};
 use crate::rbac::{ObjectRef, Privilege, QueryAuthorization, Requirement};
 use crate::result_cache::ResultCache;
 use crate::scheduler::{Admission, AdmissionError, AdmissionLimits, DEFAULT_FLEET_KEY, Scheduler};
@@ -596,7 +596,7 @@ impl Coordinator {
         // From here on the row is active, and everything below is awaited — so everything below is
         // a point at which this whole future can be dropped, taking the terminal write with it.
         // The guard is what closes that hole; see [`ActiveQuery`].
-        let active = self
+        let mut active = self
             .db
             .clone()
             .zip(query_id)
@@ -611,6 +611,10 @@ impl Coordinator {
                 .register(id, account_id, target.admission_key.clone())
         });
 
+        // Only the cancellation branch below can clear this. Every other path has already issued
+        // its own terminal write by the time it returns here, and stands the guard down as it
+        // always did.
+        let mut cancellation_recorded = true;
         let result = match running {
             None => {
                 self.run_admitted(&target, &request.sql, query_id, authorization.as_ref())
@@ -631,12 +635,20 @@ impl Coordinator {
                         &target, &request.sql, query_id, authorization.as_ref(),
                     ) => outcome,
                     cancellation = running.cancelled() => {
+                        // Re-arm the guard with the cancellation *before* attempting the write.
+                        // Doing it in this order is what lets the failure path need no code of its
+                        // own: if the write lands, the guard is stood down below and this cost
+                        // nothing; if it does not, the guard is already carrying the right terminal
+                        // state rather than its default of "abandoned by its client".
                         let reason = cancellation.reason();
+                        if let Some(active) = active.as_mut() {
+                            active.will_record_cancellation(&reason);
+                        }
                         // Written here rather than inside `run_admitted`, which no longer exists by
                         // the time this runs. Unconditional, like every other terminal write on
                         // this path: this task owns the row and is the authority on it, which is
                         // exactly the asymmetry `crate::reaper` rests on.
-                        self.mark_cancelled(query_id, &reason).await;
+                        cancellation_recorded = self.mark_cancelled(query_id, &reason).await;
                         Err(QueryError::Cancelled(reason))
                     }
                 }
@@ -644,10 +656,23 @@ impl Coordinator {
         };
         // Reached on every path that produced an outcome, and each of them — success, failure,
         // refusal, cancellation — has already written a terminal state, so the guard has nothing
-        // left to do. Standing it down even when that write *failed* is deliberate: its fallback
-        // records the row as abandoned by its client, and for a cancelled query that would be a
-        // worse lie than the row staying active for a reaper to find.
-        if let Some(active) = active {
+        // left to do and is stood down.
+        //
+        // Except when a cancellation's own terminal write *failed*, which is the one case this
+        // condition exists for. Standing the guard down there would leave the row in `running` with
+        // nothing left in the world to resolve it: not this process, which has just declared itself
+        // finished with the query, and not `crate::reaper`, whose predicate takes a row only when no
+        // *live* coordinator matches both its slot and its incarnation — and this coordinator is
+        // alive. The row would sit active until this process exits, counting against
+        // `list_active_queries` and against every later query's `peak_concurrency`, which is exactly
+        // the drift the reaper was built to remove.
+        //
+        // So the guard stays armed instead — and it stays armed with the cancellation, because the
+        // objection to its default is still right: recording a query somebody deliberately stopped
+        // as abandoned by its client would be a worse lie than either outcome. `Drop` writes
+        // `cancelled`, on a second and independent round trip, which is where a blip that took the
+        // first one has the best chance of already being over.
+        if cancellation_recorded && let Some(active) = active {
             active.finished();
         }
         match &result {
@@ -1065,15 +1090,29 @@ impl Coordinator {
     ///
     /// Best effort like the rest: a control-plane hiccup must not become a data-plane outage, and
     /// the slot has already been returned by the time this runs.
-    async fn mark_cancelled(&self, query_id: Option<i64>, reason: &str) {
-        if let (Some(db), Some(id)) = (&self.db, query_id)
-            && let Err(write_error) = db.mark_query_cancelled(id, reason).await
-        {
-            tracing::warn!(
-                query_id = id,
-                error = %format!("{write_error:#}"),
-                "could not record the query's cancellation"
-            );
+    ///
+    /// Returns **whether the row actually reached `cancelled`**, because best effort is not the same
+    /// as nobody caring. `run_query` stands the [`ActiveQuery`] guard down only on `true`; on
+    /// `false` it leaves the guard armed with the cancellation, so the row still reaches a terminal
+    /// state from the destructor instead of sitting in `running` until this process exits.
+    async fn mark_cancelled(&self, query_id: Option<i64>, reason: &str) -> bool {
+        let (Some(db), Some(id)) = (&self.db, query_id) else {
+            // No services database or no id means there is no row — so there is nothing to write
+            // and, equally, nothing left active. Reported as recorded, which is also the only
+            // honest answer for the guard: it cannot exist without both of these either.
+            return true;
+        };
+        match db.mark_query_cancelled(id, reason).await {
+            Ok(_) => true,
+            Err(write_error) => {
+                tracing::warn!(
+                    query_id = id,
+                    error = %format!("{write_error:#}"),
+                    "could not record the query's cancellation; \
+                     leaving it to the guard to close out"
+                );
+                false
+            }
         }
     }
 
@@ -1095,13 +1134,19 @@ impl Coordinator {
 /// What a client sees in `queries.error` when it hung up before its query finished.
 const ABANDONED: &str = "the client disconnected before the query finished";
 
-/// Abandoned queries this process has successfully closed out, and the ones it could not.
+/// Rows [`ActiveQuery`]'s destructor has successfully closed out, and the ones it could not.
 ///
 /// A best-effort write issued from a destructor is the least observable thing in this module:
 /// nobody awaits it, no request fails when it does not happen, and the only trace it leaves is a
 /// log line. These make it countable — for an operator who wants to know whether clients are
 /// hanging up, and for the test that proves the guard actually fires. Process-wide rather than
 /// per-coordinator because that is the scope a destructor can reach.
+///
+/// Named for the case they were built for and the case that overwhelmingly dominates them. The
+/// other one — a cancellation whose own terminal write failed, see [`Unrecorded`] — is closed out
+/// by the same destructor and counted here too, because what these actually measure is
+/// guard-issued writes, and `abandoned_unclosed`'s meaning ("history has rows stuck in
+/// `queued`/`running` that only a reaper will resolve") is exactly as true of that case.
 static ABANDONED_CLOSED: AtomicUsize = AtomicUsize::new(0);
 static ABANDONED_UNCLOSED: AtomicUsize = AtomicUsize::new(0);
 
@@ -1132,6 +1177,16 @@ pub fn abandoned_unclosed() -> usize {
 /// `Handle::try_current` rather than a bare `tokio::spawn` because dropping after the runtime has
 /// gone (shutdown, a test) would otherwise panic in a destructor.
 ///
+/// # It is also the backstop for a terminal write that failed
+///
+/// A client that vanishes is not the only way a row is left active. A **cancellation** whose own
+/// `UPDATE` failed — a Postgres blip in exactly that instant — leaves one too, and that row is
+/// worse off than an abandoned one: [`crate::reaper`] takes a row only when no *live* coordinator
+/// matches its slot and incarnation, and the coordinator that just failed to write it is alive. So
+/// nothing out of process would resolve it either, and it would sit in `running` until the process
+/// exited. `run_query` therefore does not stand the guard down after a failed cancellation write,
+/// and tells it — via [`Unrecorded`] — to record `cancelled` rather than its default.
+///
 /// Two gaps remain, and both are a reaper's job rather than oversights:
 ///
 /// - **A coordinator that dies outright.** Nothing in-process can close out a row once the process
@@ -1150,6 +1205,38 @@ struct ActiveQuery {
     db: ServicesDb,
     query_id: i64,
     finished: bool,
+    unrecorded: Unrecorded,
+}
+
+/// What [`ActiveQuery`]'s destructor writes when it fires.
+///
+/// Two cases, and the distinction is the entire reason this is not a `bool`. A row left active
+/// because its client vanished and a row left active because a *cancellation's* terminal write
+/// failed are different events, and recording the first onto the second would tell an operator that
+/// somebody hung up on a query they had in fact deliberately stopped — a lie in history, and in
+/// `queries.error` the only place anyone would ever look for the truth.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Unrecorded {
+    /// The default, and the case this guard was built for: nothing wrote a terminal state, so the
+    /// only remaining explanation is that the request future was dropped out from under the query.
+    AbandonedByClient,
+    /// The query *was* cancelled and [`Coordinator::mark_cancelled`]'s write did not land. Carries
+    /// the same reason that write carried, so the row is indistinguishable from one the ordinary
+    /// path wrote.
+    Cancelled(String),
+}
+
+impl Unrecorded {
+    /// The row this guard would write: the state, and the prose that goes in `error`.
+    ///
+    /// Pulled out of `Drop` so the choice is assertable without a database, a runtime, or a
+    /// destructor — which is the only part of this mechanism a test can reach directly.
+    fn terminal(&self) -> (QueryState, &str) {
+        match self {
+            Unrecorded::AbandonedByClient => (QueryState::Failed, ABANDONED),
+            Unrecorded::Cancelled(reason) => (QueryState::Cancelled, reason),
+        }
+    }
 }
 
 impl ActiveQuery {
@@ -1158,10 +1245,23 @@ impl ActiveQuery {
             db,
             query_id,
             finished: false,
+            unrecorded: Unrecorded::AbandonedByClient,
         }
     }
 
+    /// This query was cancelled: if the guard fires, record *that* rather than an abandonment.
+    ///
+    /// Called before the cancellation's own terminal write is attempted, so the guard is correct
+    /// whether or not that write lands. It does not arm the guard — the guard is armed from
+    /// construction — it only changes what arming means.
+    fn will_record_cancellation(&mut self, reason: &str) {
+        self.unrecorded = Unrecorded::Cancelled(reason.to_string());
+    }
+
     /// The query reached a terminal state under its own power; stand down.
+    ///
+    /// Consuming `self` is deliberate: a guard that has been stood down cannot be re-armed, so the
+    /// only way to reach `Drop` with something left to write is never to have called this.
     fn finished(mut self) {
         self.finished = true;
     }
@@ -1173,17 +1273,32 @@ impl Drop for ActiveQuery {
             return;
         }
         let (db, id) = (self.db.clone(), self.query_id);
+        let unrecorded = self.unrecorded.clone();
+        let (state, detail) = unrecorded.terminal();
         let Ok(handle) = tokio::runtime::Handle::try_current() else {
             ABANDONED_UNCLOSED.fetch_add(1, AtomicOrdering::AcqRel);
             tracing::warn!(
                 query_id = id,
-                "no runtime left to close out an abandoned query; the row stays active"
+                state = %state,
+                "no runtime left to close out an active query; the row stays active"
             );
             return;
         };
-        tracing::info!(query_id = id, "query abandoned by its client; recording it");
+        tracing::info!(
+            query_id = id,
+            state = %state,
+            detail = %detail,
+            "closing out a query row the request left active"
+        );
         handle.spawn(async move {
-            match db.mark_query_failed(id, ABANDONED).await {
+            // One arm per variant rather than one call parameterised by state, because
+            // `mark_query_failed` and `mark_query_cancelled` are the two documented entry points
+            // and a new `Unrecorded` variant should fail to compile here rather than pick one.
+            let written = match &unrecorded {
+                Unrecorded::AbandonedByClient => db.mark_query_failed(id, ABANDONED).await,
+                Unrecorded::Cancelled(reason) => db.mark_query_cancelled(id, reason).await,
+            };
+            match written {
                 Ok(_) => {
                     ABANDONED_CLOSED.fetch_add(1, AtomicOrdering::AcqRel);
                 }
@@ -1192,7 +1307,7 @@ impl Drop for ActiveQuery {
                     tracing::warn!(
                         query_id = id,
                         error = %format!("{error:#}"),
-                        "could not record an abandoned query"
+                        "could not close out an active query row"
                     );
                 }
             }
@@ -1911,5 +2026,66 @@ mod tests {
         let error = outcome.result.expect_err("the server is going away");
         assert_eq!(error.to_status().code(), tonic::Code::Unavailable);
         assert!(error.to_string().contains("shutting down"), "{error}");
+    }
+
+    /// The guard's default is the case it was built for: nobody wrote anything, so the client
+    /// vanished.
+    #[test]
+    fn an_untouched_guard_records_an_abandonment() {
+        let (state, detail) = Unrecorded::AbandonedByClient.terminal();
+        assert_eq!(state, QueryState::Failed);
+        assert_eq!(detail, ABANDONED);
+        assert!(
+            state.is_terminal(),
+            "the whole point of the guard is that the row stops being active"
+        );
+    }
+
+    /// A cancellation whose terminal write failed must reach `cancelled`, carrying the same reason
+    /// the write would have carried — **not** `failed` with the abandonment prose.
+    ///
+    /// This is the assertion the fix exists for. Standing the guard down there would leave the row
+    /// in `running` forever (this coordinator is alive, so `crate::reaper` will not take it), and
+    /// leaving it armed with the *default* would record a query somebody deliberately stopped as one
+    /// whose client hung up. Both are wrong, and this is the third option.
+    #[test]
+    fn a_guard_told_about_a_cancellation_records_the_cancellation() {
+        let unrecorded = Unrecorded::Cancelled("cancelled: by alice".to_string());
+        let (state, detail) = unrecorded.terminal();
+        assert_eq!(
+            state,
+            QueryState::Cancelled,
+            "recording a cancelled query as abandoned by its client is the lie this avoids"
+        );
+        assert_eq!(
+            detail, "cancelled: by alice",
+            "the reason must survive, or the row cannot say who stopped it"
+        );
+        assert!(state.is_terminal(), "the row must stop being active");
+        assert!(
+            state.may_carry_an_error(),
+            "`queries_error_only_when_unsuccessful` must permit the reason this writes"
+        );
+    }
+
+    /// With no services database there is no row, so "the cancellation was recorded" is vacuously
+    /// true — and it must report that rather than `false`, which would ask `run_query` to leave a
+    /// guard armed that cannot exist without a database either.
+    #[tokio::test]
+    async fn a_cancellation_with_no_row_to_write_counts_as_recorded() {
+        let coordinator =
+            Coordinator::new(SessionContext::new(), None, CoordinatorConfig::default());
+        assert!(
+            coordinator
+                .mark_cancelled(None, "cancelled: by alice")
+                .await,
+            "no id and no database means nothing was left active"
+        );
+        assert!(
+            coordinator
+                .mark_cancelled(Some(7), "cancelled: by alice")
+                .await,
+            "an id without a database still names no row this process can write"
+        );
     }
 }
