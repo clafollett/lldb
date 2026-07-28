@@ -15,8 +15,11 @@
 //!            submit                admit                 finish
 //!   (client) ──────▶ queued ──────────────▶ running ──────────────▶ succeeded
 //!                      │                       │                 └─▶ failed
-//!                      └───────────────────────────────────────────▶ failed
-//!                        (rejected, or the coordinator shut down)
+//!                      │                       └────────────────────▶ cancelled
+//!                      ├───────────────────────────────────────────▶ failed
+//!                      │  (rejected, or the coordinator shut down)
+//!                      └───────────────────────────────────────────▶ cancelled
+//!                         (stopped before it was ever admitted)
 //! ```
 //!
 //! Three timestamps, and the gaps between them are the point:
@@ -69,9 +72,9 @@ pub const MAX_ERROR_LEN: usize = 4000;
 
 /// Where a query is in its life.
 ///
-/// Four states, and the split between `queued` and `running` is the whole reason this issue
-/// exists: a scheduler that bounds concurrency *must* be able to say "accepted, but not yet
-/// executing", and a history that cannot express that cannot explain a slow afternoon.
+/// The split between `queued` and `running` is the whole reason this type exists: a scheduler that
+/// bounds concurrency *must* be able to say "accepted, but not yet executing", and a history that
+/// cannot express that cannot explain a slow afternoon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryState {
     /// Accepted by a coordinator and waiting for an admission slot.
@@ -82,15 +85,27 @@ pub enum QueryState {
     Succeeded,
     /// Finished without results. `error` says why.
     Failed,
+    /// Stopped on request before it finished — see [`crate::cancel`]. `error` records who asked.
+    ///
+    /// Its own state rather than a `failed` row with a polite message, because the two answer
+    /// different questions: `failed` means the query tried and could not, and is what an operator
+    /// counts to decide whether the system is healthy. A cancellation returned no rows *on
+    /// purpose*, and folding it into failures makes careful users look like broken queries.
+    Cancelled,
 }
 
-/// Every legal state, in lifecycle order. Kept next to the enum so a fifth state cannot be added
+/// Every legal state, in lifecycle order. Kept next to the enum so a sixth state cannot be added
 /// without this (and the migration's `CHECK`) being updated.
-pub const QUERY_STATES: [QueryState; 4] = [
+///
+/// The array's *length* is the trip-wire: adding a variant without touching this line does not
+/// compile, which is what forced migration `0007` to exist when `Cancelled` was added rather than
+/// leaving a state the database would reject at write time.
+pub const QUERY_STATES: [QueryState; 5] = [
     QueryState::Queued,
     QueryState::Running,
     QueryState::Succeeded,
     QueryState::Failed,
+    QueryState::Cancelled,
 ];
 
 impl QueryState {
@@ -101,14 +116,56 @@ impl QueryState {
             QueryState::Running => "running",
             QueryState::Succeeded => "succeeded",
             QueryState::Failed => "failed",
+            QueryState::Cancelled => "cancelled",
         }
     }
 
     /// True for a state a query never leaves. The one property callers actually branch on, so it
     /// is stated once here rather than re-derived at each call site.
     pub fn is_terminal(self) -> bool {
-        matches!(self, QueryState::Succeeded | QueryState::Failed)
+        matches!(
+            self,
+            QueryState::Succeeded | QueryState::Failed | QueryState::Cancelled
+        )
     }
+
+    /// True for a state that may carry an `error`, matching `queries_error_only_when_unsuccessful`.
+    ///
+    /// A cancellation has an explanation and is not a failure, which is exactly the pair migration
+    /// `0007` had to widen that constraint for.
+    pub fn may_carry_an_error(self) -> bool {
+        matches!(self, QueryState::Failed | QueryState::Cancelled)
+    }
+}
+
+/// The non-terminal states, as a SQL literal list: `'queued', 'running'`.
+///
+/// Written down **once** because four places need exactly this set and they must not drift: the
+/// `list_active_queries` filter below, the partial `queries_active_idx` predicate in `0004`, and
+/// [`crate::reaper`]'s stranded predicate — which is the dangerous one, since a new active state
+/// missing from it would be a state no reaper could ever resolve. Derived from [`QUERY_STATES`], so
+/// a state added to the enum lands here without anyone remembering to.
+pub(crate) fn active_states_sql() -> String {
+    states_sql(|state| !state.is_terminal())
+}
+
+/// The terminal states, as a SQL literal list: `'succeeded', 'failed', 'cancelled'`.
+///
+/// Used by the `finished_at` CASE in [`ServicesDb::set_query_state`], which is the one place a
+/// forgotten state produces a silently *wrong* row rather than a rejected one — a terminal query
+/// with no finish time reads to [`peak_concurrency`] as still running, which is precisely the drift
+/// [`crate::reaper`] exists to remove.
+pub(crate) fn terminal_states_sql() -> String {
+    states_sql(|state| state.is_terminal())
+}
+
+fn states_sql(wanted: impl Fn(QueryState) -> bool) -> String {
+    QUERY_STATES
+        .into_iter()
+        .filter(|state| wanted(*state))
+        .map(|state| format!("'{}'", state.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 impl fmt::Display for QueryState {
@@ -331,6 +388,27 @@ impl ServicesDb {
             .await
     }
 
+    /// Mark a query as cancelled, recording who asked and why.
+    ///
+    /// Legal from `queued` as well as from `running`, like a failure and for the same reason: a
+    /// query stopped while it was still waiting for a slot never started, and its `started_at`
+    /// stays `NULL` to say so. `reason` is stored in `error`, which migration `0007` widened to
+    /// permit precisely this — a cancellation that cannot say who cancelled it is close to useless.
+    ///
+    /// Written by the **owning coordinator**, unconditionally, exactly like every other terminal
+    /// write here. Cancellation adds no third writer to a query row: the request arrives on the
+    /// Flight service, but all it does is signal the task that already owns the row, and that task
+    /// issues this write. See [`crate::cancel`] and [`crate::reaper`]'s decision 3.
+    pub async fn mark_query_cancelled(&self, id: i64, reason: &str) -> Result<QueryRecord> {
+        self.set_query_state(
+            id,
+            QueryState::Cancelled,
+            Some(&truncate_error(reason)),
+            None,
+        )
+        .await
+    }
+
     /// The single UPDATE behind every transition.
     ///
     /// One statement, not read-then-write — but no longer because there is only one writer. That
@@ -367,11 +445,12 @@ impl ServicesDb {
         // history entry that lies about what happened. No caller can reach that today — success
         // and failure are mutually exclusive in `run_query` — but the invariant belongs where it
         // is written, not in the discipline of every future caller.
+        let terminal = terminal_states_sql();
         let row = sqlx::query_as::<_, QueryRow>(&format!(
             "UPDATE queries SET \
                  state = $2::TEXT, \
                  started_at = CASE WHEN $2::TEXT = 'running' THEN now() ELSE started_at END, \
-                 finished_at = CASE WHEN $2::TEXT IN ('succeeded', 'failed') THEN now() \
+                 finished_at = CASE WHEN $2::TEXT IN ({terminal}) THEN now() \
                                     ELSE finished_at END, \
                  error = $3::TEXT, \
                  result_rows = CASE WHEN $2::TEXT = 'succeeded' THEN $4::BIGINT ELSE NULL END \
@@ -423,9 +502,10 @@ impl ServicesDb {
     /// Read it with the module docs in mind: a `running` row proves a coordinator *said* it was
     /// running, not that the process is still alive.
     pub async fn list_active_queries(&self, account_id: i64) -> Result<Vec<QueryRecord>> {
+        let active = active_states_sql();
         let rows = sqlx::query_as::<_, QueryRow>(&format!(
             "SELECT {QUERY_COLUMNS} FROM queries \
-             WHERE account_id = $1 AND state IN ('queued', 'running') \
+             WHERE account_id = $1 AND state IN ({active}) \
              ORDER BY submitted_at, id"
         ))
         .bind(account_id)
@@ -533,6 +613,47 @@ mod tests {
         assert!(!QueryState::Running.is_terminal());
         assert!(QueryState::Succeeded.is_terminal());
         assert!(QueryState::Failed.is_terminal());
+        // A cancelled query is *finished*. If this ever reads false, `crate::reaper` starts
+        // treating a query somebody deliberately stopped as one that was abandoned.
+        assert!(QueryState::Cancelled.is_terminal());
+    }
+
+    #[test]
+    fn only_an_unsuccessful_query_may_carry_an_error() {
+        // The Rust half of `queries_error_only_when_unsuccessful`. It is stated here as well as in
+        // the migration because a caller that gets this wrong learns about it as a constraint
+        // violation from Postgres, which is a much worse error message than a wrong branch here.
+        assert!(QueryState::Failed.may_carry_an_error());
+        assert!(QueryState::Cancelled.may_carry_an_error());
+        assert!(!QueryState::Succeeded.may_carry_an_error());
+        assert!(!QueryState::Queued.may_carry_an_error());
+        assert!(!QueryState::Running.may_carry_an_error());
+    }
+
+    /// The two SQL literal lists, which several statements and one migration have to agree on.
+    ///
+    /// Asserted on the *spelling* as well as the membership, because these strings are spliced into
+    /// statements and into an `IN (...)` that must match the migration's CHECK exactly.
+    #[test]
+    fn the_state_lists_partition_every_state_between_them() {
+        assert_eq!(active_states_sql(), "'queued', 'running'");
+        assert_eq!(
+            terminal_states_sql(),
+            "'succeeded', 'failed', 'cancelled'",
+            "a terminal state missing here gets no finished_at, and reads to peak_concurrency as \
+             still running forever"
+        );
+        // Nothing may be in both lists, and nothing may be in neither: a state that fell through
+        // both would be invisible to `list_active_queries` *and* never stamped with a finish time.
+        for state in QUERY_STATES {
+            let quoted = format!("'{}'", state.as_str());
+            assert_eq!(
+                active_states_sql().contains(&quoted) as u8
+                    + terminal_states_sql().contains(&quoted) as u8,
+                1,
+                "{state} must be in exactly one of the two lists"
+            );
+        }
     }
 
     #[test]
@@ -590,6 +711,26 @@ mod tests {
     fn a_query_that_never_started_contributes_nothing() {
         assert_eq!(peak_concurrency(&[record(1, None, None)]), 0);
         assert_eq!(peak_concurrency(&[]), 0);
+    }
+
+    /// The issue's fourth bullet, as an assertion: the sweep-line must treat a cancellation as an
+    /// **ending**.
+    ///
+    /// It does, and the mechanism is worth naming because it is not a special case here: a
+    /// cancelled row is stamped with `finished_at` by `set_query_state`'s `IN (terminal)` CASE, so
+    /// its interval closes like any other. Were `Cancelled` missing from `terminal_states_sql`, the
+    /// row would carry no finish time, `peak_concurrency` would extend it past every later query,
+    /// and a correct scheduler would start looking broken — the exact drift `crate::reaper` exists
+    /// to remove, reintroduced by the feature meant to *return* the slot.
+    #[test]
+    fn a_cancelled_query_ends_its_interval_like_any_other() {
+        let mut cancelled = record(1, Some(0), Some(5));
+        cancelled.state = QueryState::Cancelled;
+        cancelled.result_rows = None;
+        cancelled.error = Some("cancelled by user `dana`".to_string());
+        let later = record(2, Some(5), Some(10));
+        assert_eq!(peak_concurrency(&[cancelled.clone(), later]), 1);
+        assert_eq!(cancelled.execution_time(), Some(TimeDelta::seconds(5)));
     }
 
     #[test]

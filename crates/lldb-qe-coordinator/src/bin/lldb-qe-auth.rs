@@ -154,7 +154,10 @@ enum RoleCommand {
 struct GrantArgs {
     #[arg(long)]
     role: String,
-    /// SELECT | INSERT | DELETE | UPDATE | USAGE | ALL (case-insensitive).
+    /// SELECT | INSERT | DELETE | UPDATE | USAGE | CANCEL | ALL (case-insensitive).
+    ///
+    /// CANCEL is held on a warehouse and permits stopping any query running on it. USAGE — which
+    /// every submitter to that warehouse already needs — deliberately does not imply it; ALL does.
     #[arg(long)]
     privilege: String,
     /// catalog | namespace | table | warehouse.

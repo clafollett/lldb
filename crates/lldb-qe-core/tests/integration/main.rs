@@ -84,6 +84,7 @@ mod fleet_discovery;
 mod flight_transport;
 mod iceberg_roundtrip;
 mod manifest_examples;
+mod query_cancel;
 mod query_reaper;
 mod query_scheduler;
 mod result_cache_db;

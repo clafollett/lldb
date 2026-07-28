@@ -8,8 +8,8 @@
 //!
 //! # The model, in four nouns
 //!
-//! - A **privilege** ([`Privilege`]) is a verb: `SELECT`, `INSERT`, `DELETE`, `UPDATE`, `USAGE`, or
-//!   `ALL`.
+//! - A **privilege** ([`Privilege`]) is a verb: `SELECT`, `INSERT`, `DELETE`, `UPDATE`, `USAGE`,
+//!   `CANCEL`, or `ALL`.
 //! - An **object** ([`ObjectRef`]) is a typed, dotted path: a catalog, a namespace, a table, or a
 //!   warehouse.
 //! - A **grant** ([`Grant`]) attaches one privilege on one object to one role.
@@ -33,7 +33,12 @@
 //! `lldb.sales.orders` but never `lldb.salesforce.orders`, which is the bug a naive
 //! `starts_with` would ship. Warehouses are deliberately *outside* this hierarchy: a warehouse
 //! name is a bare DNS label in its own namespace, so a grant on a catalog implies nothing about
-//! compute, and a `USAGE` grant on a warehouse implies nothing about data.
+//! compute, and a `USAGE` or `CANCEL` grant on a warehouse implies nothing about data.
+//!
+//! `ALL` is the one wildcard, and it is a wildcard over *privileges* only, never over objects. That
+//! has a consequence worth stating rather than discovering: adding a privilege — as `CANCEL` was
+//! added — silently widens every pre-existing `ALL` grant on the same object. An operator who wants
+//! submit-without-kill on a warehouse must write the narrow privileges rather than `ALL`.
 //!
 //! # Enforcement is at plan time, on the *logical* plan
 //!
@@ -111,18 +116,26 @@ pub enum Privilege {
     Update,
     /// Run something *on* an object without reading it — today, a warehouse.
     Usage,
+    /// Stop a query that is running on a warehouse. Held on the warehouse, never on data.
+    ///
+    /// Separate from [`Privilege::Usage`] on purpose. `USAGE` is what lets a caller *submit* to a
+    /// warehouse; if cancelling needed only that, everyone entitled to run a query on a warehouse
+    /// would be entitled to kill everyone else's on it, and "cancelling somebody else's query needs
+    /// a grant" would be true only in a technical sense. See [`crate::cancel`].
+    Cancel,
     /// Every other privilege on the same object.
     All,
 }
 
-/// Every legal privilege, in the order the CLI's help lists them. Next to the enum so a seventh
+/// Every legal privilege, in the order the CLI's help lists them. Next to the enum so an eighth
 /// cannot be added without this — and the migration's `CHECK` — being updated with it.
-pub const PRIVILEGES: [Privilege; 6] = [
+pub const PRIVILEGES: [Privilege; 7] = [
     Privilege::Select,
     Privilege::Insert,
     Privilege::Delete,
     Privilege::Update,
     Privilege::Usage,
+    Privilege::Cancel,
     Privilege::All,
 ];
 
@@ -136,6 +149,7 @@ impl Privilege {
             Privilege::Delete => "DELETE",
             Privilege::Update => "UPDATE",
             Privilege::Usage => "USAGE",
+            Privilege::Cancel => "CANCEL",
             Privilege::All => "ALL",
         }
     }
@@ -168,6 +182,7 @@ impl FromStr for Privilege {
             "DELETE" => Ok(Privilege::Delete),
             "UPDATE" => Ok(Privilege::Update),
             "USAGE" => Ok(Privilege::Usage),
+            "CANCEL" => Ok(Privilege::Cancel),
             "ALL" => Ok(Privilege::All),
             other => bail!(
                 "unknown privilege `{other}` (expected one of: {})",
@@ -722,12 +737,39 @@ mod tests {
             Privilege::Delete,
             Privilege::Update,
             Privilege::Usage,
+            Privilege::Cancel,
         ] {
             assert!(
                 !g.covers(&need(p, ObjectType::Table, "lldb.sales.orders")),
                 "SELECT must not imply {p}"
             );
         }
+    }
+
+    /// Cancelling is compute, and it is not implied by being allowed to *use* the compute.
+    ///
+    /// The pair that matters: `USAGE ON WAREHOUSE analytics` — which every submitter to that
+    /// warehouse must hold — must not let its holder stop somebody else's query, or the grant this
+    /// privilege exists for would be decorative.
+    #[test]
+    fn cancelling_is_its_own_privilege_on_a_warehouse() {
+        let usage = grant(Privilege::Usage, ObjectType::Warehouse, "analytics");
+        let cancel = grant(Privilege::Cancel, ObjectType::Warehouse, "analytics");
+        let need_cancel = need(Privilege::Cancel, ObjectType::Warehouse, "analytics");
+
+        assert!(!usage.covers(&need_cancel), "USAGE must not imply CANCEL");
+        assert!(cancel.covers(&need_cancel));
+        // …and it does not run backwards either: holding CANCEL is not permission to submit.
+        assert!(!cancel.covers(&need(Privilege::Usage, ObjectType::Warehouse, "analytics")));
+        // Per warehouse, like every other warehouse grant.
+        assert!(!cancel.covers(&need(Privilege::Cancel, ObjectType::Warehouse, "etl")));
+        // And a catalog-wide grant reaches no warehouse at all, CANCEL included.
+        let catalog = grant(Privilege::All, ObjectType::Catalog, "lldb");
+        assert!(!catalog.covers(&need_cancel));
+        // `ALL` on the warehouse *does* cover it — the honest cost of adding a privilege under an
+        // existing wildcard, asserted so nobody discovers it in production instead.
+        let all = grant(Privilege::All, ObjectType::Warehouse, "analytics");
+        assert!(all.covers(&need_cancel));
     }
 
     #[test]
