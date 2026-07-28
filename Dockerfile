@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 #
-# One image, both binaries. The coordinator and worker MUST be the identical build — serialized
+# One image, every binary. The coordinator and worker MUST be the identical build — serialized
 # DataFusion physical plans are not cross-version compatible — so we build them together and
 # select the role via the container `command`.
 #
@@ -54,15 +54,23 @@ ARG GIT_SHA=unknown
 ENV LLDB_GIT_SHA=$GIT_SHA
 # The coordinator package also builds the control-plane one-shots: `lldb-qe-migrate` (applies
 # services-DB migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual
-# warehouse) and `lldb-qe-reap` (resolve query-history rows stranded by a dead coordinator), plus
-# `lldb-qe-server`, the long-running query scheduler. They ship in the same image on purpose —
-# migrations are embedded in the binary at compile time, the build that writes a warehouse row must
-# be the build that reads it, and a coordinator (one-shot or serving) must be the identical build to
-# every worker it ships a plan to.
+# warehouse), `lldb-qe-auth` (users, API keys, roles, grants) and `lldb-qe-reap` (resolve
+# query-history rows stranded by a dead coordinator), plus `lldb-qe-server`, the long-running query
+# scheduler. They ship in the same image on purpose — migrations are embedded in the binary at
+# compile time, the build that writes a warehouse row must be the build that reads it, the build
+# that writes a grant must be the build that checks it, and a coordinator (one-shot or serving) must
+# be the identical build to every worker it ships a plan to.
+#
+# **Every binary this package produces must be listed here and copied into the runtime stage
+# below.** `docker-compose.yml` and the CDK stack both invoke these by name, so a binary that is
+# built but not copied is a service whose entrypoint does not exist in the image it runs — which is
+# exactly how `lldb-qe-auth` went missing (issue #51). `distributed_cluster.rs`'s
+# `image_contains_every_binary_the_cluster_invokes` is the test that now fails when this list and
+# `src/bin/` disagree.
 RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
     && cp target/release/lldb-qe-coordinator target/release/lldb-qe-migrate \
-          target/release/lldb-qe-warehouse target/release/lldb-qe-reap \
-          target/release/lldb-qe-server \
+          target/release/lldb-qe-warehouse target/release/lldb-qe-auth \
+          target/release/lldb-qe-reap target/release/lldb-qe-server \
           target/release/lldb-qe-worker /usr/local/bin/
 
 # ---- Runtime -------------------------------------------------------------------------------
@@ -77,6 +85,7 @@ RUN apt-get update \
 COPY --from=builder /usr/local/bin/lldb-qe-coordinator /usr/local/bin/lldb-qe-coordinator
 COPY --from=builder /usr/local/bin/lldb-qe-migrate /usr/local/bin/lldb-qe-migrate
 COPY --from=builder /usr/local/bin/lldb-qe-warehouse /usr/local/bin/lldb-qe-warehouse
+COPY --from=builder /usr/local/bin/lldb-qe-auth /usr/local/bin/lldb-qe-auth
 COPY --from=builder /usr/local/bin/lldb-qe-reap /usr/local/bin/lldb-qe-reap
 COPY --from=builder /usr/local/bin/lldb-qe-server /usr/local/bin/lldb-qe-server
 COPY --from=builder /usr/local/bin/lldb-qe-worker /usr/local/bin/lldb-qe-worker
