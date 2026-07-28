@@ -530,13 +530,28 @@ impl Admission {
     /// A consistent-enough reading of the counters. Each is atomic; the set is not a snapshot
     /// under a lock, which is the right trade for a gauge that exists to be logged and asserted on
     /// after the storm has passed.
+    ///
+    /// **A peak is never reported below its current value**, and that clamp is load-bearing rather
+    /// than cosmetic. A place is taken in two steps — `queued` is raised by the compare-and-swap in
+    /// [`Self::reserve_queue_slot`], then `peak_queued` is raised to match — and `running` is the
+    /// same shape. Two atomics cannot be advanced as one without a lock, so between those steps an
+    /// observer could read `queued: 1, peak_queued: 0`: a snapshot asserting a peak *lower* than
+    /// something it can see happening right now. Taking the max here closes that window for every
+    /// reader at once, and cannot over-report — if the current value exceeds the stored peak, the
+    /// true peak is at least the current value by definition.
+    ///
+    /// The alternative, making each caller spin until the peak catches up, pushes a detail of this
+    /// module's internals onto everything that reads a gauge, and would have to be got right again
+    /// at every call site.
     pub fn snapshot(&self) -> AdmissionSnapshot {
+        let running = self.running.load(Ordering::Acquire);
+        let queued = self.queued.load(Ordering::Acquire);
         AdmissionSnapshot {
             max_concurrent: self.limits.max_concurrent,
-            running: self.running.load(Ordering::Acquire),
-            queued: self.queued.load(Ordering::Acquire),
-            peak_running: self.peak_running.load(Ordering::Acquire),
-            peak_queued: self.peak_queued.load(Ordering::Acquire),
+            running,
+            queued,
+            peak_running: self.peak_running.load(Ordering::Acquire).max(running),
+            peak_queued: self.peak_queued.load(Ordering::Acquire).max(queued),
             admitted: self.admitted.load(Ordering::Acquire),
             refused: self.refused.load(Ordering::Acquire),
             fleet_waits: self.fleet_waits.load(Ordering::Acquire),
