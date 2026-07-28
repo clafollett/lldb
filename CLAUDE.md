@@ -56,8 +56,9 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   hands a slot back (`cancel.rs`), query history
   (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
   (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
-  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — and the per-account
-  catalog/warehouse partitioning those two rest on (`tenancy.rs`)
+  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — the transport those
+  credentials travel over (`tls.rs`), and the per-account
+  catalog/warehouse partitioning auth and rbac rest on (`tenancy.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
   migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
@@ -220,6 +221,48 @@ Two boundaries, two claims. The **coordinator** proves "you are user X of tenant
 only proves membership of the deployment: `LLDB_FLEET_TOKEN`, constant-time compared, required if
 set and open-with-a-loud-warning if not. Per-request identity at the worker boundary is a follow-on,
 not something this already does.
+
+## TLS on both boundaries, and a plaintext port you have to ask for
+
+Both credentials above used to cross the wire in the clear. `tls.rs` puts
+`tonic::transport::{ServerTlsConfig, ClientTlsConfig}` on **both** Flight boundaries — in process,
+not behind a terminating proxy, because workers pull from each other directly and a single front
+door would encrypt one hop of a mesh. Certificates are **mounted files** (`--tls-cert`/`--tls-key`
+to serve, `--tls-ca`/`--tls-domain` to dial); the engine generates and issues nothing. Five things
+to keep straight.
+
+1. **The rule is not "TLS unless you said otherwise".** That would make `cargo run` need
+   certificates, which is the same rule that forbids it needing Postgres. The rule is: **binding a
+   plaintext port while a credential is actually being checked on it requires `--allow-plaintext`**
+   — because that, and only that, is where a real secret crosses a real network in the clear. It is
+   the `--allow-anonymous` idiom (default secure, explicit opt-in, a warning on every startup) with
+   the condition it actually applies to.
+2. **Each binary answers "is a credential checked here?" from what it already knows.**
+   `lldb-qe-server`: a services database is configured. `lldb-qe-worker`: `LLDB_FLEET_TOKEN` is set.
+   `lldb-qe-coordinator`: never — it binds no port, so it takes `TlsClientArgs` and not `TlsArgs`.
+   A single-node checkout has no credential to leak and needs no flag and no certificate.
+3. **`LLDB_FLEET_TOKEN` is untouched, and TLS does not make it redundant.** This is *server*
+   authentication: a client verifies the server, never the reverse. Which fleet member is calling is
+   still the shared secret's claim alone, and mTLS at the worker boundary is a separate decision
+   (#34). Say so rather than letting "we have TLS now" imply more than it does.
+4. **The scheme is the switch, and there is no fallback.** `https://` dials TLS, `http://` does not,
+   and a TLS server refuses a plaintext client rather than obliging it — so turning certificates on
+   means changing the `--workers` URLs too, and a half-converted fleet fails loudly. Note the trap
+   `discovery.rs` creates: a DNS endpoint is expanded to one URL *per task IP*, so the name verified
+   is an IP unless the certificate carries IP SANs or `--tls-domain` names the certificate's host.
+5. **Two process-globals, both argued rather than assumed.** rustls's crypto provider is *installed*
+   (`ring`, once, idempotently) rather than inferred from crate features — inference panics if a
+   future dependency adds `aws-lc-rs`. And the dialing trust is ambient
+   (`tls::install_client_trust`) for the same reason the fleet token is: a `FlightReaderExec` is
+   serialized into a plan, so nothing per-call can travel with it. It is consulted **only for
+   `https://`**, which is what makes installing one inert for every plaintext caller — and is what
+   lets the TLS tests live in the shared `integration` binary at all.
+
+`docker-compose.yml` is the plaintext path and says so out loud: `LLDB_ALLOW_PLAINTEXT` is set on
+every service that binds a port, with a comment explaining that deleting it stops the cluster coming
+up — which is the guard working. `infra/` carries a **`KNOWN GAP`**: Fargate cannot mount a Secrets
+Manager value as a file, so provisioning certificates there is its own piece of work, and the stack
+deliberately does not set `LLDB_ALLOW_PLAINTEXT` either (a CDK test asserts that).
 
 ## A catalog per tenant — the boundary the grant check no longer carries alone
 
@@ -577,6 +620,20 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # scoping the name without the warehouse root fails it on the file paths rather than passing.
 # Same three-way gating.
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration tenant_catalogs
+
+# TLS on both Flight boundaries (`tls.rs`). Needs NO database and no fixtures: the suite mints its
+# own CA with `rcgen` at run time, so nothing key-shaped is ever committed. One query crosses an
+# encrypted client→coordinator hop AND an encrypted coordinator→worker hop and is asserted on the
+# rows; a plaintext client is refused by a TLS worker *within a timeout*, so "legible, not a hang"
+# is an assertion; and the no-certificate path is proven still to work in the same process, which
+# is the inertness claim for the ambient client trust. The refuse-to-start rule is a unit test in
+# `tls.rs` — it is a pure function of flags and needs no socket.
+cargo test -p lldb-qe-core --test integration flight_tls
+cargo test -p lldb-qe-core tls::tests
+# Serve TLS. Certificates are files the deployment mounts; the engine issues none.
+cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
+  --tls-cert /certs/server.crt --tls-key /certs/server.key --tls-ca /certs/ca.crt \
+  --workers https://worker-1.lldb.local:50051 --metadata-url postgres://lldb@localhost/lldb
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ```

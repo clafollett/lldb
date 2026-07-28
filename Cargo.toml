@@ -50,8 +50,26 @@ clap = { version = "4", features = ["derive", "env"] }
 # --- Async runtime + gRPC transport ---
 tokio = { version = "1.48", features = ["full"] }
 tokio-stream = { version = "0.1", features = ["net"] }
-tonic = "0.14"
+# `tls-ring` is tonic 0.14's spelling of "TLS via rustls, backed by *ring*" — 0.12's plain `tls`
+# feature is gone, and the two successors name their crypto backend (`tls-ring` / `tls-aws-lc`).
+# Ring is the one to pick here and the choice is forced rather than aesthetic: `ring` is already in
+# the tree (object_store → reqwest → hyper-rustls, and sqlx's `tls-rustls`) and `aws-lc-rs` is not,
+# so `tls-ring` reuses the single `rustls 0.23` copy and adds no second version of anything.
+# `tls-aws-lc` would add a whole second crypto stack, which the one-version-tree-wide rule in
+# CLAUDE.md forbids. Deliberately NOT `tls-native-roots` / `tls-webpki-roots`: this fleet verifies
+# against a CA file the deployment mounts (`--tls-ca`), so a bundled trust store would be a
+# dependency bought for nothing. See crates/lldb-qe-core/src/tls.rs.
+tonic = { version = "0.14", features = ["tls-ring"] }
 futures = "0.3"
+
+# The crypto provider behind that TLS, named explicitly. rustls 0.23 resolves its provider from
+# crate features when nothing has installed one, which works today only because `ring` is the sole
+# provider in the tree — the day a dependency adds `aws-lc-rs`, the fallback becomes ambiguous and
+# `ServerConfig::builder()` PANICS inside a handshake. Depending on rustls directly lets
+# `tls::install_crypto_provider` install ring once, at startup, so that day turns into a no-op
+# instead of an outage. Already at 0.23.42 in the tree via hyper-rustls/sqlx; `default-features =
+# false` keeps `aws-lc-rs` (a rustls *default* feature) from being unioned in by this line.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 # --- Services DB (metadata/catalog/accounts): pinned to sqlx 0.8 because
 # `iceberg-catalog-sql` 0.10 (issue #8) depends on sqlx ^0.8.1 — one sqlx tree-wide.
@@ -97,6 +115,17 @@ toml = "0.8"
 # --- Benchmarking + test utilities (dev) ---
 criterion = { version = "0.8", features = ["async_tokio"] }
 tempfile = "3"
+# A self-signed certificate, minted per test run, so the TLS tests need no committed key material.
+# A checked-in PEM private key would be a secret in git — flagged by every scanner, blocked by
+# GitHub push protection, and a lie about what a private key is — and an `openssl` shell-out would
+# make the test suite depend on a binary that is not in the toolchain.
+#
+# `default-features = false` + `ring` is NOT cosmetic: rcgen 0.14 defaults to **aws-lc-rs**, which
+# would put a second crypto provider in the tree. That breaks the one-version rule in CLAUDE.md and,
+# worse, makes rustls's provider inference ambiguous — turning `ServerConfig::builder()` into a
+# panic in exactly the tests that exercise TLS. Verified with `cargo tree -d`: 48 duplicates before
+# and after. Dev-only; no binary links it.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [profile.dev]
 # This workspace's debug build is enormous, and that is a property of the dependency tree rather

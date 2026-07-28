@@ -1,8 +1,10 @@
-//! Finding a Postgres to test against — and undoing what a test did, however the test ended.
+//! What a test in this binary borrows, and who gives it back.
 //!
-//! Two of the three things in this module are teardown ([`Servers`], [`DbCleanup`]); the rest is
-//! the database resolution described below. They live together because they answer the same
-//! question from opposite ends: what does a test in this binary own, and who gives it back?
+//! Three things live here. The database resolution described below; the teardown guards
+//! ([`Servers`], [`DbCleanup`]) that hand back the servers and rows a test owns however the test
+//! ended; and [`certs`], the one throwaway certificate authority the TLS tests share. They belong
+//! together because they answer the same question from different ends: a test in a *single* binary
+//! borrows from a process that outlives it, so everything it takes it must give back.
 //!
 //! Most database-gated integration tests resolve their database through this module — `services_db`
 //! (migrations, accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its
@@ -38,6 +40,8 @@
 //! stopped being true when those binaries became modules of one (see `main.rs`): there is now a
 //! single copy, every item in it has a caller, and the allow — which would have hidden a genuinely
 //! unused helper — is gone. Do not put it back to silence a warning; delete the helper instead.
+
+pub mod certs;
 
 use std::future::Future;
 use std::process::Command;

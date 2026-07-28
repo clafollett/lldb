@@ -52,10 +52,19 @@
 //! is wide open by construction — there are no accounts to be. Whichever it is, it says so at
 //! startup, because a posture nobody logged is a posture nobody chose.
 //!
-//! Two things this does *not* do, and a deployment must: terminate TLS in front of this port (a
-//! bearer token on a plaintext channel is replayable by anyone on the path), and set
-//! `LLDB_FLEET_TOKEN` to the same value here and on every worker, so the workers this server
-//! dispatches to refuse plans from anyone else.
+//! That credential now travels inside TLS. `--tls-cert` / `--tls-key` make this port TLS, and —
+//! the part that matters — a server *with* a services database will **refuse to bind a plaintext
+//! port at all** unless `--allow-plaintext` is set, because that is exactly the configuration in
+//! which a real bearer token crosses a real network in the clear. Without a services database
+//! nothing is authenticated, there is no credential to expose, and it binds plaintext with no
+//! certificate and no flag — the same bargain every other feature here strikes. See
+//! [`lldb_qe_core::tls`] for the rule and for what TLS does *not* buy (it proves the server's
+//! identity to a client, not a client's to anyone).
+//!
+//! One thing this still does not do, and a deployment must: set `LLDB_FLEET_TOKEN` to the same
+//! value here and on every worker, so the workers this server dispatches to refuse plans from
+//! anyone else. TLS does not make that redundant — it protects the secret in transit; it does not
+//! prove who is presenting one.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -71,11 +80,11 @@ use lldb_qe_core::liveness::{
 };
 use lldb_qe_core::scheduler::DEFAULT_MAX_QUEUED_QUERIES;
 use lldb_qe_core::server::{
-    Coordinator, CoordinatorConfig, DEFAULT_SERVER_BIND, serve_coordinator,
+    Coordinator, CoordinatorConfig, DEFAULT_SERVER_BIND, serve_coordinator_with_tls,
 };
 use lldb_qe_core::{
-    CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ResultCacheArgs, ServicesArgs, StorageArgs,
-    init_tracing, redact_url, reject_inmemory_storage,
+    CatalogSource, CredentialCheck, DEFAULT_WAREHOUSE_ENDPOINT, ResultCacheArgs, ServicesArgs,
+    StorageArgs, TlsArgs, init_tracing, install_client_trust, redact_url, reject_inmemory_storage,
 };
 use tokio::net::TcpListener;
 
@@ -181,6 +190,9 @@ struct Cli {
 
     #[command(flatten)]
     result_cache: ResultCacheArgs,
+
+    #[command(flatten)]
+    tls: TlsArgs,
 }
 
 #[tokio::main]
@@ -219,6 +231,21 @@ async fn main() -> Result<()> {
              no accounts and no warehouse routing (set --metadata-url or --metadata-host)"
         );
     }
+
+    // Resolve the transport posture the moment the credential posture is known, and *before* the
+    // port is bound. `db.is_some()` is precisely "a bearer token will be verified on this port"
+    // (accounts, keys and grants all live in that database — see `lldb_qe_core::auth`), so it is
+    // the condition under which a plaintext port has to be an explicit choice rather than an
+    // omission. Note that `--allow-anonymous` does not enter into it: it permits a request with
+    // *no* credential, and never stops one that carries a token from being checked, so a token
+    // still crosses this wire.
+    let server_tls = cli
+        .tls
+        .resolve_server(CredentialCheck::from_bool(db.is_some()))?;
+    // What this coordinator presents when it dials workers. Installed once, from this process's
+    // own flags: a worker dial can be issued from inside a serialized plan, so nothing per-call can
+    // travel with it (see `lldb_qe_core::tls`).
+    install_client_trust(cli.tls.to_trust()?);
 
     let catalog = match &cli.manifest {
         Some(path) => CatalogSource::Manifest(path.clone()),
@@ -319,6 +346,7 @@ async fn main() -> Result<()> {
         max_concurrent_queries = ?coordinator.config().max_concurrent_queries,
         max_queued_queries = coordinator.config().max_queued_queries,
         fleet_wide_admission = coordinator.scheduler().is_fleet_wide(),
+        tls = server_tls.is_tls(),
         "lldb-qe-server listening"
     );
     if !coordinator.scheduler().is_fleet_wide() {
@@ -335,13 +363,14 @@ async fn main() -> Result<()> {
 
     // Ctrl-C / SIGTERM: close the scheduler so queued queries are told the truth immediately,
     // then let tonic drain the ones that are already running. See `serve_coordinator`.
-    let result = serve_coordinator(listener, Arc::clone(&coordinator), async {
-        match tokio::signal::ctrl_c().await {
-            Ok(()) => tracing::info!("received interrupt; draining"),
-            Err(error) => tracing::error!(%error, "could not listen for an interrupt"),
-        }
-    })
-    .await;
+    let result =
+        serve_coordinator_with_tls(listener, Arc::clone(&coordinator), server_tls, async {
+            match tokio::signal::ctrl_c().await {
+                Ok(()) => tracing::info!("received interrupt; draining"),
+                Err(error) => tracing::error!(%error, "could not listen for an interrupt"),
+            }
+        })
+        .await;
 
     tracing::info!(admission = ?coordinator.scheduler().snapshot(), "lldb-qe-server stopped");
     // Deregister *before* closing the pool, and before returning: a coordinator that stopped on

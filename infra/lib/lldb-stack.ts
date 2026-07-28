@@ -373,6 +373,30 @@ export class LldbStack extends cdk.Stack {
     // warehouse's tasks and to nothing else, so a coordinator handed a warehouse name cannot
     // reach another warehouse's compute even by accident.
     //
+    // KNOWN GAP (issue #33): **no TLS certificates are provisioned**, so every Flight port this
+    // stack deploys is plaintext. It comes up regardless, and that is a property of the guard
+    // rather than a hole in it: the engine refuses a plaintext port only when a credential is
+    // actually checked on it, and nothing here checks one — no `LLDB_FLEET_TOKEN` on the workers
+    // (the gap below), and no `lldb-qe-server` in this stack at all (the coordinator is a one-shot
+    // *client*, which binds nothing). Traffic is confined to the VPC by the security groups above.
+    //
+    // Closing it is genuinely separate work and deserves its own review, because the engine takes
+    // certificates as **mounted files** (`LLDB_TLS_CERT` / `LLDB_TLS_KEY` / `LLDB_TLS_CA`) and
+    // Fargate has no first-class way to put a Secrets Manager value on a filesystem: `ecs.Secret`
+    // injects *environment variables* only. The three real options — an EFS access point mounted
+    // into every task; an entrypoint that materializes PEMs from secret-backed env vars into files
+    // at start (which puts private key material in the task's environment, the thing the
+    // `LLDB_METADATA_PASSWORD` handling above is careful to avoid); or ACM Private CA with an
+    // issuing sidecar — differ in cost, blast radius and rotation story, and picking among them is
+    // a decision, not a detail. Half-building one here would ship the worst of all three.
+    //
+    // Note the interaction with the gap below, because it will bite whoever closes that one first:
+    // the moment `LLDB_FLEET_TOKEN` is set on these tasks, a worker starts *checking* a credential,
+    // and it will then refuse to bind until certificates exist — or until `LLDB_ALLOW_PLAINTEXT` is
+    // set, which is a deliberate, reviewable line and not something this stack sets pre-emptively
+    // (`infra/test/lldb-stack.test.ts` asserts that it does not). See
+    // crates/lldb-qe-core/src/tls.rs.
+    //
     // KNOWN GAP (issue #19): `LLDB_FLEET_TOKEN` is NOT set here, so worker Flight ports on ECS are
     // reachable by anything inside the VPC that can resolve `<warehouse>.lldb.local` — a worker
     // will execute any physical plan it is handed, with this task role's S3 credentials. Compose

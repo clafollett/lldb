@@ -30,6 +30,7 @@
 //! | [`liveness`]     | Coordinator registration and renewal: telling a dead coordinator from a slow one | 5 |
 //! | [`reaper`]       | Resolving history rows whose coordinator is gone — the first consumer of that answer | 5 |
 //! | [`server`]       | The long-running coordinator: concurrent queries over one Flight port  | 5 |
+//! | [`tls`]          | Transport security on both Flight boundaries, and the refusal to bind a plaintext port that carries a credential | 5 |
 //!
 //! The guiding principle of the storage layer: **the engine is written against the
 //! `object_store::ObjectStore` trait, never a concrete backend.** Swapping a laptop's disk
@@ -82,6 +83,7 @@ pub mod stage_cache;
 pub mod staging;
 pub mod storage;
 pub mod tenancy;
+pub mod tls;
 pub mod tpch;
 pub mod warehouse;
 
@@ -99,7 +101,8 @@ pub use engine::{
     execute_query, execute_query_cached, reject_inmemory_storage, resolve_fleet,
 };
 pub use flight::{
-    fetch, fetch_with_failover, serve_worker, serve_worker_with_auth, serve_worker_with_cache,
+    fetch, fetch_with_failover, serve_worker, serve_worker_with, serve_worker_with_auth,
+    serve_worker_with_cache,
 };
 pub use iceberg_scan::{resolve_iceberg_scans, scanned_data_files};
 pub use lakehouse::Lakehouse;
@@ -122,8 +125,8 @@ pub use retry::{Retriability, RetryPolicy};
 pub use scan_split::split_scan;
 pub use scheduler::{Admission, AdmissionError, AdmissionLimits, QuerySlot, Scheduler};
 pub use server::{
-    Coordinator, CoordinatorConfig, QueryRequest, cancel_query, serve_coordinator, submit_query,
-    submit_query_as,
+    Coordinator, CoordinatorConfig, QueryRequest, cancel_query, serve_coordinator,
+    serve_coordinator_with_tls, submit_query, submit_query_as,
 };
 pub use services::{Account, ServicesArgs, ServicesDb, redact_url};
 pub use session::{build_session, register_tpch_parquet};
@@ -131,5 +134,8 @@ pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
 pub use staging::plan_distributed;
 pub use storage::{Storage, StorageConfig};
 pub use tenancy::TenantScope;
+pub use tls::{
+    ClientTrust, CredentialCheck, ServerTls, TlsArgs, TlsClientArgs, install_client_trust,
+};
 pub use tpch::{TPCH_TABLES, tpch_manifest};
 pub use warehouse::{Warehouse, WarehouseOp, WarehouseState};

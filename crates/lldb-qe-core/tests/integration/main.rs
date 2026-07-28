@@ -62,6 +62,24 @@
 //!   row. Anything that starts asserting on an absolute count of these would be order-dependent
 //!   and must move out.
 //!
+//! Issue #33 (TLS) added two more, and both were checked against the rule above rather than
+//! assumed to be fine:
+//!
+//! - **rustls's process-default crypto provider.** rustls 0.23 keeps exactly one, and installing a
+//!   second is an error rather than a replacement. `lldb_qe_core::tls::install_crypto_provider`
+//!   therefore owns it — a `OnceLock` whose `install_default` failure is ignored, called from every
+//!   entry point that touches TLS. Nothing in `tests/` installs one, so there is no ordering to get
+//!   wrong: whichever test reaches TLS first installs `ring`, and every later caller finds it there.
+//!   A test that installed a *different* provider would break this and does not belong here.
+//! - **`lldb_qe_core::tls`'s ambient client trust** (`install_client_trust`), which `flight_tls`
+//!   sets. It is mutable global state, which normally would be exactly the thing that forces a
+//!   separate target — except that it is consulted **only for `https://` URLs**. Every other test in
+//!   this binary dials `http://`, so installing a CA is genuinely inert for them, and
+//!   `flight_tls::with_no_certificates_at_all_the_plaintext_path_is_unchanged` asserts that rather
+//!   than assuming it. All TLS tests share one CA (`support::certs::shared`), so concurrent installs
+//!   agree on a value and the race has no losing side. A test that installed a *different* trust
+//!   would reintroduce one.
+//!
 //! Everything else these tests touch is per-instance: sessions, catalogs, stage caches and
 //! warehouses are constructed per test, every server binds `127.0.0.1:0`, and every file that
 //! writes to disk writes into its own `tempfile::tempdir()`. The database-gated files name their
@@ -93,6 +111,7 @@ mod distributed_shuffle;
 mod dml_snapshots;
 mod first_light;
 mod fleet_discovery;
+mod flight_tls;
 mod flight_transport;
 mod iceberg_roundtrip;
 mod manifest_examples;
