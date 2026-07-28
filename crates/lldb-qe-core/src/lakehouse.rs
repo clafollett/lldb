@@ -201,9 +201,11 @@ impl Lakehouse {
     ) -> Result<Self> {
         let iceberg_catalog_name = scope.iceberg_catalog_name(catalog_name);
         let warehouse_uri = scope.warehouse_uri(&normalize_warehouse_uri(warehouse));
-        // Validated up front so a bad URI fails before any connection attempt; recomputed per
-        // attempt below because `SqlBindStyle` is neither `Clone` nor `Copy` and the function is a
-        // cheap pure mapping over the scheme.
+        // All validated up front so a bad configuration fails before any connection attempt, with
+        // a message about the configuration rather than one raised from inside a dependency.
+        ensure_catalog_name_fits(catalog_name, scope, &iceberg_catalog_name)?;
+        // `sql_bind_style_for` is recomputed per attempt below because `SqlBindStyle` is neither
+        // `Clone` nor `Copy` and the function is a cheap pure mapping over the scheme.
         sql_bind_style_for(catalog_uri)?;
         ensure_sql_driver_compiled(catalog_uri)?;
         let storage = storage_factory_for(&warehouse_uri)?;
@@ -524,6 +526,11 @@ fn catalog_properties() -> HashMap<String, String> {
 /// always suffices and a large budget would only slow down a genuine failure.
 const CATALOG_BOOTSTRAP_ATTEMPTS: u32 = 3;
 
+/// The width of `iceberg_tables.catalog_name`, which `iceberg-catalog-sql` declares as
+/// `VARCHAR(255) NOT NULL` and we do not own — the table is created by that crate, so this is a
+/// fact about a dependency's schema rather than a policy of ours.
+const CATALOG_NAME_LIMIT: usize = 255;
+
 /// True if this error is the non-atomic `CREATE TABLE IF NOT EXISTS` race described in
 /// [`Lakehouse::open_sql`], rather than something worth surfacing.
 ///
@@ -602,6 +609,39 @@ fn ensure_sql_driver_compiled(uri: &str) -> Result<()> {
         "sql catalog uri scheme `{scheme}` needs an sqlx driver this build does not compile in \
          — the services database is Postgres, so the catalog is too; use a `postgres://` uri"
     )
+}
+
+/// Reject a scoped catalog name that will not fit `iceberg_tables.catalog_name`.
+///
+/// `iceberg-catalog-sql` declares that column `VARCHAR(255) NOT NULL`, and [`TenantScope`] prepends
+/// `acct_<id>__` to whatever the manifest declared — so a name that is legal untenanted can be over
+/// the limit once scoped. Without this the manifest is accepted, the tenanted open reaches Postgres,
+/// and the operator gets a value-too-long error raised from inside a dependency that names neither
+/// the tenant nor the string that was actually too long. The whole point of checking here is to say
+/// the computed name out loud.
+///
+/// Alongside the other pre-connection validators for the same reason they are: a configuration this
+/// build cannot honour should fail before a socket is opened, with a message about the
+/// configuration.
+///
+/// Only the SQL path needs it. A `MemoryCatalog` writes no `iceberg_tables` row — it holds its
+/// tables in a per-process map with no column widths at all — and [`Lakehouse::open_memory_uri`]
+/// does not scope the catalog name in the first place, so there is no limit there to overrun and a
+/// check would be false precision.
+fn ensure_catalog_name_fits(declared: &str, scope: &TenantScope, scoped: &str) -> Result<()> {
+    // Characters, not bytes: Postgres `VARCHAR(n)` bounds character length, so `len()` would refuse
+    // a multi-byte name that actually fits.
+    let length = scoped.chars().count();
+    if length > CATALOG_NAME_LIMIT {
+        bail!(
+            "catalog name `{scoped}` is {length} characters; the limit is {CATALOG_NAME_LIMIT} \
+             (`iceberg_tables.catalog_name` is VARCHAR(255)). It is the manifest's catalog \
+             `{declared}` scoped to tenant `{scope}`; shorten the declared name by at least {} \
+             characters.",
+            length - CATALOG_NAME_LIMIT
+        );
+    }
+    Ok(())
 }
 
 /// Pick the Iceberg [`StorageFactory`] that can actually read and write `warehouse_uri`.
@@ -761,6 +801,49 @@ mod tests {
             .to_string();
         assert!(err.contains("sqlite"), "{err}");
         assert!(err.contains("postgres://"), "{err}");
+    }
+
+    #[test]
+    fn a_catalog_name_that_only_overruns_once_scoped_is_refused_by_its_computed_value() {
+        // 250 characters: comfortably inside `VARCHAR(255)` as the manifest declares it, and
+        // therefore a manifest that worked before per-tenant catalogs existed.
+        let declared = "c".repeat(250);
+        assert!(
+            ensure_catalog_name_fits(
+                &declared,
+                &TenantScope::untenanted(),
+                &TenantScope::untenanted().iceberg_catalog_name(&declared),
+            )
+            .is_ok(),
+            "unscoped, this name fits — the refusal below must be about the prefix"
+        );
+
+        let scope = TenantScope::account(7);
+        let scoped = scope.iceberg_catalog_name(&declared);
+        let err = ensure_catalog_name_fits(&declared, &scope, &scoped)
+            .expect_err("`acct_7__` + 250 characters is over the column width")
+            .to_string();
+
+        // "Too long" alone reproduces the problem this exists to fix: the operator cannot see what
+        // was computed. So the message has to carry the computed name, the tenant, the declared
+        // name, the actual length and the limit.
+        assert!(err.contains(&scoped), "{err}");
+        assert!(err.contains("acct_7"), "{err}");
+        assert!(err.contains(&declared), "{err}");
+        assert!(
+            err.contains(&format!("{} characters", scoped.chars().count())),
+            "{err}"
+        );
+        assert!(err.contains("255"), "{err}");
+    }
+
+    #[test]
+    fn a_catalog_name_is_measured_in_characters_not_bytes() {
+        // Postgres bounds `VARCHAR(n)` by characters. Measuring bytes would refuse this name, which
+        // is 255 characters and fits, on the strength of its encoding.
+        let declared = "é".repeat(255);
+        assert_eq!(declared.len(), 510);
+        assert!(ensure_catalog_name_fits(&declared, &TenantScope::untenanted(), &declared).is_ok());
     }
 
     #[test]
