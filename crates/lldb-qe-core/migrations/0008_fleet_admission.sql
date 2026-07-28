@@ -23,8 +23,12 @@
 -- hottest path in the system.
 --
 -- So the slots are *rows*, numbered `0 .. K-1`, and the primary key does the arbitration. A claim
--- is one statement: pick the lowest claimable number, `INSERT ... ON CONFLICT DO UPDATE` it, and
--- see whether a row comes back. Two coordinators racing for the same number both reach the unique
+-- is one statement: pick a claimable number, `INSERT ... ON CONFLICT DO UPDATE` it, and see
+-- whether a row comes back. The candidate is chosen at *random* rather than lowest-first, which is
+-- a small thing with a real effect — lowest-first makes every simultaneous claimant on a warehouse
+-- that has room pick the same number, so all but one lose a race none of them needed to have. See
+-- `crate::fleet_admission`, which is where that reasoning lives at length.
+-- Two coordinators racing for the same number both reach the unique
 -- index; one wins outright and the other is turned into an `ON CONFLICT` whose `WHERE` refuses to
 -- take a slot from a live holder — the same repeated-predicate compare-and-swap `crate::reaper`
 -- writes with, for the same reason. Over-admission is then impossible by *construction* rather than
