@@ -318,12 +318,23 @@ impl ServerTls {
     /// Fails here rather than at the first connection when the certificate or key does not parse:
     /// `Server::tls_config` builds the rustls acceptor eagerly, so a bad PEM is a startup error
     /// naming the file, not a handshake failure on somebody's query.
+    ///
+    /// The provider is installed *here* and not only in [`TlsArgs::resolve_server`], even though
+    /// every caller in this repo reaches a `Tls` variant through the resolver. `ServerTls` is
+    /// public and so is its variant, so nothing stops a caller building one directly — and this
+    /// line, not the resolver, is where rustls is actually touched. Resting the invariant on
+    /// "every caller happens to go through the resolver" is precisely the inference this module
+    /// exists to stop relying on; the call is a `OnceLock` and runs once per process, on a path
+    /// taken once per server start.
     pub fn configure(&self, server: Server) -> Result<Server> {
         match self {
             Self::Plaintext(_) => Ok(server),
-            Self::Tls(config) => server
-                .tls_config((**config).clone())
-                .context("building the TLS acceptor from --tls-cert / --tls-key"),
+            Self::Tls(config) => {
+                install_crypto_provider();
+                server
+                    .tls_config((**config).clone())
+                    .context("building the TLS acceptor from --tls-cert / --tls-key")
+            }
         }
     }
 
