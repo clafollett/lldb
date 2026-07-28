@@ -29,12 +29,21 @@ use lldb_qe_core::flight::{self, serialize_plan};
 use lldb_qe_core::{StageCache, stage_id_of};
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 /// Start an in-process worker sharing `cache`; returns its URL. The caller keeps its own `Arc`
 /// clone of the cache to read execution counts afterwards.
-async fn start_worker_with_cache(cache: Arc<StageCache>) -> anyhow::Result<String> {
+///
+/// The handle goes into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port — and this `StageCache` — for the rest of the run.
+async fn start_worker_with_cache(
+    workers: &mut Servers,
+    cache: Arc<StageCache>,
+) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    workers.spawn(async move {
         flight::serve_worker_with_cache(listener, SessionContext::new(), cache)
             .await
             .expect("worker serve");
@@ -121,7 +130,8 @@ async fn a_producer_pulled_by_many_consumers_executes_once() -> anyhow::Result<(
     let path = seed_parquet(tmp.path())?;
 
     let cache = Arc::new(StageCache::new());
-    let worker = start_worker_with_cache(Arc::clone(&cache)).await?;
+    let mut fleet = Servers::new();
+    let worker = start_worker_with_cache(&mut fleet, Arc::clone(&cache)).await?;
 
     let ctx = multi_partition_ctx();
     let producer = producer_plan(&ctx, &path).await;
@@ -179,7 +189,8 @@ async fn different_producers_get_different_stage_ids() -> anyhow::Result<()> {
     let path = seed_parquet(tmp.path())?;
 
     let cache = Arc::new(StageCache::new());
-    let worker = start_worker_with_cache(Arc::clone(&cache)).await?;
+    let mut fleet = Servers::new();
+    let worker = start_worker_with_cache(&mut fleet, Arc::clone(&cache)).await?;
 
     // Two genuinely different producers over the same data.
     let ctx = SessionContext::new();

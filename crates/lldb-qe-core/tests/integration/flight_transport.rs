@@ -12,6 +12,8 @@ use datafusion::prelude::SessionContext;
 use lldb_qe_core::{StorageConfig, build_session, flight, register_tpch_parquet};
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
@@ -27,7 +29,9 @@ async fn scan_round_trips_through_a_worker() -> anyhow::Result<()> {
     // absolute, so no table registration is needed on the worker).
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    // Held rather than detached, and so stopped when this test returns — see [`Servers`].
+    let mut workers = Servers::new();
+    workers.spawn(async move {
         flight::serve_worker(listener, SessionContext::new())
             .await
             .expect("worker serve");

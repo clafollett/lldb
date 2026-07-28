@@ -59,7 +59,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::support::{self, resolve_target, unique_name};
+use crate::support::{self, Cleanup, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{Int64Array, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -141,12 +141,16 @@ fn distributing_ctx() -> SessionContext {
 }
 
 /// Start `count` in-process workers, standing in for a warehouse's tasks.
-async fn start_workers(count: usize) -> Result<Vec<SocketAddr>> {
+///
+/// The handles go into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_workers(servers: &mut Servers, count: usize) -> Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(count);
     for _ in 0..count {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        tokio::spawn(async move {
+        servers.spawn(async move {
             flight::serve_worker(listener, SessionContext::new())
                 .await
                 .expect("worker serve");
@@ -191,6 +195,9 @@ struct Node {
 /// one warehouse's compute.
 struct Harness {
     db: ServicesDb,
+    /// The services database's URL, so a test that plants rows of its own can build a
+    /// [`DbCleanup`] for them without re-resolving the target.
+    db_url: String,
     account_id: i64,
     warehouse: String,
     warehouse_id: i64,
@@ -198,14 +205,20 @@ struct Harness {
     /// The API key every submission presents. Held once here rather than re-issued per query,
     /// exactly as a real client would.
     token: String,
+    /// Every coordinator's and worker's Flight server. Declared before `_cleanup` so they stop
+    /// before the rows they write to are deleted; see [`Servers`].
+    _servers: Servers,
+    /// The account and this fleet's `coordinators` rows, deleted on the way out however the test
+    /// ended — see [`DbCleanup`].
+    _cleanup: DbCleanup,
     /// Kept alive so the seeded parquet outlives the queries reading it.
     _tmp: tempfile::TempDir,
 }
 
 impl Harness {
     /// One coordinator — the shape most of this file's tests want.
-    async fn start(db: ServicesDb, tag: &str) -> Result<Self> {
-        Self::start_fleet(db, tag, 1).await
+    async fn start(db: ServicesDb, url: &str, tag: &str) -> Result<Self> {
+        Self::start_fleet(db, url, tag, 1).await
     }
 
     /// Stand up: workers, a warehouse row, a catalog, `coordinators` coordinators, a listening
@@ -216,7 +229,12 @@ impl Harness {
     /// them. That is true even at `coordinators == 1`: the single-node tests below therefore run
     /// through the *same* admission path production uses, rather than through a fallback that only
     /// tests exercise.
-    async fn start_fleet(db: ServicesDb, tag: &str, coordinators: usize) -> Result<Self> {
+    async fn start_fleet(
+        db: ServicesDb,
+        url: &str,
+        tag: &str,
+        coordinators: usize,
+    ) -> Result<Self> {
         let tmp = tempfile::tempdir()?;
         let path = seed_parquet(tmp.path(), 1200, 6)?;
 
@@ -261,7 +279,8 @@ impl Harness {
         // its DNS name is exactly `warehouse.size` tasks — desired and observed state agreeing.
         // One fleet of workers for *every* coordinator, which is the point: `N` schedulers, one
         // pool of compute.
-        let workers = start_workers(warehouse.size as usize).await?;
+        let mut servers = Servers::new();
+        let workers = start_workers(&mut servers, warehouse.size as usize).await?;
         let authority = format!("{warehouse_name}.lldb.local:50051");
 
         let mut nodes = Vec::with_capacity(coordinators);
@@ -313,7 +332,7 @@ impl Harness {
             );
 
             let serving = Arc::clone(&coordinator);
-            tokio::spawn(async move {
+            servers.spawn(async move {
                 serve_coordinator(listener, serving, std::future::pending::<()>())
                     .await
                     .expect("coordinator serve");
@@ -327,13 +346,27 @@ impl Harness {
             });
         }
 
+        // Deleting the account cascades to its warehouse, its query history and — the reason it
+        // matters here — the warehouse's `admission_slots` rows. The `coordinators` rows are not
+        // account-scoped, so they are removed by name: this binary shares a database with every
+        // other test in it, and a shared CI instance with whoever else, and a registration left
+        // renewing against a deleted account is litter with a heartbeat.
+        let mut cleanup = DbCleanup::new(url);
+        cleanup.account(account.id);
+        cleanup.add(Cleanup::CoordinatorSlots(
+            nodes.iter().map(|node| node.slot.clone()).collect(),
+        ));
+
         Ok(Self {
             db,
+            db_url: url.to_string(),
             account_id: account.id,
             warehouse: warehouse_name,
             warehouse_id: warehouse.id,
             nodes,
             token,
+            _servers: servers,
+            _cleanup: cleanup,
             _tmp: tmp,
         })
     }
@@ -375,26 +408,6 @@ impl Harness {
     fn coordinator_slots(&self) -> Vec<String> {
         self.nodes.iter().map(|node| node.slot.clone()).collect()
     }
-
-    /// Delete the account, which cascades to its warehouse, its query history and — the reason this
-    /// matters here — the warehouse's `admission_slots` rows.
-    ///
-    /// The `coordinators` rows are not account-scoped, so they are removed by name: this binary
-    /// shares a database with every other test in it, and a shared CI instance with whoever else,
-    /// and a registration left renewing against a deleted account is litter with a heartbeat.
-    async fn cleanup(&self) -> Result<()> {
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(self.account_id)
-            .execute(self.db.pool())
-            .await
-            .context("deleting the test account")?;
-        sqlx::query("DELETE FROM coordinators WHERE slot = ANY($1)")
-            .bind(self.coordinator_slots())
-            .execute(self.db.pool())
-            .await
-            .context("deleting the test coordinators")?;
-        Ok(())
-    }
 }
 
 /// The workload. Distinct per `i` on purpose: identical queries would hit the workers' stage
@@ -434,14 +447,16 @@ fn rows_of(batches: &[RecordBatch]) -> Result<Vec<GroupCount>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_queries_are_bounded_queued_drained_and_recorded() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("scheduling").await? else {
+    let Some((db, target)) = db_or_skip("scheduling").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "sched").await?;
-    let result = concurrency_body(&harness).await;
-    // Clean up whatever happened, then report.
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "sched").await?;
+    concurrency_body(&harness).await
 }
 
 async fn concurrency_body(harness: &Harness) -> Result<()> {
@@ -625,13 +640,16 @@ fn assert_timings_are_sane(record: &QueryRecord) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_query_is_recorded_and_does_not_wedge_the_queue() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("failure handling").await? else {
+    let Some((db, target)) = db_or_skip("failure handling").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "fail").await?;
-    let result = failure_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "fail").await?;
+    failure_body(&harness).await
 }
 
 async fn failure_body(harness: &Harness) -> Result<()> {
@@ -742,13 +760,16 @@ async fn failure_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutting_down_refuses_new_work_instead_of_stranding_it() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("shutdown").await? else {
+    let Some((db, target)) = db_or_skip("shutdown").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "stop").await?;
-    let result = shutdown_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "stop").await?;
+    shutdown_body(&harness).await
 }
 
 async fn shutdown_body(harness: &Harness) -> Result<()> {
@@ -796,13 +817,16 @@ async fn shutdown_body(harness: &Harness) -> Result<()> {
 /// Clients disconnecting is ordinary rather than exceptional, so this is a routine path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_abandoned_by_its_client_is_closed_out_rather_than_left_active() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("abandonment").await? else {
+    let Some((db, target)) = db_or_skip("abandonment").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "gone").await?;
-    let result = abandonment_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "gone").await?;
+    abandonment_body(&harness).await
 }
 
 /// How long the abandonment test will wait for an asynchronous state change before giving up.
@@ -968,13 +992,14 @@ const FLEET_COORDINATORS: usize = 2;
 ///    process's semaphore — which is the one thing a per-process bound could never produce.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_coordinators_on_one_warehouse_admit_k_total_not_2k() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("fleet-wide admission").await? else {
+    let Some((db, target)) = db_or_skip("fleet-wide admission").await? else {
         return Ok(());
     };
-    let harness = Harness::start_fleet(db, "fleet", FLEET_COORDINATORS).await?;
-    let result = fleet_admission_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    let harness = Harness::start_fleet(db, url, "fleet", FLEET_COORDINATORS).await?;
+    fleet_admission_body(&harness).await
 }
 
 async fn fleet_admission_body(harness: &Harness) -> Result<()> {
@@ -1125,13 +1150,16 @@ async fn fleet_admission_body(harness: &Harness) -> Result<()> {
 /// test that has to outlive one must really take that long.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_coordinator_that_dies_holding_slots_does_not_consume_them_forever() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("fleet-wide slot expiry").await? else {
+    let Some((db, target)) = db_or_skip("fleet-wide slot expiry").await? else {
         return Ok(());
     };
-    let harness = Harness::start(db, "expire").await?;
-    let result = slot_expiry_body(&harness).await;
-    harness.cleanup().await?;
-    result
+    let url = target
+        .url()
+        .expect("db_or_skip only returns a connected database");
+    // No explicit cleanup call: the harness deletes its rows in `Drop`, so a failing assertion in
+    // the body still cleans up after itself. See `support::DbCleanup`.
+    let harness = Harness::start(db, url, "expire").await?;
+    slot_expiry_body(&harness).await
 }
 
 async fn slot_expiry_body(harness: &Harness) -> Result<()> {
@@ -1155,22 +1183,17 @@ async fn slot_expiry_body(harness: &Harness) -> Result<()> {
     db.register_coordinator(&doomed, brisk).await?;
     db.register_coordinator(&survivor, std::time::Duration::from_secs(60))
         .await?;
-    let planted = vec![doomed.slot().to_string(), survivor.slot().to_string()];
+    // These two are not this harness's own nodes, so its guard will not take them — and neither
+    // will the account cascade, since `coordinators` is not account-scoped. Registered *before* the
+    // assertions, so a failure below still takes them with it. See `support::DbCleanup`.
+    let mut planted = DbCleanup::new(&harness.db_url);
+    planted.add(Cleanup::CoordinatorSlots(vec![
+        doomed.slot().to_string(),
+        survivor.slot().to_string(),
+    ]));
+    planted.add(Cleanup::AdmissionSlots(warehouse_id));
 
-    let outcome = slot_expiry_assertions(harness, &doomed, &survivor, brisk, limit).await;
-
-    // These two are not this harness's own nodes, so `cleanup` will not take them.
-    sqlx::query("DELETE FROM coordinators WHERE slot = ANY($1)")
-        .bind(&planted)
-        .execute(db.pool())
-        .await
-        .context("deleting the planted coordinators")?;
-    sqlx::query("DELETE FROM admission_slots WHERE warehouse_id = $1")
-        .bind(warehouse_id)
-        .execute(db.pool())
-        .await
-        .context("clearing the test warehouse's slots")?;
-    outcome
+    slot_expiry_assertions(harness, &doomed, &survivor, brisk, limit).await
 }
 
 async fn slot_expiry_assertions(

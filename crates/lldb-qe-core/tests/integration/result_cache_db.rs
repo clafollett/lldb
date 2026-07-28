@@ -90,6 +90,8 @@ use lldb_qe_core::{
 };
 use tokio::net::TcpListener;
 
+use crate::support::{Cleanup, DbCleanup, Servers};
+
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -263,24 +265,16 @@ pub(crate) fn manifest(catalog_name: &str, url: &str, warehouse: &Path) -> Manif
 struct Fleet {
     urls: Vec<String>,
     caches: Vec<Arc<StageCache>>,
-    servers: Vec<tokio::task::JoinHandle<()>>,
-}
-
-impl Drop for Fleet {
-    fn drop(&mut self) {
-        // A test that starts a fleet per query would otherwise leave a gRPC server per query
-        // running for the rest of the process.
-        for server in &self.servers {
-            server.abort();
-        }
-    }
+    /// A test that starts a fleet per query would otherwise leave a gRPC server per query running
+    /// for the rest of the process. [`Servers`] is that abort, shared with every other file here.
+    _servers: Servers,
 }
 
 impl Fleet {
     async fn start() -> Result<Self> {
         let mut urls = Vec::with_capacity(WORKERS);
         let mut caches = Vec::with_capacity(WORKERS);
-        let mut servers = Vec::with_capacity(WORKERS);
+        let mut servers = Servers::new();
         for _ in 0..WORKERS {
             // Port 0: the OS picks a free one, so this file is safe under a parallel
             // `cargo test --workspace`.
@@ -288,21 +282,21 @@ impl Fleet {
             let addr = listener.local_addr()?;
             let cache = Arc::new(StageCache::new());
             let served = Arc::clone(&cache);
-            servers.push(tokio::spawn(async move {
+            servers.spawn(async move {
                 // A bare `SessionContext`: no catalog, no manifest, no warehouse path. A worker can
                 // only read what the plan names — which, for an Iceberg scan, is the data files
                 // `resolve_iceberg_scans` pinned into it on the coordinator.
                 serve_worker_with_cache(listener, SessionContext::new(), served)
                     .await
                     .expect("worker serve");
-            }));
+            });
             urls.push(format!("http://{addr}"));
             caches.push(cache);
         }
         Ok(Self {
             urls,
             caches,
-            servers,
+            _servers: servers,
         })
     }
 
@@ -405,6 +399,14 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     let tenant_b = db.ensure_account(&unique("cache-b")).await?;
 
     let catalog = format!("lldb_rc_{}_{}", std::process::id(), nanos());
+
+    // Registered here rather than deleted at the end, so a failing assertion below still takes its
+    // rows with it — see [`DbCleanup`]. Declared after `target` so it drops before the container.
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(tenant_a.id);
+    cleanup.account(tenant_b.id);
+    cleanup.add(Cleanup::IcebergCatalog(catalog.clone()));
+
     let warehouse = tempfile::tempdir()?;
     // `Local`, not `InMemory`: a resolved plan names its data files, so every worker has to be able
     // to read the warehouse's object store. The in-memory store is per-process and a worker would
@@ -618,9 +620,10 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     assert!(plain.worker_executions > 0);
     assert_eq!(rendered(&plain.batches), rendered(&truth.batches));
 
-    // ---- Cleanup: this run's rows only ---------------------------------------------------------
-    // Deleting the accounts cascades the cache rows away, which is also the assertion that the
-    // foreign key is doing its job.
+    // ---- The cascade, which is an assertion and not only cleanup -------------------------------
+    // `cleanup` would delete these accounts anyway, and idempotently — but the point here is to
+    // *observe* the foreign key doing its job, which needs the delete to happen while the test is
+    // still running.
     for tenant in [&tenant_a, &tenant_b] {
         sqlx::query("DELETE FROM accounts WHERE id = $1")
             .bind(tenant.id)
@@ -640,15 +643,8 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     );
 
     // The Iceberg catalog's own tables belong to `iceberg-catalog-sql` and may be shared with a
-    // real catalog on this database, so only this run's uniquely-named rows are removed.
-    for table in ["iceberg_tables", "iceberg_namespace_properties"] {
-        sqlx::query(&format!("DELETE FROM {table} WHERE catalog_name = $1"))
-            .bind(&catalog)
-            .execute(db.pool())
-            .await
-            .with_context(|| format!("cleaning up {table}"))?;
-    }
-
+    // real catalog on this database, so only this run's uniquely-named rows are removed — by
+    // `cleanup`, on the way out, whether or not anything above failed.
     db.close().await;
     warehouse.close()?;
     Ok(())
@@ -673,6 +669,12 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
     let tenant = db.ensure_account(&unique("cache-bounds")).await?;
 
     let catalog = format!("lldb_rcb_{}_{}", std::process::id(), nanos());
+
+    // Teardown up front, so a failure below still takes its rows with it — see [`DbCleanup`].
+    let mut cleanup = DbCleanup::new(url);
+    cleanup.account(tenant.id);
+    cleanup.add(Cleanup::IcebergCatalog(catalog.clone()));
+
     let warehouse = tempfile::tempdir()?;
     // `Local` for the same reason as above: the workers read the warehouse's files directly.
     let (ctx, storage) =
@@ -796,17 +798,7 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
     );
     assert_eq!(expiring.hit_count(), 0);
 
-    // ---- Cleanup ----------------------------------------------------------------------------
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(tenant.id)
-        .execute(db.pool())
-        .await?;
-    for t in ["iceberg_tables", "iceberg_namespace_properties"] {
-        sqlx::query(&format!("DELETE FROM {t} WHERE catalog_name = $1"))
-            .bind(&catalog)
-            .execute(db.pool())
-            .await?;
-    }
+    // Cleanup is `cleanup`'s, on the way out — see [`DbCleanup`].
     db.close().await;
     warehouse.close()?;
     Ok(())

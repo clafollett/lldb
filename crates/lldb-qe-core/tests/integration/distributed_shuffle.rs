@@ -21,11 +21,17 @@ use lldb_qe_core::distributed::{GroupCount, extract_group_counts};
 use lldb_qe_core::{flight, plan_distributed};
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 /// Start an in-process worker on a random port; returns its URL.
-async fn start_worker() -> anyhow::Result<String> {
+///
+/// The handle goes into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_worker(workers: &mut Servers) -> anyhow::Result<String> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    tokio::spawn(async move {
+    workers.spawn(async move {
         flight::serve_worker(listener, SessionContext::new())
             .await
             .expect("worker serve");
@@ -97,10 +103,11 @@ async fn distributed_group_by_matches_single_node() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = seed_parquet(tmp.path(), 2000, 5)?;
 
+    let mut fleet = Servers::new();
     let workers = vec![
-        start_worker().await?,
-        start_worker().await?,
-        start_worker().await?,
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
     ];
 
     let ctx = distributing_ctx();
@@ -131,7 +138,11 @@ async fn distributed_group_by_high_cardinality() -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let path = seed_parquet(tmp.path(), 3000, 50)?;
 
-    let workers = vec![start_worker().await?, start_worker().await?];
+    let mut fleet = Servers::new();
+    let workers = vec![
+        start_worker(&mut fleet).await?,
+        start_worker(&mut fleet).await?,
+    ];
 
     let ctx = distributing_ctx();
     ctx.register_parquet(

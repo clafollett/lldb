@@ -29,7 +29,7 @@ use lldb_qe_core::liveness::{
 };
 use lldb_qe_core::services::ServicesDb;
 
-use crate::support::{resolve_target, unique_name};
+use crate::support::{Cleanup, DbCleanup, resolve_target, unique_name};
 
 /// The fastest cadence the schema can express: `renew_interval_secs` is whole seconds, so this is
 /// also the shortest threshold any real deployment could be configured with.
@@ -49,14 +49,15 @@ async fn database(target: &crate::support::Target) -> Result<Option<ServicesDb>>
     Ok(Some(db))
 }
 
-/// Remove exactly the registrations this test made. Never touches anything global.
-async fn forget(db: &ServicesDb, slot: &str) -> Result<()> {
-    sqlx::query("DELETE FROM coordinators WHERE slot = $1")
-        .bind(slot)
-        .execute(db.pool())
-        .await
-        .context("deleting the test coordinator registration")?;
-    Ok(())
+/// Remove exactly the registrations and rows this test made. Never touches anything global.
+///
+/// A `Drop` guard rather than a call at the end of each body: an assertion that fails unwinds
+/// straight past anything written down there, and a failing run is precisely the run whose rows you
+/// do not want left behind. See [`DbCleanup`].
+fn forget(target: &crate::support::Target, slot: &str) -> DbCleanup {
+    let mut cleanup = DbCleanup::new(target.url().expect("a connected database"));
+    cleanup.add(Cleanup::CoordinatorSlots(vec![slot.to_string()]));
+    cleanup
 }
 
 /// Registration, renewal, and a clean exit — the happy path end to end.
@@ -73,6 +74,7 @@ async fn a_coordinator_registers_renews_and_leaves_promptly() -> Result<()> {
     };
     let identity = CoordinatorIdentity::new(unique_name("live"));
     let slot = identity.slot().to_string();
+    let _cleanup = forget(&target, &slot);
 
     let registration = CoordinatorRegistration::start(db.clone(), identity.clone(), RENEW).await?;
 
@@ -133,7 +135,7 @@ async fn a_coordinator_registers_renews_and_leaves_promptly() -> Result<()> {
             .any(|row| row.slot == slot)
     );
 
-    forget(&db, &slot).await
+    Ok(())
 }
 
 /// A coordinator killed outright: renewals simply stop, and nothing gets to say goodbye.
@@ -153,6 +155,7 @@ async fn a_killed_coordinator_expires_within_the_documented_bound() -> Result<()
     };
     let identity = CoordinatorIdentity::new(unique_name("killed"));
     let slot = identity.slot().to_string();
+    let _cleanup = forget(&target, &slot);
 
     let registration = CoordinatorRegistration::start(db.clone(), identity.clone(), RENEW).await?;
     assert!(db.is_coordinator_live(&slot, None).await?);
@@ -192,7 +195,7 @@ async fn a_killed_coordinator_expires_within_the_documented_bound() -> Result<()
     assert_eq!(row.shutdown_at, None, "a kill is not a clean exit");
     assert!(!row.is_live_at(chrono::Utc::now()), "{row:?}");
 
-    forget(&db, &slot).await
+    Ok(())
 }
 
 /// **The assertion that separates a liveness mechanism from a timeout.**
@@ -218,6 +221,8 @@ async fn a_live_coordinator_is_never_concluded_dead() -> Result<()> {
     let identity = CoordinatorIdentity::new(unique_name("longquery"));
     let slot = identity.slot().to_string();
     let account = db.create_account(&unique_name("longquery-acct")).await?;
+    let mut cleanup = forget(&target, &slot);
+    cleanup.account(account.id);
 
     let registration = CoordinatorRegistration::start(db.clone(), identity.clone(), RENEW).await?;
 
@@ -270,12 +275,7 @@ async fn a_live_coordinator_is_never_concluded_dead() -> Result<()> {
     assert_eq!(done.state, lldb_qe_core::query_log::QueryState::Succeeded);
 
     registration.shut_down().await;
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(account.id)
-        .execute(db.pool())
-        .await
-        .context("deleting the test account")?;
-    forget(&db, &slot).await
+    Ok(())
 }
 
 /// A restarted coordinator is unambiguously distinguishable from the process it replaced — **on
@@ -294,6 +294,8 @@ async fn a_restart_is_distinguishable_from_the_process_it_replaced() -> Result<(
     };
     let slot = unique_name("restart");
     let account = db.create_account(&unique_name("restart-acct")).await?;
+    let mut cleanup = forget(&target, &slot);
+    cleanup.account(account.id);
 
     // The first process, with a query in flight when it dies.
     let first = CoordinatorIdentity::new(&slot);
@@ -354,12 +356,7 @@ async fn a_restart_is_distinguishable_from_the_process_it_replaced() -> Result<(
     assert_eq!(stranded.state, lldb_qe_core::query_log::QueryState::Running);
 
     second_registration.shut_down().await;
-    sqlx::query("DELETE FROM accounts WHERE id = $1")
-        .bind(account.id)
-        .execute(db.pool())
-        .await
-        .context("deleting the test account")?;
-    forget(&db, &slot).await
+    Ok(())
 }
 
 /// Decision 2, both branches, as behaviour rather than prose.
@@ -379,6 +376,7 @@ async fn a_failed_renewal_is_survived_and_a_stolen_slot_is_conceded() -> Result<
     // ---- A database that stops answering -----------------------------------------------------
     let identity = CoordinatorIdentity::new(unique_name("outage"));
     let slot = identity.slot().to_string();
+    let _outage_cleanup = forget(&target, &slot);
     // Its own pool, so closing it simulates an outage for this coordinator alone.
     let doomed = ServicesDb::connect(target.url().expect("checked above")).await?;
     let registration = CoordinatorRegistration::start(doomed.clone(), identity, RENEW).await?;
@@ -409,10 +407,10 @@ async fn a_failed_renewal_is_survived_and_a_stolen_slot_is_conceded() -> Result<
         "the renewal loop gave up instead of retrying: {registration:?}"
     );
     drop(registration);
-    forget(&db, &slot).await?;
 
     // ---- A second process on one slot --------------------------------------------------------
     let shared_slot = unique_name("contested");
+    let _contested_cleanup = forget(&target, &shared_slot);
     let incumbent = CoordinatorIdentity::new(&shared_slot);
     let incumbent_registration =
         CoordinatorRegistration::start(db.clone(), incumbent.clone(), RENEW).await?;
@@ -444,5 +442,5 @@ async fn a_failed_renewal_is_survived_and_a_stolen_slot_is_conceded() -> Result<
 
     usurper_registration.shut_down().await;
     drop(incumbent_registration);
-    forget(&db, &shared_slot).await
+    Ok(())
 }

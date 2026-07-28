@@ -57,6 +57,8 @@ use lldb_qe_core::{
 };
 use tokio::net::TcpListener;
 
+use crate::support::Servers;
+
 const NS: &str = "sales";
 
 /// A fleet of `n` in-process Flight workers, each with a cache the test can read.
@@ -66,12 +68,15 @@ const NS: &str = "sales";
 struct Fleet {
     urls: Vec<String>,
     caches: Vec<Arc<StageCache>>,
+    /// The workers themselves, stopped when this fleet is dropped — see [`Servers`].
+    _servers: Servers,
 }
 
 impl Fleet {
     async fn start(n: usize) -> anyhow::Result<Self> {
         let mut urls = Vec::with_capacity(n);
         let mut caches = Vec::with_capacity(n);
+        let mut servers = Servers::new();
         for _ in 0..n {
             // Port 0: the OS picks a free one, so the whole file is safe under a parallel
             // `cargo test --workspace`.
@@ -79,7 +84,7 @@ impl Fleet {
             let addr = listener.local_addr()?;
             let cache = Arc::new(StageCache::new());
             let served = Arc::clone(&cache);
-            tokio::spawn(async move {
+            servers.spawn(async move {
                 // A worker gets a bare `SessionContext` — no catalog, no manifest, no warehouse
                 // path. It can only read what the plan names.
                 flight::serve_worker_with_cache(listener, SessionContext::new(), served)
@@ -89,7 +94,11 @@ impl Fleet {
             urls.push(format!("http://{addr}"));
             caches.push(cache);
         }
-        Ok(Self { urls, caches })
+        Ok(Self {
+            urls,
+            caches,
+            _servers: servers,
+        })
     }
 
     /// Total stage materializations across the fleet.

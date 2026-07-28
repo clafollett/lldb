@@ -47,7 +47,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
-use crate::support::{self, resolve_target, unique_name};
+use crate::support::{self, Cleanup, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::Int64Array;
 use datafusion::prelude::SessionContext;
@@ -182,12 +182,16 @@ async fn seed(storage_root: &Path, manifest: &Manifest, account_id: i64, rows: i
 }
 
 /// In-process workers with bare sessions — a worker can only read what the plan names.
-async fn start_workers(count: usize) -> Result<Vec<SocketAddr>> {
+///
+/// The handles go into the caller's [`Servers`] rather than being dropped: a dropped `JoinHandle`
+/// detaches the task instead of stopping it, and since #44 this is one binary, so a detached worker
+/// holds its port for the rest of the run.
+async fn start_workers(servers: &mut Servers, count: usize) -> Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(count);
     for _ in 0..count {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         addrs.push(listener.local_addr()?);
-        tokio::spawn(async move {
+        servers.spawn(async move {
             flight::serve_worker(listener, SessionContext::new())
                 .await
                 .expect("worker serve");
@@ -231,9 +235,22 @@ async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_ins
 
     let a = provision(&db, "cat-a").await?;
     let b = provision(&db, "cat-b").await?;
-    // Everything below runs whether or not an assertion panics, so a failure does not leave rows
-    // in someone's dev database.
-    let outcome = async {
+
+    // Everything below runs whether or not an assertion panics, so a failure does not leave rows in
+    // someone's dev database. Registered *here*, before the first thing that can fail — the old
+    // shape ran these deletes after the body and so only on the success path. See
+    // `support::DbCleanup`.
+    let mut cleanup = DbCleanup::new(&url);
+    for tenant in [&a, &b] {
+        cleanup.account(tenant.account_id);
+        cleanup.add(Cleanup::IcebergCatalog(
+            TenantScope::account(tenant.account_id).iceberg_catalog_name(CATALOG),
+        ));
+    }
+    // A `Servers` per test, outside the block below so a `?` inside it still stops the workers.
+    let mut servers = Servers::new();
+
+    async {
         seed(tmp.path(), &manifest, a.account_id, ROWS_A).await?;
         seed(tmp.path(), &manifest, b.account_id, ROWS_B).await?;
 
@@ -278,7 +295,7 @@ async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_ins
         }
 
         // --- 2. The front door: one server, two tenants, one manifest. -------------------------
-        let workers = start_workers(2).await?;
+        let workers = start_workers(&mut servers, 2).await?;
         let sessions = TenantSessions::per_account(
             StorageConfig::Local(tmp.path().to_path_buf()),
             CatalogSource::Manifest(manifest_path.clone()),
@@ -302,7 +319,7 @@ async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_ins
             .with_result_cache(cache),
         );
         let served = Arc::clone(&coordinator);
-        let server = tokio::spawn(async move {
+        servers.spawn(async move {
             serve_coordinator(listener, served, std::future::pending::<()>())
                 .await
                 .expect("coordinator serve");
@@ -354,32 +371,7 @@ async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_ins
             "a catalog with no lakehouse handle means the cache has gone permanently cold"
         );
 
-        server.abort();
         Ok::<(), anyhow::Error>(())
     }
-    .await;
-
-    for id in [a.account_id, b.account_id] {
-        sqlx::query("DELETE FROM accounts WHERE id = $1")
-            .bind(id)
-            .execute(db.pool())
-            .await
-            .context("deleting a test account")?;
-    }
-    for scope in [
-        TenantScope::account(a.account_id),
-        TenantScope::account(b.account_id),
-    ] {
-        sqlx::query("DELETE FROM iceberg_tables WHERE catalog_name = $1")
-            .bind(scope.iceberg_catalog_name(CATALOG))
-            .execute(db.pool())
-            .await
-            .context("deleting a test catalog's rows")?;
-        sqlx::query("DELETE FROM iceberg_namespace_properties WHERE catalog_name = $1")
-            .bind(scope.iceberg_catalog_name(CATALOG))
-            .execute(db.pool())
-            .await
-            .context("deleting a test catalog's namespaces")?;
-    }
-    outcome
+    .await
 }
