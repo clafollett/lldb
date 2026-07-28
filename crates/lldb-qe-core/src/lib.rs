@@ -74,6 +74,7 @@ pub mod session;
 pub mod stage_cache;
 pub mod staging;
 pub mod storage;
+pub mod tenancy;
 pub mod tpch;
 pub mod warehouse;
 
@@ -86,8 +87,8 @@ pub use discovery::{
 };
 pub use dml::{DmlKind, DmlOutcome, DmlStatement};
 pub use engine::{
-    CatalogSource, build_query_session, contains_flight_reader, execute_query,
-    execute_query_cached, reject_inmemory_storage, resolve_fleet,
+    CatalogSource, TenantSession, TenantSessions, build_query_session, contains_flight_reader,
+    execute_query, execute_query_cached, reject_inmemory_storage, resolve_fleet,
 };
 pub use flight::{
     fetch, fetch_with_failover, serve_worker, serve_worker_with_auth, serve_worker_with_cache,
@@ -115,5 +116,6 @@ pub use session::{build_session, register_tpch_parquet};
 pub use stage_cache::{MaterializedStage, StageCache, stage_id_of};
 pub use staging::plan_distributed;
 pub use storage::{Storage, StorageConfig};
+pub use tenancy::TenantScope;
 pub use tpch::{TPCH_TABLES, tpch_manifest};
 pub use warehouse::{Warehouse, WarehouseOp, WarehouseState};

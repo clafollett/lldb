@@ -90,6 +90,7 @@ mod services_db;
 mod shared_sql_catalog;
 mod shuffle_materialization;
 mod stage_reassignment;
+mod tenant_catalogs;
 mod tpch_baseline;
 mod warehouse_lifecycle;
 mod warehouse_routing;

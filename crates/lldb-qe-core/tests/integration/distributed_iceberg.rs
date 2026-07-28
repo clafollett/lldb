@@ -49,6 +49,7 @@ use lldb_qe_core::flight::{self, deserialize_plan, serialize_plan};
 use lldb_qe_core::manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef,
 };
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
     FlightReaderExec, Lakehouse, StageCache, StorageConfig, TableSource, apply_manifest,
     contains_flight_reader, execute_query, plan_distributed, resolve_iceberg_scans,
@@ -163,7 +164,13 @@ async fn seeded(
 ) -> anyhow::Result<(SessionContext, Lakehouse)> {
     let ctx = distributing_ctx();
     let storage = StorageConfig::Local(warehouse.to_path_buf()).build()?;
-    let mut lakes = apply_manifest(&ctx, &storage, &manifest(warehouse)).await?;
+    let mut lakes = apply_manifest(
+        &ctx,
+        &storage,
+        &manifest(warehouse),
+        &TenantScope::untenanted(),
+    )
+    .await?;
 
     for batch in 0..orders_batches {
         let values = (0..rows_per_batch)

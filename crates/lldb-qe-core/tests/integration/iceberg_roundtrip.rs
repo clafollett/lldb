@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::util::pretty::pretty_format_batches;
 use lldb_qe_core::manifest::{CatalogDef, Manifest, NamespaceDef, TableDef, TableSource};
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
 fn data_dir() -> PathBuf {
@@ -72,7 +73,7 @@ async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
     // `lldb.tpch.nation` table as data through the generic manifest, then materialize it.
     let warehouse = tempfile::tempdir()?;
     let manifest = single_iceberg_table(warehouse.path(), "nation", &nation);
-    let lakes = apply_manifest(&ctx, &storage, &manifest).await?;
+    let lakes = apply_manifest(&ctx, &storage, &manifest, &TenantScope::untenanted()).await?;
     let lake = &lakes[0];
 
     // Query through the Iceberg catalog — three-part name: catalog.namespace.table.
@@ -111,7 +112,7 @@ async fn lineitem_group_by_through_iceberg() -> anyhow::Result<()> {
     let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;
     let warehouse = tempfile::tempdir()?;
     let manifest = single_iceberg_table(warehouse.path(), "lineitem", &lineitem);
-    apply_manifest(&ctx, &storage, &manifest).await?;
+    apply_manifest(&ctx, &storage, &manifest, &TenantScope::untenanted()).await?;
 
     let batches = ctx
         .sql(

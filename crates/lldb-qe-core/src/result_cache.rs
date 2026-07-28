@@ -486,8 +486,33 @@ fn referenced_tables(
     Ok(refs)
 }
 
-/// Turn resolved table names into versioned [`TableInput`]s, or `None` if *any* of them cannot be
-/// versioned.
+/// Why a query's inputs could not be versioned.
+///
+/// Two outcomes with the same *effect* — the query is not cached — and very different meanings, so
+/// they are separate variants rather than one `None`. Collapsing them is how a wiring mistake
+/// turns into a cache that silently never fires again: every lookup would report "not cacheable",
+/// which is indistinguishable from a correct refusal and is exactly what "fail open" looks like
+/// from the outside.
+#[derive(Debug)]
+enum Unversionable {
+    /// An expected refusal: no tables at all, a listing table, a table function,
+    /// `information_schema`, or an Iceberg table whose metadata would not load. See
+    /// "What this does NOT cache".
+    Expected,
+    /// A reference the session resolved into a catalog this process holds **no [`Lakehouse`] for**.
+    ///
+    /// That is a wiring bug, not a policy decision: the session and the lakehouse set are supposed
+    /// to come from one [`build_query_session`](crate::engine::build_query_session) call for one
+    /// tenant, so a catalog that plans but cannot be versioned means they have drifted apart — a
+    /// tenant served another tenant's context, or a caller that paired a cache with the wrong
+    /// handles. The query still runs (**not caching is always a legal answer**, CLAUDE.md), but it
+    /// is counted and logged at `warn` so the cache going permanently cold is visible instead of
+    /// merely quiet.
+    MissingCatalog { catalog: String },
+}
+
+/// Turn resolved table names into versioned [`TableInput`]s, or say why not if *any* of them
+/// cannot be versioned.
 ///
 /// The all-or-nothing return is the point. A partially-versioned input set would produce a key
 /// that looks specific and is not, and the query it keyed would go stale the moment the
@@ -495,23 +520,37 @@ fn referenced_tables(
 async fn version_inputs(
     lakehouses: &[Lakehouse],
     refs: &BTreeSet<ResolvedTableReference>,
-) -> Option<Vec<TableInput>> {
+    default_catalog: &str,
+) -> Result<Vec<TableInput>, Unversionable> {
     if refs.is_empty() {
         // Nothing to invalidate on. See "What this does NOT cache".
-        return None;
+        return Err(Unversionable::Expected);
     }
     let mut inputs = Vec::with_capacity(refs.len());
     for r in refs {
-        let lake = lakehouses
-            .iter()
-            .find(|l| l.catalog_name() == &*r.catalog)?;
+        // Matched on the *DataFusion* catalog name, which is what a plan's table reference carries
+        // and what stays constant across tenants; the storage-facing name that actually partitions
+        // the tenants is `Lakehouse::iceberg_catalog_name`, and matching on it here would fail for
+        // every tenanted catalog and reduce this cache to "never fires". See [`crate::lakehouse`].
+        let Some(lake) = lakehouses.iter().find(|l| l.catalog_name() == &*r.catalog) else {
+            // A reference into the session's *default* catalog is a listing table, an in-memory
+            // table or a table function — there is no snapshot behind any of them and there never
+            // will be, so this is the ordinary refusal rather than a mismatch.
+            return Err(if &*r.catalog == default_catalog {
+                Unversionable::Expected
+            } else {
+                Unversionable::MissingCatalog {
+                    catalog: r.catalog.to_string(),
+                }
+            });
+        };
         // A load failure — the table is not in this catalog, the metadata is unreadable — means
         // we do not know this input's version, which means we do not cache.
         let snapshot = match lake.current_snapshot_id(&r.schema, &r.table).await {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 tracing::debug!(table = %r, error = %e, "result cache: input cannot be versioned");
-                return None;
+                return Err(Unversionable::Expected);
             }
         };
         inputs.push(TableInput {
@@ -521,7 +560,7 @@ async fn version_inputs(
             snapshot,
         });
     }
-    Some(inputs)
+    Ok(inputs)
 }
 
 // ---------------------------------------------------------------------------
@@ -545,6 +584,7 @@ pub struct ResultCache {
     stores: AtomicUsize,
     skips: AtomicUsize,
     executions: AtomicUsize,
+    catalog_mismatches: AtomicUsize,
 }
 
 impl ResultCache {
@@ -558,6 +598,7 @@ impl ResultCache {
             stores: AtomicUsize::new(0),
             skips: AtomicUsize::new(0),
             executions: AtomicUsize::new(0),
+            catalog_mismatches: AtomicUsize::new(0),
         }
     }
 
@@ -584,6 +625,18 @@ impl ResultCache {
     /// Queries the cache declined to key at all — see "What this does NOT cache".
     pub fn skip_count(&self) -> usize {
         self.skips.load(Ordering::SeqCst)
+    }
+
+    /// Skips caused by a catalog with no [`Lakehouse`] handle behind it — see
+    /// [`Unversionable::MissingCatalog`].
+    ///
+    /// **This must be zero.** It is not a tuning statistic; it counts the one way this cache can
+    /// stop working without anything failing, which is that the session it is asked about and the
+    /// handles it is asked with belong to different tenants or different builds. A test asserts it
+    /// stays at zero across a real multi-tenant run, because "the cache quietly never fires" is
+    /// otherwise indistinguishable from "these queries are correctly uncacheable".
+    pub fn catalog_mismatch_count(&self) -> usize {
+        self.catalog_mismatches.load(Ordering::SeqCst)
     }
 
     /// How many times the engine actually ran a query through this cache.
@@ -888,7 +941,10 @@ where
         return execute(plan).await;
     };
 
-    let Some(key) = cache_key_for(&state, lakehouses, account_id, &statement, &named, &plan).await
+    let Some(key) = cache_key_for(
+        &state, cache, lakehouses, account_id, &statement, &named, &plan,
+    )
+    .await
     else {
         cache.skips.fetch_add(1, Ordering::SeqCst);
         tracing::debug!("result cache: query is not cacheable; executing normally");
@@ -920,6 +976,7 @@ where
 /// The key for this query, or `None` if it must not be cached.
 async fn cache_key_for(
     state: &datafusion::execution::SessionState,
+    cache: &ResultCache,
     lakehouses: &[Lakehouse],
     account_id: i64,
     statement: &DFStatement,
@@ -935,7 +992,22 @@ async fn cache_key_for(
     let default_schema = options.catalog.default_schema.clone();
 
     let refs = referenced_tables(named, plan, &default_catalog, &default_schema).ok()?;
-    let inputs = version_inputs(lakehouses, &refs).await?;
+    let inputs = match version_inputs(lakehouses, &refs, &default_catalog).await {
+        Ok(inputs) => inputs,
+        Err(Unversionable::Expected) => return None,
+        Err(Unversionable::MissingCatalog { catalog }) => {
+            cache.catalog_mismatches.fetch_add(1, Ordering::SeqCst);
+            tracing::warn!(
+                catalog,
+                held = ?lakehouses.iter().map(Lakehouse::catalog_name).collect::<Vec<_>>(),
+                "result cache: the query planned against a catalog this process holds no lakehouse \
+                 handle for, so nothing it reads can be versioned and nothing will ever be cached. \
+                 The session and its catalog handles must come from one build_query_session call \
+                 for one tenant."
+            );
+            return None;
+        }
+    };
 
     Some(ResultCacheKey::new(
         account_id,
@@ -1280,14 +1352,37 @@ mod tests {
 
     #[tokio::test]
     async fn a_query_with_no_versionable_input_is_not_cacheable() {
-        // No lakehouses at all: nothing can be versioned, so nothing may be cached.
-        let refs: BTreeSet<ResolvedTableReference> =
-            [TableReference::from("lldb.sales.t").resolve("lldb", "sales")]
+        // A table in the session's *default* catalog is a listing table or an in-memory one:
+        // no snapshot, never any snapshot, so this refusal is expected and stays quiet.
+        let listing: BTreeSet<ResolvedTableReference> =
+            [TableReference::from("t").resolve("datafusion", "public")]
                 .into_iter()
                 .collect();
-        assert!(version_inputs(&[], &refs).await.is_none());
+        assert!(matches!(
+            version_inputs(&[], &listing, "datafusion").await,
+            Err(Unversionable::Expected)
+        ));
         // …and a query touching no table has nothing to invalidate on.
-        assert!(version_inputs(&[], &BTreeSet::new()).await.is_none());
+        assert!(matches!(
+            version_inputs(&[], &BTreeSet::new(), "datafusion").await,
+            Err(Unversionable::Expected)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_catalog_with_no_lakehouse_is_reported_rather_than_shrugged_off() {
+        // The failure this variant exists for: the query planned against `lldb`, so that catalog
+        // *is* registered in the session — but no handle here can version it. Both outcomes stop
+        // the query being cached, and telling them apart is the only way "the cache went cold" is
+        // ever distinguishable from "these queries were never cacheable".
+        let refs: BTreeSet<ResolvedTableReference> =
+            [TableReference::from("lldb.sales.t").resolve("datafusion", "public")]
+                .into_iter()
+                .collect();
+        assert!(matches!(
+            version_inputs(&[], &refs, "datafusion").await,
+            Err(Unversionable::MissingCatalog { catalog }) if catalog == "lldb"
+        ));
     }
 
     #[tokio::test]

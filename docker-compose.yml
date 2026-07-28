@@ -30,6 +30,14 @@
 # `s3://` warehouse is refused at startup instead of silently writing table metadata to one
 # container's local disk (see the `lakehouse` module docs). Table *data* still lives in S3; it is
 # the Iceberg metadata that needs a filesystem every role can reach, hence a shared volume.
+#
+# On that volume the catalog is **per account**, so the path is `.../warehouse/acct_<id>/...` and
+# the row in `iceberg_tables` says `acct_<id>__shared`, not `shared`. The manifest is unchanged and
+# so is the SQL — `FROM shared.sales.orders` still resolves, to that account's copy. Nothing here
+# sets LLDB_ACCOUNT, so every role runs as `default` — the account `db-migrate` seeds — and they all
+# see one catalog, which is what this demo is for. Workers are unaffected either way: since a plan
+# names its data files directly, a worker opens no catalog at all. See
+# crates/lldb-qe-core/src/tenancy.rs.
 # ---- Virtual warehouses, locally -----------------------------------------------------------
 #
 # Two named pools of compute over the *same* MinIO warehouse and the same catalog: `analytics`

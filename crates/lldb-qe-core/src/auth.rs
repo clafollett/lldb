@@ -54,15 +54,27 @@
 //! merely unlikely. Two accounts on one deployment therefore cannot name each other's warehouses
 //! and cannot be granted each other's tables.
 //!
-//! **The catalog is the exception, and it is worth stating plainly rather than letting a reader
-//! discover it.** The Iceberg SQL catalog's `iceberg_tables` / `iceberg_namespace_properties` rows
-//! are created and owned by `iceberg-catalog-sql`, not by this schema, and they are **not
-//! partitioned by account**. Isolation between tenants over table data is therefore enforced by the
-//! plan-time grant check in [`crate::rbac`] and by nothing else: a tenant with no grants can query
-//! nothing, but the catalog underneath is one namespace, and an operator who grants account B a
-//! catalog-wide privilege really has given it account A's tables. Physically separate per-account
-//! catalogs are a larger change — a catalog per tenant, or a tenant column `iceberg-catalog-sql`
-//! does not have — and belong to their own issue.
+//! **The catalog is partitioned too, by a different mechanism, and the difference is worth
+//! knowing.** `iceberg_tables` / `iceberg_namespace_properties` are created and owned by
+//! `iceberg-catalog-sql`, not by this schema, so no migration here can add an `account_id` column
+//! to them and no foreign key here can constrain them. What [`crate::tenancy`] does instead is give
+//! each account **its own catalog and its own warehouse root**: `catalog_name` is already the
+//! leading primary-key column of both tables and appears in the `WHERE` clause of every statement
+//! that crate issues, so a per-account value partitions the rows exactly as a discriminator column
+//! would, and a per-account warehouse root keeps the files apart (the catalog name does not appear
+//! in a table's location, so scoping one without the other would collide on disk).
+//!
+//! The consequence for *this* module: a coordinator registers only the caller's own catalogs into
+//! the caller's session, so another tenant's tables are not reachable by any name — the grant check
+//! is no longer the only thing between two accounts. A catalog-wide grant is now genuinely
+//! catalog-wide within one tenant and reaches nothing outside it.
+//!
+//! Two honest limits remain, and neither is closed by the above. **Enforcement is per boundary, not
+//! per row**: the partitioning is a property of what a session registers, so a component that
+//! opened a catalog for the wrong scope would read the wrong tenant's rows — nothing in Postgres
+//! would stop it, the way a foreign key stops a cross-tenant grant. And this separates tenants'
+//! *layout*, not their *access*: see the worker boundary below, and [`crate::tenancy`] for the full
+//! statement of what it does not stop.
 //!
 //! # The other boundary: the worker fleet
 //!

@@ -89,14 +89,35 @@ use tokio::sync::OnceCell;
 
 use crate::manifest::CatalogBackend;
 use crate::services::{ServicesArgs, redact_url};
+use crate::tenancy::TenantScope;
 
 /// An Iceberg catalog plus the glue to create tables and expose them to DataFusion.
 ///
 /// Generic over the DataFusion catalog name; namespaces and tables are passed per call, so a
 /// single `Lakehouse` can hold many namespaces.
+///
+/// # Two names, on purpose
+///
+/// A lakehouse answers to two catalog names and they are *not* interchangeable:
+///
+/// - [`Self::catalog_name`] is what SQL says — the name this catalog registers under in a
+///   [`SessionContext`], the first segment of `catalog.namespace.table`, and what [`crate::rbac`]
+///   grants are written against.
+/// - [`Self::iceberg_catalog_name`] is what the *storage* says — the value in
+///   `iceberg_tables.catalog_name`, which is that table's leading primary-key column and the
+///   discriminator every statement `iceberg-catalog-sql` issues filters on.
+///
+/// They are equal for an untenanted catalog and differ under a [`TenantScope`], which is the whole
+/// mechanism of per-tenant catalogs: each account's session registers *its* catalog under the
+/// manifest's declared name, so `SELECT … FROM lldb.sales.orders` stays portable across tenants
+/// while resolving to a different set of rows and a different directory for each one. Confusing
+/// the two is the bug this doc comment exists to prevent — using the SQL name to commit would put
+/// two tenants back in one catalog, and using the storage name in SQL would make every query name
+/// its own account id.
 pub struct Lakehouse {
     catalog: Arc<dyn Catalog>,
     catalog_name: String,
+    iceberg_catalog_name: String,
     /// The compare-and-swap this catalog commits through, when it has one. See
     /// [`CatalogCommitPoint`] and [`crate::dml`].
     commit_point: Option<CatalogCommitPoint>,
@@ -150,20 +171,36 @@ impl CatalogCommitPoint {
 impl Lakehouse {
     /// Open an in-process MemoryCatalog whose data files live under `warehouse` on the local
     /// filesystem. `warehouse` must be an absolute path.
+    ///
+    /// Untenanted: a memory catalog is per-process and dies with it, so there is nothing for two
+    /// tenants to share and nothing to partition. The tenant-scoped path is [`Self::open`], which
+    /// is what a manifest goes through.
     pub async fn open_memory(catalog_name: &str, warehouse: &Path) -> Result<Self> {
         let warehouse_uri = format!("file://{}", warehouse.display());
-        Self::open_memory_uri(catalog_name, &warehouse_uri).await
+        Self::open_memory_uri(catalog_name, &TenantScope::untenanted(), &warehouse_uri).await
     }
 
     /// Open a persistent SQL catalog: catalog metadata in `catalog_uri`'s database, table files
-    /// under `warehouse` (a path or `file://` URI).
+    /// under `warehouse` (a path or `file://` URI), both partitioned by `scope`.
     ///
-    /// `catalog_name` is not decoration — it is a *column* in `iceberg_tables`, so it is the
-    /// key two processes must agree on to be looking at the same catalog. Same name + same URI
-    /// = same tables; a typo in either silently yields an empty catalog rather than an error,
-    /// which is worth knowing when a worker reports a table that "does not exist".
-    pub async fn open_sql(catalog_name: &str, catalog_uri: &str, warehouse: &str) -> Result<Self> {
-        let warehouse_uri = normalize_warehouse_uri(warehouse);
+    /// `catalog_name` is not decoration — `scope` turns it into a *column* value in
+    /// `iceberg_tables`, so it is the key two processes must agree on to be looking at the same
+    /// catalog. Same name + same scope + same URI = same tables; a mismatch in any of them
+    /// silently yields an empty catalog rather than an error, which is worth knowing when a worker
+    /// reports a table that "does not exist".
+    ///
+    /// `scope` moves the warehouse root as well as the name, and it has to:
+    /// `iceberg-catalog-sql` builds a table's location as `{warehouse}/{namespace}/{table}` with no
+    /// catalog name in it, so two tenanted catalogs over one warehouse root would separate their
+    /// rows and then collide on disk. See [`TenantScope`].
+    pub async fn open_sql(
+        catalog_name: &str,
+        scope: &TenantScope,
+        catalog_uri: &str,
+        warehouse: &str,
+    ) -> Result<Self> {
+        let iceberg_catalog_name = scope.iceberg_catalog_name(catalog_name);
+        let warehouse_uri = scope.warehouse_uri(&normalize_warehouse_uri(warehouse));
         // Validated up front so a bad URI fails before any connection attempt; recomputed per
         // attempt below because `SqlBindStyle` is neither `Clone` nor `Copy` and the function is a
         // cheap pure mapping over the scheme.
@@ -195,7 +232,7 @@ impl Lakehouse {
                 .uri(catalog_uri)
                 .warehouse_location(warehouse_uri.clone())
                 .sql_bind_style(sql_bind_style_for(catalog_uri)?)
-                .load(catalog_name, HashMap::new())
+                .load(&iceberg_catalog_name, catalog_properties())
                 .await;
             match result {
                 Ok(catalog) => break catalog,
@@ -204,7 +241,7 @@ impl Lakehouse {
                 {
                     attempt += 1;
                     tracing::debug!(
-                        catalog = catalog_name,
+                        catalog = iceberg_catalog_name,
                         attempt,
                         "another process was bootstrapping the catalog schema; retrying"
                     );
@@ -215,7 +252,8 @@ impl Lakehouse {
                 Err(err) => {
                     return Err(err).with_context(|| {
                         format!(
-                            "opening sql catalog `{catalog_name}` at {} (warehouse {warehouse_uri})",
+                            "opening sql catalog `{iceberg_catalog_name}` at {} (warehouse \
+                             {warehouse_uri})",
                             redact_url(catalog_uri)
                         )
                     });
@@ -225,6 +263,7 @@ impl Lakehouse {
         Ok(Self {
             catalog: Arc::new(catalog),
             catalog_name: catalog_name.to_string(),
+            iceberg_catalog_name,
             commit_point: Some(CatalogCommitPoint {
                 uri: catalog_uri.to_string(),
                 pool: OnceCell::new(),
@@ -232,13 +271,15 @@ impl Lakehouse {
         })
     }
 
-    /// Open a catalog for `backend`. Iceberg backends need a `warehouse` (path or URI).
+    /// Open a catalog for `backend`, partitioned by `scope`. Iceberg backends need a `warehouse`
+    /// (path or URI).
     ///
     /// A `sql` backend with no `uri` falls back to the fleet's services database
     /// (`LLDB_METADATA_*`) — see [`CatalogBackend::Sql`] for why a manifest should not carry a
     /// password. `rest` is still unimplemented and says so.
     pub async fn open(
         catalog_name: &str,
+        scope: &TenantScope,
         backend: &CatalogBackend,
         warehouse: Option<&str>,
     ) -> Result<Self> {
@@ -246,13 +287,14 @@ impl Lakehouse {
             CatalogBackend::Memory => {
                 let warehouse = warehouse
                     .context("memory catalog requires a `warehouse` (path or file:// URI)")?;
-                Self::open_memory_uri(catalog_name, &normalize_warehouse_uri(warehouse)).await
+                Self::open_memory_uri(catalog_name, scope, &normalize_warehouse_uri(warehouse))
+                    .await
             }
             CatalogBackend::Sql { uri } => {
                 let warehouse = warehouse
                     .context("sql catalog requires a `warehouse` (path or file:// URI)")?;
                 let uri = resolve_sql_catalog_uri(uri.as_deref())?;
-                Self::open_sql(catalog_name, &uri, warehouse).await
+                Self::open_sql(catalog_name, scope, &uri, warehouse).await
             }
             CatalogBackend::Rest { .. } => bail!(
                 "rest catalog backend is not implemented — use `{{ kind = \"sql\" }}` for a \
@@ -261,7 +303,16 @@ impl Lakehouse {
         }
     }
 
-    async fn open_memory_uri(catalog_name: &str, warehouse_uri: &str) -> Result<Self> {
+    async fn open_memory_uri(
+        catalog_name: &str,
+        scope: &TenantScope,
+        warehouse_uri: &str,
+    ) -> Result<Self> {
+        // A memory catalog is per-process, so its *name* needs no partitioning — two tenants in
+        // one process already hold two independent `MemoryCatalog`s. The warehouse still does:
+        // both of those catalogs write real files, and unscoped they would write them to the same
+        // directory. Scoping only what actually collides keeps the dev default's on-disk layout
+        // recognizable.
         let catalog = MemoryCatalogBuilder::default()
             // Without a storage factory the "files" would live in RAM; we want them on disk.
             .with_storage_factory(Arc::new(LocalFsStorageFactory))
@@ -269,7 +320,7 @@ impl Lakehouse {
                 catalog_name,
                 HashMap::from([(
                     MEMORY_CATALOG_WAREHOUSE.to_string(),
-                    warehouse_uri.to_string(),
+                    scope.warehouse_uri(warehouse_uri),
                 )]),
             )
             .await
@@ -277,6 +328,7 @@ impl Lakehouse {
         Ok(Self {
             catalog: Arc::new(catalog),
             catalog_name: catalog_name.to_string(),
+            iceberg_catalog_name: catalog_name.to_string(),
             // A MemoryCatalog keeps its table pointers behind a private mutex with no public
             // way to swap one, and in any case it is per-process — there is nothing for two
             // writers to race over and nothing to arbitrate the race if there were. DML says so
@@ -285,9 +337,20 @@ impl Lakehouse {
         })
     }
 
-    /// The DataFusion catalog name this lakehouse registers under.
+    /// The DataFusion catalog name this lakehouse registers under — what SQL says.
+    ///
+    /// The same for every tenant, by design. See the type's docs for why there are two names.
     pub fn catalog_name(&self) -> &str {
         &self.catalog_name
+    }
+
+    /// The value in `iceberg_tables.catalog_name` — what the storage says, and the column that
+    /// keeps one tenant's rows out of another's.
+    ///
+    /// Equal to [`Self::catalog_name`] for an untenanted catalog. [`crate::dml`] commits against
+    /// *this* one, because its `UPDATE` is a statement about a row, not about a query.
+    pub fn iceberg_catalog_name(&self) -> &str {
+        &self.iceberg_catalog_name
     }
 
     /// The compare-and-swap this catalog commits through, if it has one.
@@ -422,6 +485,37 @@ fn table_creation(name: &str, arrow_schema: &ArrowSchema) -> Result<TableCreatio
         .schema(ice_schema)
         .properties(HashMap::new())
         .build())
+}
+
+/// How large `SqlCatalog`'s private connection pool may grow, per catalog, per process.
+///
+/// **Four, not the crate's default of ten, and the reason is per-tenant catalogs.** Before
+/// [`TenantScope`] existed a process held one SQL catalog, so `SqlCatalog`'s undersized-by-nobody
+/// default of 10 connections (plus [`CatalogCommitPoint`]'s lazy 2) cost at most 12 sockets and was
+/// not worth an opinion. A catalog per tenant multiplies that by the number of tenants *and* by
+/// every coordinator and worker process in the fleet, which turns an unremarkable default into the
+/// dominant running cost of this design — and into a way for one busy deployment to exhaust
+/// Postgres's `max_connections` on catalog handles that are almost always idle.
+///
+/// Four is the per-coordinator query concurrency
+/// ([`DEFAULT_MAX_CONCURRENT_QUERIES`](crate::scheduler::DEFAULT_MAX_CONCURRENT_QUERIES)), which is
+/// the real bound on how many catalog statements one process can have in flight at once: catalog
+/// work is short metadata reads and a pointer swap, never the scan. The pool is also a *ceiling*
+/// rather than a resident count — `iceberg-catalog-sql` sets a 10 s idle timeout, so an idle
+/// tenant's connections are returned rather than held.
+const CATALOG_POOL_MAX_CONNECTIONS: u32 = 4;
+
+/// Properties handed to `SqlCatalogBuilder::load`.
+///
+/// `iceberg-catalog-sql` reads its pool settings out of this map and `parse().unwrap()`s them, so
+/// the value must be a plain integer — which is why it is rendered from a typed constant rather
+/// than written as a literal string. Unrecognized keys are forwarded to the `FileIO` and ignored
+/// there, so this map is not a place to put anything storage-facing.
+fn catalog_properties() -> HashMap<String, String> {
+    HashMap::from([(
+        "pool.max-connections".to_string(),
+        CATALOG_POOL_MAX_CONNECTIONS.to_string(),
+    )])
 }
 
 /// How many times to re-attempt a catalog open that lost the `CREATE TABLE IF NOT EXISTS` race.
@@ -564,6 +658,39 @@ mod tests {
         // Idempotent: a second ensure on an existing namespace is fine.
         lake.ensure_namespace(&ns).await?;
         assert_eq!(lake.catalog_name(), "lldb");
+        // Untenanted, so SQL's name and the storage's name are the same word.
+        assert_eq!(lake.iceberg_catalog_name(), "lldb");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tenanted_memory_catalog_keeps_its_files_to_itself() -> Result<()> {
+        // Two accounts, one manifest, one warehouse root, the same qualified table name. The
+        // catalogs are separate for free (a memory catalog is per-process); what has to be checked
+        // is that they do not write over each other, since `iceberg-catalog-sql`'s layout — which
+        // the memory catalog shares — puts no catalog name in the path.
+        let warehouse = tempfile::tempdir()?;
+        let uri = format!("file://{}", warehouse.path().display());
+        let ns = NamespaceIdent::new("sales".to_string());
+        let schema = ArrowSchema::new(vec![datafusion::arrow::datatypes::Field::new(
+            "id",
+            datafusion::arrow::datatypes::DataType::Int64,
+            false,
+        )]);
+
+        for id in [1i64, 2] {
+            let lake = Lakehouse::open_memory_uri("lldb", &TenantScope::account(id), &uri).await?;
+            lake.ensure_namespace(&ns).await?;
+            assert!(lake.ensure_table_from_arrow(&ns, "orders", &schema).await?);
+            // Same SQL name for both tenants — that is the point of the two-name split.
+            assert_eq!(lake.catalog_name(), "lldb");
+            let table = lake.load_table("sales", "orders").await?;
+            assert!(
+                table.metadata().location().contains(&format!("acct_{id}")),
+                "a tenant's table must live under its own warehouse root: {}",
+                table.metadata().location()
+            );
+        }
         Ok(())
     }
 
@@ -653,6 +780,22 @@ mod tests {
     }
 
     #[test]
+    fn the_catalog_pool_is_sized_rather_than_defaulted() {
+        // Left empty, `iceberg-catalog-sql` applies its own default of 10 per catalog — which a
+        // catalog per tenant multiplies by tenants and by processes. The key spelling is the
+        // crate's, and it `parse().unwrap()`s the value, so both are pinned here.
+        let props = catalog_properties();
+        assert_eq!(
+            props.get("pool.max-connections").map(String::as_str),
+            Some("4")
+        );
+        assert!(
+            props["pool.max-connections"].parse::<u32>().is_ok(),
+            "iceberg-catalog-sql unwraps this parse; a non-integer would panic at open"
+        );
+    }
+
+    #[test]
     fn explicit_catalog_uri_wins_over_the_environment() -> Result<()> {
         assert_eq!(
             resolve_sql_catalog_uri(Some("postgres://lldb@db/lldb"))?,
@@ -670,20 +813,21 @@ mod tests {
 
     #[tokio::test]
     async fn open_rejects_the_rest_backend_and_warehouseless_sql() {
+        let scope = TenantScope::untenanted();
         let rest = CatalogBackend::Rest {
             uri: "http://localhost:8181".to_string(),
         };
-        assert!(Lakehouse::open("c", &rest, None).await.is_err());
+        assert!(Lakehouse::open("c", &scope, &rest, None).await.is_err());
 
         // A SQL catalog still needs somewhere to put table files.
         let sql = CatalogBackend::Sql {
             uri: Some("postgres://lldb@127.0.0.1:1/lldb".to_string()),
         };
-        assert!(Lakehouse::open("c", &sql, None).await.is_err());
+        assert!(Lakehouse::open("c", &scope, &sql, None).await.is_err());
 
         // …and an object-store warehouse is refused before any connection is attempted, so this
         // asserts the message rather than a timeout against a dead port.
-        let err = match Lakehouse::open("c", &sql, Some("s3://bucket/wh")).await {
+        let err = match Lakehouse::open("c", &scope, &sql, Some("s3://bucket/wh")).await {
             Ok(_) => panic!("an s3 warehouse must be rejected, not silently localized"),
             Err(e) => e.to_string(),
         };

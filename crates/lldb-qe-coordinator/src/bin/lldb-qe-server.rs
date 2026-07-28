@@ -49,13 +49,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use lldb_qe_core::engine::TenantSessions;
 use lldb_qe_core::scheduler::DEFAULT_MAX_QUEUED_QUERIES;
 use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, DEFAULT_SERVER_BIND, serve_coordinator,
 };
 use lldb_qe_core::{
     CatalogSource, DEFAULT_WAREHOUSE_ENDPOINT, ResultCacheArgs, ServicesArgs, StorageArgs,
-    build_query_session, init_tracing, redact_url, reject_inmemory_storage,
+    init_tracing, redact_url, reject_inmemory_storage,
 };
 use tokio::net::TcpListener;
 
@@ -188,7 +189,16 @@ async fn main() -> Result<()> {
             subdir: cli.tpch_subdir.clone(),
         },
     };
-    let (ctx, lakehouses) = build_query_session(config, &catalog).await?;
+    // One session per account, built the first time that account submits a query, rather than one
+    // process-wide session built here. This is the *front door*: it serves many tenants, and a
+    // shared session would have to hold every tenant's catalog — making every tenant's catalog name
+    // visible to every other one, and putting isolation back on the grant check instead of on the
+    // structure. See `lldb_qe_core::tenancy`.
+    //
+    // Building lazily rather than eagerly is not an optimization: the set of accounts is a table in
+    // the services database that changes while this process runs, so there is no moment at startup
+    // when "every tenant" is a knowable list.
+    let sessions = TenantSessions::per_account(config, catalog);
 
     let listener = TcpListener::bind(cli.bind)
         .await
@@ -196,8 +206,8 @@ async fn main() -> Result<()> {
     let addr = listener.local_addr()?;
     let coordinator_id = cli.coordinator_id.unwrap_or_else(|| addr.to_string());
 
-    let mut coordinator = Coordinator::new(
-        ctx,
+    let mut coordinator = Coordinator::multi_tenant(
+        sessions,
         db.clone(),
         CoordinatorConfig {
             default_account: cli.account,
@@ -216,7 +226,7 @@ async fn main() -> Result<()> {
         && let Some(cache) = cli.result_cache.build(db)
     {
         tracing::info!(config = ?cache.config(), "result cache is on");
-        coordinator = coordinator.with_result_cache(cache, lakehouses);
+        coordinator = coordinator.with_result_cache(cache);
     }
     let coordinator = Arc::new(coordinator);
     // Before the port is served, and unconditionally: whichever posture this is, it is stated.

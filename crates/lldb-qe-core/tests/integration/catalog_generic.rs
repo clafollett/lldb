@@ -8,6 +8,7 @@ use datafusion::prelude::SessionContext;
 use lldb_qe_core::manifest::{
     CatalogDef, Manifest, NamespaceDef, TableDef, TableFormat, TableSource,
 };
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
 /// Write `select_sql`'s rows to a parquet file at `path` via DataFusion `COPY`.
@@ -82,7 +83,7 @@ async fn arbitrary_schema_loads_through_the_manifest() -> anyhow::Result<()> {
     };
 
     let (ctx, storage) = build_session(StorageConfig::Local(root.path().to_path_buf())).await?;
-    let lakes = apply_manifest(&ctx, &storage, &manifest).await?;
+    let lakes = apply_manifest(&ctx, &storage, &manifest, &TenantScope::untenanted()).await?;
     assert_eq!(lakes.len(), 1, "one catalog has Iceberg tables");
 
     // Iceberg table resolves by its arbitrary three-part name.

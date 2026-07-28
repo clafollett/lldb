@@ -83,6 +83,7 @@ use lldb_qe_core::manifest::{
 };
 use lldb_qe_core::result_cache::{ResultCache, ResultCacheConfig};
 use lldb_qe_core::services::ServicesDb;
+use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
     StageCache, StorageConfig, apply_manifest, build_session, execute_query_cached,
     serve_worker_with_cache,
@@ -411,8 +412,13 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
     // relies on it.
     let (ctx, storage) =
         build_session(StorageConfig::Local(warehouse.path().to_path_buf())).await?;
-    let lakehouses =
-        apply_manifest(&ctx, &storage, &manifest(&catalog, url, warehouse.path())).await?;
+    let lakehouses = apply_manifest(
+        &ctx,
+        &storage,
+        &manifest(&catalog, url, warehouse.path()),
+        &TenantScope::untenanted(),
+    )
+    .await?;
     assert_eq!(lakehouses.len(), 1, "one catalog in, one lakehouse out");
 
     insert_rows(&ctx, &catalog, "(1, 'a'), (2, 'b'), (3, 'c')").await?;
@@ -671,8 +677,13 @@ async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Resul
     // `Local` for the same reason as above: the workers read the warehouse's files directly.
     let (ctx, storage) =
         build_session(StorageConfig::Local(warehouse.path().to_path_buf())).await?;
-    let lakehouses =
-        apply_manifest(&ctx, &storage, &manifest(&catalog, url, warehouse.path())).await?;
+    let lakehouses = apply_manifest(
+        &ctx,
+        &storage,
+        &manifest(&catalog, url, warehouse.path()),
+        &TenantScope::untenanted(),
+    )
+    .await?;
     insert_rows(&ctx, &catalog, "(1, 'a'), (2, 'b')").await?;
 
     let table = format!("\"{catalog}\".\"{NS}\".\"orders\"");
