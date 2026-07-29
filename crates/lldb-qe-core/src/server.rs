@@ -67,6 +67,11 @@
 //!    the path can read and replay indefinitely, so a coordinator that is *checking* credentials
 //!    (i.e. one with a services database) will not bind a plaintext port unless an operator
 //!    explicitly asks for one. See [`crate::tls`].
+//! 5. The answer travels *with the query*. Everything above happens here, on the coordinator, and a
+//!    worker used to see none of it — it received a physical plan and ran it. Every dispatch now
+//!    carries a signed, short-lived [plan assertion](crate::plan_assertion) naming the account, the
+//!    user and the locations this plan was authorized to read, and a worker checks the plan it is
+//!    handed against it. Read that module for what the check can and cannot verify.
 //!
 //! **Whether authentication is enforced follows the services database**, because that is where
 //! accounts, users, keys and grants live. With no `--metadata-*` there is nothing to authenticate
@@ -103,9 +108,17 @@
 //!   *client* certificate. mTLS, and the question of whether it should replace the worker
 //!   boundary's shared secret, is a separate decision and is not what this does; `LLDB_FLEET_TOKEN`
 //!   is untouched and is still the only thing proving fleet membership.
-//! - **No per-request identity at the worker boundary.** Workers authenticate the *fleet*, not the
-//!   user (see [`crate::auth`]). A compromised coordinator can still ask a worker for anything, and
-//!   TLS does not change what claim a shared deployment secret makes.
+//! - **No *proof* that the coordinator authorized a worker's plan — only that the fleet did.** This
+//!   bullet used to read "no per-request identity at the worker boundary", and that part is closed:
+//!   every dispatch now carries a short-lived, MAC'd assertion naming the account, the user and the
+//!   object-store locations the grant check passed, and a worker refuses a plan whose file scans
+//!   fall outside them ([`crate::plan_assertion`]). What is *not* closed is who can produce one. The
+//!   key is HMAC-derived from `LLDB_FLEET_TOKEN`, so it is symmetric: a compromised **worker** can
+//!   mint an assertion as easily as it verifies one, and the honest claim is "someone in this fleet
+//!   authorized this plan", not "the coordinator did". Nor can a worker check the *whole* assertion
+//!   — a physical plan has no table names, so `SELECT on table lldb.sales.orders` travels for audit
+//!   while only the file locations are verifiable. Asymmetric keys are what would make the first gap
+//!   go away; neither is what this does.
 //! - **No cancellation of another coordinator's query, and none of the fleet's work.** A cancel is
 //!   answered by the process that is running the query and refused as "not running here" by any
 //!   other, and the workers executing its stages are not told (see [`crate::cancel`] for both, and

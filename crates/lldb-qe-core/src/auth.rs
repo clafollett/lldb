@@ -87,11 +87,25 @@
 //! without it as `UNAUTHENTICATED`, constant-time compared.
 //!
 //! Be precise about what that is and is not. It proves *"you are part of this deployment"*. It does
-//! **not** prove "you are user X", and a worker therefore still cannot enforce per-request RBAC —
-//! it never sees the user, only a plan. Per-request identity at the worker boundary (a signed,
-//! short-lived assertion travelling with the plan, checked against the same grants) is the
-//! follow-on this issue asks to be noted rather than forgotten. Until it lands, worker ports stay
-//! on a private network and the fleet token is a second lock, not the only one.
+//! **not** prove "you are user X" — and on its own it made every plan self-authorizing: anything
+//! that could present it could have an arbitrary physical plan executed, reading whatever the
+//! worker's storage credentials could reach.
+//!
+//! [`crate::plan_assertion`] is the per-request half, and it is a **second** credential on the same
+//! call rather than a replacement for this one. The coordinator, having authenticated a request and
+//! authorized its logical plan, mints a short-lived assertion naming the account, the user and the
+//! object-store locations that plan may read, signs it with a key derived from this same fleet
+//! secret, and sends it in its own metadata header; a worker verifies it and then checks that the
+//! plan's own file scans fall inside those locations. So the two claims are now: *which deployment*
+//! is calling (this module) and *which request* this is and what it authorizes (that one).
+//!
+//! Two limits are worth stating here rather than only there, because they are limits of the fleet
+//! secret and not of the assertion. The key is **derived from this secret and is therefore
+//! symmetric**: a worker can mint as well as verify, so an assertion proves "someone in this fleet
+//! authorized this plan", not "the coordinator did" — a compromised worker can still forge one, and
+//! only asymmetric keys would change that. And **rotation still means a restart**, for the same
+//! reason it always did: this value is read once per process from the environment. Worker ports
+//! still belong on a private network.
 //!
 //! Unset, a worker accepts everything and logs a loud startup warning naming the variable — because
 //! `cargo run -p lldb-qe-worker` and the compose demo must keep working with no configuration,
@@ -990,7 +1004,9 @@ impl FleetAuth {
     pub fn log_posture(&self) {
         match self {
             FleetAuth::Required(_) => tracing::info!(
-                "worker Flight port requires the shared fleet secret ({FLEET_TOKEN_ENV})"
+                "worker Flight port requires the shared fleet secret ({FLEET_TOKEN_ENV}), and \
+                 every request must also carry a plan assertion signed with the key derived from \
+                 it: a plan is executed only within the locations its assertion covers"
             ),
             FleetAuth::Open => tracing::warn!(
                 "worker Flight port is UNAUTHENTICATED: any process that can reach it may have an \

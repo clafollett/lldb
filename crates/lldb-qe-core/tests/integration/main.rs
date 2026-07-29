@@ -52,6 +52,11 @@
 //!   (`serve_worker_with_auth`, `fetch_stream_with_auth`) precisely because `std::env::set_var` is
 //!   `unsafe` in edition 2024 and would race the rest of the binary. **A test that sets or removes
 //!   an environment variable would break that reasoning and does not belong in this binary.**
+//!   `worker_plan_assertion` (issue #34) is the second thing to live under that constraint and the
+//!   place it bites hardest: a worker dialling another worker presents the *process's* ambient fleet
+//!   token, so two fully-closed workers here could never authenticate to each other. It uses
+//!   `serve_worker_with_postures` — documented in `flight.rs` as exactly this seam — rather than
+//!   reaching for `set_var`.
 //! - `stage_reassignment::show_retry_logs` installs a `tracing` subscriber with `try_init`, which
 //!   was already idempotent across the several `#[tokio::test]`s in that file. Merged, the winner
 //!   sets the filter for the whole binary's log output. No test asserts on log output, so this
@@ -128,4 +133,5 @@ mod tenant_catalogs;
 mod tpch_baseline;
 mod warehouse_lifecycle;
 mod warehouse_routing;
+mod worker_plan_assertion;
 mod worker_to_worker;

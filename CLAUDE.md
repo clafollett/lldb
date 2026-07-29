@@ -56,7 +56,8 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   hands a slot back (`cancel.rs`), query history
   (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
   (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
-  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — the transport those
+  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — the signed, short-lived
+  assertion that carries that check's answer to a worker (`plan_assertion.rs`), the transport those
   credentials travel over (`tls.rs`), and the per-account
   catalog/warehouse partitioning auth and rbac rest on (`tenancy.rs`)
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
@@ -217,10 +218,55 @@ tenant data. Four rules follow:
    guess, so a KDF buys no security and costs a dependency plus per-request CPU. Constant-time
    compare, prefix lookup, and the token is stored nowhere — printed once, at creation.
 
-Two boundaries, two claims. The **coordinator** proves "you are user X of tenant Y". A **worker**
-only proves membership of the deployment: `LLDB_FLEET_TOKEN`, constant-time compared, required if
-set and open-with-a-loud-warning if not. Per-request identity at the worker boundary is a follow-on,
-not something this already does.
+Two boundaries, two claims — and the worker's boundary now makes two of its own (see the next
+section). The **coordinator** proves "you are user X of tenant Y". A **worker** proves membership of
+the deployment (`LLDB_FLEET_TOKEN`, constant-time compared, required if set and
+open-with-a-loud-warning if not) *and* checks a per-request assertion of what the coordinator
+authorized that particular plan to read.
+
+## The worker boundary carries the request's identity, not just the fleet's
+
+`plan_assertion.rs` closes the hole `#28` made concrete: a resolved plan names warehouse data files
+by absolute URI, so a worker executing one is reading data at rest, and `FleetAuth` alone made every
+plan **self-authorizing** — anything holding the fleet secret could have any plan executed. The
+coordinator now mints a short-lived, HMAC'd assertion naming the account, the user, the objects the
+grant check passed and the object-store **locations** the plan may read; a worker verifies it and
+refuses a plan whose file scans fall outside them. Six things to keep straight.
+
+1. **It travels BESIDE the plan, in gRPC metadata (`lldb-plan-assertion`), never inside it.** That is
+   arithmetic, not hygiene: `stage_id_of` is a content hash of the plan bytes and it *is* the
+   `StageCache` key, so a per-request value inside them would make every request a cache miss and
+   silently destroy the materialize-once shuffle. `AUTHORIZATION_HEADER` still carries the fleet
+   token on the same call; both are present and both are checked.
+2. **A worker forwards it through the `TaskContext`.** A `FlightReaderExec` deserialized on worker A
+   dials worker B, and the plan cannot carry the assertion (1) while a `tokio::task_local!` cannot
+   either — `collect_partitioned` drives partitions in a `JoinSet::spawn`. The `TaskContext` is the
+   one per-request channel every operator gets by construction. This is why the fleet token's
+   ambience is *right* and the assertion's would be wrong: one is per process, the other per request.
+3. **The covering check is the point.** A worker that verified a MAC and ignored the plan would have
+   built a second fleet token. Coverage is by **directory** (each read file's parent), because exact
+   file lists do not fit in a gRPC header — so a sibling file of the same table is covered, and that
+   is stated rather than hidden. What is *not* checkable is everything a physical plan lost:
+   `SELECT on table lldb.sales.orders` and the user name ride along for audit, and a worker has no
+   catalog to check them against.
+4. **The gate is the fleet secret, exactly like TLS's plaintext rule.** No `LLDB_FLEET_TOKEN` → no
+   key → nothing minted and nothing checked, so `cargo run` and every single-node path are untouched.
+   `PlanAuth` is *derived* from `FleetAuth` so the two postures cannot be configured apart
+   (`new_with_postures` can express it, is documented as a test seam, and exists only because two
+   closed workers in one test process cannot authenticate to each other).
+5. **The key is symmetric, so do not overclaim.** It is HMAC-SHA256 keyed from the fleet secret: a
+   worker can mint as well as verify, so an assertion proves *"someone in this fleet authorized
+   this"*, not *"the coordinator did"*. A compromised worker can still forge one. That is a large
+   improvement on a plan needing no authorization at all, and it is not the end state; asymmetric
+   keys are, and the payload's version byte is where a key id would go.
+6. **Rotation needs a restart, and that is a limitation, not a feature.** One accepted key, derived
+   from a secret read once per process, so rotating it means rotating `LLDB_FLEET_TOKEN` and
+   restarting the fleet — with a window during a rolling restart where the halves disagree. Hitless
+   rotation needs a *set* of accepted keys; it is deliberately not invented here.
+
+Expiry is `DEFAULT_TTL` = 15 minutes with a minute of clock skew, which bounds replay and also
+bounds a query: nothing re-mints mid-query, so a query still pulling stages after that fails at the
+worker.
 
 ## TLS on both boundaries, and a plaintext port you have to ask for
 
@@ -244,7 +290,9 @@ to keep straight.
 3. **`LLDB_FLEET_TOKEN` is untouched, and TLS does not make it redundant.** This is *server*
    authentication: a client verifies the server, never the reverse. Which fleet member is calling is
    still the shared secret's claim alone, and mTLS at the worker boundary is a separate decision
-   (#34). Say so rather than letting "we have TLS now" imply more than it does.
+   (#32, still open). Say so rather than letting "we have TLS now" imply more than it does. What a
+   request *is* — the per-request half — is `plan_assertion.rs`'s job, not TLS's; the two are
+   complementary and the next section covers it.
 4. **The scheme is the switch, and there is no fallback.** `https://` dials TLS, `http://` does not,
    and a TLS server refuses a plaintext client rather than obliging it — so turning certificates on
    means changing the `--workers` URLs too, and a half-converted fleet fails loudly. Note the trap
@@ -295,9 +343,11 @@ untenanted()` → the catalog names and warehouse paths the manifest literally d
 still needs no Postgres.
 
 Be honest about what this buys: **layout, not access.** Since #28 a resolved plan names data files
-by absolute path and a worker reads them with its own credentials, so any worker that can read
-tenant A's plan can read tenant B's files if handed a plan naming them. Per-request identity at the
-worker boundary is the other half and is its own issue. Listing tables are also outside the boundary
+by absolute path and a worker reads them with its own credentials. `plan_assertion.rs` is the other
+half and it landed (#34): a worker now refuses a plan whose files fall outside the locations the
+coordinator's assertion covers, so handing a worker tenant B's plan no longer gets tenant B's files
+read under tenant A's request — *given* the fleet has a secret to key that assertion from, and given
+whoever forges one does not already hold that secret (it is symmetric). Listing tables are also outside the boundary
 entirely — they have no catalog row and no warehouse — so a multi-tenant manifest should declare
 `format = "iceberg"`.
 
@@ -630,6 +680,16 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # `tls.rs` — it is a pure function of flags and needs no socket.
 cargo test -p lldb-qe-core --test integration flight_tls
 cargo test -p lldb-qe-core tls::tests
+
+# Per-request identity at the worker boundary (`plan_assertion.rs`). Needs NO database: the fleet
+# secret and the assertion are both passed explicitly, because `LLDB_FLEET_TOKEN` is read once per
+# process and `set_var` is `unsafe`. Four properties — a plan with no assertion (or one covering
+# another table) is REFUSED; stage caching still HITS across requests carrying different assertions
+# (the trap: an assertion inside the plan bytes would change the content-addressed stage id and make
+# every request a miss); a worker forwards the assertion to the worker it pulls from; and a
+# reassigned stage carries it to whichever worker serves it.
+cargo test -p lldb-qe-core --test integration worker_plan_assertion
+cargo test -p lldb-qe-core plan_assertion::tests
 # Serve TLS. Certificates are files the deployment mounts; the engine issues none.
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --tls-cert /certs/server.crt --tls-key /certs/server.key --tls-ca /certs/ca.crt \

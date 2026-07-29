@@ -96,6 +96,13 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 # rand is pinned to 0.9 deliberately: 0.8 and 0.10 are both in the tree transitively, and picking
 # the one datafusion/iceberg already resolve to is what keeps the duplicate count unchanged.
 sha2 = "0.10"      # hash an API token (NOT a KDF — see crates/lldb-qe-core/src/auth.rs)
+# HMAC-SHA256 over the same `digest` traits sha2 already implements, so it adds no second hash
+# implementation and no second `digest` — verified with `cargo tree -d` (48 duplicated crates
+# before and after). It signs the per-request plan assertion the worker boundary checks; see
+# crates/lldb-qe-core/src/plan_assertion.rs for why that is a MAC keyed by the fleet secret and
+# not a signature. Hand-rolling HMAC over sha2 was the alternative: 20 lines, no dependency, and
+# no reason to prefer a fresh implementation of a specified construction over the audited one.
+hmac = "0.12"
 subtle = "2.6"     # constant-time comparison of digests and of the fleet secret
 hex = "0.4"        # render the digest for storage
 rand = "0.9"       # 32 bytes of CSPRNG per token

@@ -94,6 +94,7 @@ use crate::flight::fetch_with_failover;
 use crate::iceberg_scan::resolve_iceberg_scans;
 use crate::lakehouse::Lakehouse;
 use crate::manifest::Manifest;
+use crate::plan_assertion::{PlanAuth, QueryIdentity};
 use crate::rbac::QueryAuthorization;
 use crate::remote::FlightReaderExec;
 use crate::result_cache::{ResultCache, execute_cached};
@@ -422,6 +423,25 @@ pub async fn execute_query_cached(
         authorization,
         sql,
         |logical| async {
+            // What the coordinator will tell a worker about this request. The objects are the same
+            // requirements [`crate::rbac`] just checked, recomputed from the same logical plan by
+            // the same pure function — carried for audit, since a worker cannot map a file path back
+            // to a table name (see [`crate::plan_assertion`]). A statement whose privileges this
+            // build cannot name has already been refused upstream when authorization is in force;
+            // with no services database it reaches here and simply names nothing.
+            let catalog = ctx.copied_config().options().catalog.clone();
+            let identity = QueryIdentity {
+                account_id,
+                user: authorization.map(|a| a.user_name.clone()),
+                objects: crate::rbac::required_privileges(
+                    &logical,
+                    &catalog.default_catalog,
+                    &catalog.default_schema,
+                )
+                .map(|reqs| reqs.iter().map(|r| r.to_string()).collect())
+                .unwrap_or_default(),
+            };
+
             // `INSERT` is a write, and it must not leave this process. It arrives here rather than
             // through [`crate::dml`] because appends go through DataFusion
             // (`IcebergTableProvider` implements `insert_into`), so it is an ordinary logical plan
@@ -451,7 +471,7 @@ pub async fn execute_query_cached(
                 .create_physical_plan()
                 .await
                 .context("building the physical plan")?;
-            run_on_fleet(ctx, plan, fleet).await
+            run_on_fleet(ctx, plan, fleet, &identity).await
         },
     )
     .await
@@ -463,6 +483,7 @@ async fn run_on_fleet(
     ctx: &SessionContext,
     plan: Arc<dyn ExecutionPlan>,
     fleet: &[String],
+    identity: &QueryIdentity,
 ) -> Result<Vec<RecordBatch>> {
     // Before anything is staged, sliced or serialized: every `IcebergTableScan` becomes a plain
     // parquet scan over the data files of the snapshot it was planned against. See
@@ -473,12 +494,28 @@ async fn run_on_fleet(
         .await
         .context("resolving iceberg scans to the data files of their snapshot")?;
 
+    // Minted from the plan *after* the Iceberg rewrite and *before* staging, which is the one moment
+    // both halves are true: every location this query will read is now named in the plan (the
+    // rewrite is what turns a catalog handle into file URIs), and nothing has been cut into stages
+    // yet — so one assertion covers every stage, however the fleet is fanned. Staging only wraps and
+    // slices those scans; it never introduces a location the assertion has not seen. See
+    // [`crate::plan_assertion`].
+    //
+    // `None` for a fleet with no `LLDB_FLEET_TOKEN`: no secret, no key, nothing to mint — and the
+    // workers of such a fleet check nothing either, so the no-configuration path is unchanged.
+    let assertion = PlanAuth::from_fleet_auth(crate::flight::ambient_fleet_auth())
+        .mint(identity, &plan, std::time::SystemTime::now())
+        .context("minting this query's plan assertion for the worker boundary")?;
+
     let coordinated = plan_distributed(Arc::clone(&plan), fleet)?;
 
     if contains_flight_reader(&coordinated) {
         // Genuinely distributed: the coordinator runs the reduce side locally and its
-        // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight.
-        collect(coordinated, ctx.task_ctx())
+        // FlightReaderExec leaves pull each map/reduce stage from a worker over Flight. The
+        // assertion rides on the `TaskContext` those leaves execute under — not in the plan bytes,
+        // which are content-hashed into a stage id.
+        let task_ctx = crate::plan_assertion::task_ctx_with(&ctx.task_ctx(), assertion);
+        collect(coordinated, task_ctx)
             .await
             .context("running the distributed query across the fleet")
     } else {
@@ -495,7 +532,7 @@ async fn run_on_fleet(
             fleet_size = fleet.len(),
             "no distribution boundary; offloading the whole plan to one worker (failing over across the fleet if it is lost)"
         );
-        fetch_with_failover(fleet, 0, plan)
+        fetch_with_failover(fleet, 0, plan, assertion.as_ref())
             .await
             .context("running the query on a single worker")
     }

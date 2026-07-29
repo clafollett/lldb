@@ -79,6 +79,16 @@ pub struct MaterializedStage {
     pub schema: SchemaRef,
     /// `partitions[i]` is the complete set of batches for output partition `i`.
     pub partitions: Vec<Vec<RecordBatch>>,
+    /// The object-store locations this stage's plan names
+    /// ([`plan_reads`](crate::plan_assertion::plan_reads)), recorded when it was materialized.
+    ///
+    /// Here rather than recomputed per request because of what a cache *hit* is: the plan bytes are
+    /// content-addressed, so a hit means byte-identical bytes and therefore an identical read set —
+    /// but the requester still has to be authorized for it ([`crate::plan_assertion`]), and the only
+    /// way to check that without deserializing the plan again on every pull is to keep what the one
+    /// deserialization found. A stage materialized before this existed, or by a fleet with no
+    /// secret, simply carries an empty set and is covered trivially.
+    pub reads: Vec<String>,
 }
 
 impl MaterializedStage {
@@ -296,6 +306,7 @@ mod tests {
         Arc::new(MaterializedStage {
             schema: schema(),
             partitions: vec![vec![batch(vec![1, 2])], vec![batch(vec![3, 4, 5])]],
+            reads: Vec::new(),
         })
     }
 
