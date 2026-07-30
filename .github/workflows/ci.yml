@@ -1,29 +1,22 @@
 name: CI
 
-# A markdown-only change runs no code, so it should not spend ~25 minutes in the cross-container
-# cluster job. Nothing in this repo takes a `.md` file as a build or test input — the manifests the
-# tests read are TOML, and `build.rs` reads only the git sha — so ignoring them costs no coverage.
+# There is deliberately NO `paths-ignore` here, and that is the whole design.
 #
-# `paths-ignore` skips the WORKFLOW, which is only safe while `main` has no required status checks:
-# a workflow that never runs never reports, so a required check would sit "Expected — Waiting for
-# status" forever and the PR would be unmergeable. `main` is unprotected today. **If you turn on
-# branch protection with required checks, this block has to change** — move the filtering into the
-# jobs (a `changes` job plus `if:` on each one), because a job skipped via `if:` still reports and
-# satisfies the requirement, whereas an absent workflow does not.
+# A markdown-only change runs no code and should not spend ~25 minutes in the cross-container
+# cluster job — but `paths-ignore` buys that by skipping the WORKFLOW, and a workflow that never
+# runs never reports a status. Under a ruleset with required status checks that is a trap: the PR
+# sits on "Expected — Waiting for status" for a check that is never coming, and only an admin
+# override can merge it. `main` is a protected default branch here, so the filtering lives in the
+# jobs instead: the `changes` job below always runs, and each real job carries an `if:`. A job
+# skipped by `if:` still produces a check run (conclusion `skipped`) rather than no check at all,
+# which is what keeps a required check satisfiable.
 #
-# Deliberately NOT ignored: `.github/**` (a CI change must run CI) and every non-markdown file.
-#
-# The list is written out twice rather than shared through a YAML anchor: GitHub Actions does not
-# support anchors or aliases in workflow files, so `&docs-only` / `*docs-only` parses locally and
-# then fails on the runner. Keep the two lists identical by hand.
+# If a required check ever does sit pending on a docs-only PR, the fallback is to make the job
+# always run and no-op internally rather than to reintroduce `paths-ignore`.
 on:
   push:
     branches: [main]
-    paths-ignore:
-      - '**/*.md'
   pull_request:
-    paths-ignore:
-      - '**/*.md'
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -33,10 +26,81 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # What moved in this push/PR, as two booleans the real jobs gate on.
+  #
+  # Computed with plain `git diff` rather than a third-party path-filter action, for the reason
+  # every dependency in this repo is argued for: one more action is one more thing to pin, audit
+  # and keep current, and this is fifteen lines of shell.
+  #
+  # **It fails OPEN.** Anything it cannot work out — a base ref it cannot resolve, a force-push
+  # whose `before` sha is gone, an empty diff — sets both outputs true and runs the whole suite.
+  # A filter that guesses wrong in the direction of "skip" hides a broken build; guessing wrong
+  # toward "run" only costs runner minutes.
+  changes:
+    name: what changed
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      infra: ${{ steps.filter.outputs.infra }}
+    steps:
+      # Full history: the diff needs the merge base, which a shallow clone does not have.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: filter
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          files=""
+          if [ "$EVENT" = "pull_request" ]; then
+            if git rev-parse --verify -q "origin/$BASE_REF" >/dev/null; then
+              files=$(git diff --name-only "origin/$BASE_REF...HEAD" || true)
+            fi
+          elif [ -n "${BEFORE:-}" ] \
+            && [ "$BEFORE" != "0000000000000000000000000000000000000000" ] \
+            && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            files=$(git diff --name-only "$BEFORE" "$SHA" || true)
+          fi
+
+          if [ -z "$files" ]; then
+            echo "could not determine the changed files — running everything"
+            printf 'rust=true\ninfra=true\n' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "changed files:"; printf '%s\n' "$files" | sed 's/^/  /'
+
+          rust=false
+          infra=false
+          while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            case "$f" in
+              # Markdown is an input to nothing here: the manifests the tests read are TOML and
+              # build.rs reads only the git sha. Listed first so a .md under .github/ is still docs.
+              *.md)       ;;
+              # A change to CI itself must exercise every job it governs.
+              .github/*)  rust=true; infra=true ;;
+              # The CDK app is TypeScript and does not depend on the Rust build.
+              infra/*)    infra=true ;;
+              *)          rust=true ;;
+            esac
+          done <<< "$files"
+
+          echo "rust=$rust infra=$infra"
+          printf 'rust=%s\ninfra=%s\n' "$rust" "$infra" >> "$GITHUB_OUTPUT"
+
   # Fast path: format, lint, and the in-process test suite. Integration tests that need SF1
   # data or Docker skip themselves, so this stays green without either.
   check:
     name: fmt • clippy • test
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     # The services-database test (crates/lldb-qe-core/tests/integration/services_db.rs) proves claims only a real server can
@@ -95,6 +159,8 @@ jobs:
   # then reuses that prebuilt image (LLDB_IMAGE) instead of building again.
   docker-cluster:
     name: cross-container cluster
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -135,6 +201,8 @@ jobs:
   # assertion tests, and synthesize valid CloudFormation.
   infra:
     name: cdk synth • test
+    needs: changes
+    if: needs.changes.outputs.infra == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
