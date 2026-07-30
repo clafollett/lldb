@@ -6,26 +6,52 @@ Thanks for your interest in lldb, a distributed analytical query engine written 
 
 lldb is licensed under the [Apache License, Version 2.0](LICENSE). Contributions are accepted under the same license. By submitting a contribution, you agree that your work is licensed under Apache-2.0 and that you have the right to submit it.
 
-## Workflow: Trunk-Based Development
+## Workflow: Branch and Pull Request
 
-We practice trunk-based development. `main` is always releasable.
+Every change lands through a pull request. `main` is always releasable, and **nothing is pushed
+straight to it** — not by contributors, not by maintainers.
 
-- **Maintainers** commit directly to `main` or use short-lived branches that merge back quickly.
-- **Everyone else** is welcome to open a pull request from a short-lived branch. Keep changes small and focused so they're easy to review and merge.
-- Rebase on the latest `main` before opening or updating a PR. Avoid long-running branches — they drift and rot.
+```
+feature branch → pull request → review → green CI → squash-merge to main
+```
+
+- Branch from the latest `main`. Maintainer branches are named `claude/issue-<n>-<slug>`; anything
+  descriptive is fine for an outside contribution.
+- Open a pull request and let CI finish. Every PR gets reviewed — Copilot code review at minimum.
+- Keep changes small and focused, and rebase on `main` before opening or updating a PR. Avoid
+  long-running branches; they drift and rot.
+- Squash-merge, so `main` keeps one commit per change.
 
 ## Building and Testing
 
 New checkout? Run `./scripts/bootstrap.sh` first — it installs the TPC-H data generator and generates the benchmark data the test suite needs.
 
+Run `cargo fmt --all` to *fix* formatting as you work. Before you push, run the three gates — these
+are verbatim what CI runs, and all three must pass:
+
 ```sh
-cargo build                                      # build
-cargo test                                       # run the test suite
-cargo fmt --all                                  # format (run before committing)
-cargo clippy --all-targets --all-features        # lint (keep it warning-clean)
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-Please make sure `cargo fmt --all`, `cargo clippy --all-targets --all-features`, and `cargo test` all pass before you push.
+Two things that surprise people:
+
+- **A green `cargo test` does not mean everything ran.** Suites that need a service — a Postgres
+  services database, Docker — skip *silently* without it. The tell is timing: the `integration`
+  binary takes ~20 s with a database and under 2 s without. The prerequisites for each gated suite
+  are listed in `.claude/skills/lldb-commands/SKILL.md`.
+- **Do not override the build profile on the command line.** `[profile.dev]` in the root
+  `Cargo.toml` already sets `debug = 0` and `incremental = false`; passing `CARGO_PROFILE_DEV_DEBUG`
+  or `CARGO_INCREMENTAL` yourself invalidates the whole target directory and forces a full rebuild.
+  See [`docs/build-performance.md`](docs/build-performance.md).
+
+## Dependencies
+
+`datafusion`, `arrow`, `object_store`, `iceberg` and `sqlx` are pinned and move **together**, never
+independently — the Arrow Flight plan-serialization boundary requires one version of each tree-wide.
+Before adding any dependency, check `cargo tree -d` and confirm it introduces no second copy of any
+of them. The rationale is in the root [`Cargo.toml`](Cargo.toml) and `CLAUDE.md`.
 
 ## Commit Messages
 
