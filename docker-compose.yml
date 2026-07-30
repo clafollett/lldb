@@ -129,7 +129,10 @@ x-metadata-env: &metadata-env
 # on startup.
 #
 # Note what it is and is not: it proves "you are part of this deployment", not "you are user X".
-# Per-request identity at the worker boundary is a follow-on — see crates/lldb-qe-core/src/auth.rs.
+# Setting it also turns on the *per-request* half (crates/lldb-qe-core/src/plan_assertion.rs): the
+# key that signs a query's plan assertion is derived from this value, so every service that talks
+# Flight needs the same one — which is why it is one anchor applied to all of them, coordinator
+# included, rather than a worker-only setting. Unset it and neither check happens, on either side.
 x-fleet-env: &fleet-env
   LLDB_FLEET_TOKEN: ${LLDB_FLEET_TOKEN:-compose-demo-fleet-secret}
 

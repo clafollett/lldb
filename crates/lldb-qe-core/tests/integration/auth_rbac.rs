@@ -827,10 +827,14 @@ async fn isolation_body(harness: &Harness) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// A worker's Flight port with a fleet secret on it refuses a caller that does not present it, and
-/// serves the identical plan to one that does.
+/// serves the identical plan to one that does — **and to one that also carries a plan assertion**,
+/// because a closed worker requires both.
 ///
 /// Needs no database — the fleet secret is a deployment-level credential, not a per-user one, which
-/// is exactly the limitation [`lldb_qe_core::auth::FleetAuth`] documents.
+/// is exactly the limitation [`lldb_qe_core::auth::FleetAuth`] documents. What closes the other half
+/// of it is `lldb_qe_core::plan_assertion`, and `worker_plan_assertion` is where that is tested;
+/// what this file keeps is the *fleet membership* half, so the assertion here is minted and passed
+/// simply because the door now has two locks.
 ///
 /// The credential is passed explicitly rather than through `LLDB_FLEET_TOKEN`, because `set_var` is
 /// `unsafe` in edition 2024 and would race every other test in this process.
@@ -863,6 +867,16 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
         .create_physical_plan()
         .await?;
     let plan_bytes = flight::serialize_plan(Arc::clone(&plan))?;
+    // A closed worker checks two credentials, so a caller that means to get past the first one has
+    // to carry the second. `SELECT 1` reads no storage, so the assertion covers nothing and is
+    // satisfied trivially — which keeps this test about the fleet secret, as it was.
+    let assertion = lldb_qe_core::plan_assertion::PlanAuth::from_fleet_auth(&secret)
+        .mint(
+            &lldb_qe_core::plan_assertion::QueryIdentity::default(),
+            &plan,
+            std::time::SystemTime::now(),
+        )?
+        .expect("a fleet with a secret mints one");
 
     // ---- No credential: refused ------------------------------------------------------------------
     // `fetch` uses this process's ambient credential, which is unset, so this is exactly the shape
@@ -881,11 +895,12 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
     );
 
     // ---- The wrong credential: refused ------------------------------------------------------------
-    let error = flight::fetch_stream_with_auth(
+    let error = flight::fetch_stream_with(
         url.clone(),
         0,
         plan_bytes.clone(),
         &FleetAuth::Required("not-the-secret".to_string()),
+        Some(&assertion),
     )
     .await
     .err()
@@ -900,7 +915,7 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
     // ---- The right credential: served -------------------------------------------------------------
     use futures::TryStreamExt;
     let batches: Vec<RecordBatch> =
-        flight::fetch_stream_with_auth(url.clone(), 0, plan_bytes, &secret)
+        flight::fetch_stream_with(url.clone(), 0, plan_bytes, &secret, Some(&assertion))
             .await?
             .try_collect()
             .await?;

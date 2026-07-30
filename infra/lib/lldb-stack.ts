@@ -405,6 +405,13 @@ export class LldbStack extends cdk.Stack {
     // definitions, and that is a change worth reviewing on its own rather than riding along. Until
     // then the mitigation is the security group (workers are not internet-facing) and the loud
     // warning every worker logs at startup. See crates/lldb-qe-core/src/auth.rs::FleetAuth.
+    //
+    // That gap now covers two checks rather than one. Issue #34 keys the per-request plan assertion
+    // (crates/lldb-qe-core/src/plan_assertion.rs) off the same secret, so a fleet without it also
+    // has no key, mints nothing and verifies nothing: a worker here still executes any plan it is
+    // handed, with this task role's S3 credentials, and nothing binds a plan to the account and
+    // locations a coordinator authorized. One secret injected into both task definitions closes
+    // both — which is the same piece of work, not a second one.
     for (const definition of warehouses) {
       const id = `Warehouse${pascalCase(definition.name)}`;
       const task = new ecs.FargateTaskDefinition(this, `${id}Task`, { cpu, memoryLimitMiB });

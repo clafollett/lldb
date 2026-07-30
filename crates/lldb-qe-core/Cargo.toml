@@ -32,6 +32,7 @@ clap.workspace = true
 sqlx.workspace = true
 chrono.workspace = true
 sha2.workspace = true
+hmac.workspace = true
 subtle.workspace = true
 hex.workspace = true
 rand.workspace = true

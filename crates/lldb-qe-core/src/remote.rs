@@ -245,11 +245,21 @@ impl ExecutionPlan for FlightReaderExec {
     /// resume is possible but needs per-batch sequencing (a producer-side cursor so a reassigned pull
     /// can say "resume after batch *k*"); that is a follow-up, not built here.
     ///
+    /// # Where the per-request authorization comes from
+    ///
+    /// `context`, and nowhere else. This leaf is *serialized into a plan*, so nothing per-call can
+    /// travel with it — the same fact that makes the fleet token and the TLS trust ambient. But a
+    /// plan assertion is per **request**, not per process, so ambience is exactly wrong for it: a
+    /// worker executing this leaf is forwarding *its caller's* authorization to the next worker.
+    /// [`TaskContext`] is the one channel that is per-request and reaches every operator by
+    /// construction, which is why [`crate::plan_assertion::task_ctx_with`] puts it there and this
+    /// reads it back. `None` means an open fleet, which presents nothing and is checked for nothing.
+    ///
     /// [`StageCache`]: crate::stage_cache::StageCache
     fn execute(
         &self,
         partition: usize,
-        _context: Arc<TaskContext>,
+        context: Arc<TaskContext>,
     ) -> DFResult<SendableRecordBatchStream> {
         if partition != 0 {
             return Err(DataFusionError::Internal(format!(
@@ -263,6 +273,9 @@ impl ExecutionPlan for FlightReaderExec {
         let candidates = self.candidates();
         let remote_partition = self.remote_partition;
         let schema = self.schema();
+        // Read here rather than inside the stream: `execute` runs in the frame that owns the
+        // request, while the stream is polled wherever the runtime happens to drive it.
+        let assertion = crate::plan_assertion::forwarded(&context);
 
         // Connecting is async but `execute` is not, so defer the whole round-trip into the
         // stream: nothing touches the network until the consumer polls.
@@ -272,6 +285,7 @@ impl ExecutionPlan for FlightReaderExec {
                 remote_partition,
                 plan_bytes,
                 &RetryPolicy::default(),
+                assertion.as_ref(),
             )
             .await
             // `anyhow::Error` is not itself a `std::error::Error`, but it converts into a

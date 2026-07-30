@@ -54,8 +54,20 @@
 //! be absent exactly where worker-to-worker pulls need it. A process-wide deployment secret read
 //! from the process's own environment is what it actually is.
 //!
-//! What this proves is "you are part of this deployment", *not* "you are user X" — see
-//! [`crate::auth`] for the scope of that claim and for what per-request worker identity would take.
+//! What that secret proves is "you are part of this deployment", *not* "you are user X". The
+//! per-request half is [`crate::plan_assertion`], and it is a **second** credential on the same
+//! call: a short-lived, MAC'd statement naming the account, the user and the object-store locations
+//! the coordinator authorized, which a worker verifies and then checks the plan against. Both
+//! headers are required and both are checked — the fleet secret says which *deployment* is calling,
+//! the assertion says which *request* this is and what it may read.
+//!
+//! It travels in the metadata beside the fleet token and **never inside the ticket**, which is not
+//! hygiene but arithmetic: [`stage_id_of`] hashes the plan bytes, so a per-request value inside them
+//! would give every request a distinct stage id and turn every pull into a cache miss. That is the
+//! materialize-once property this module exists for, so the assertion is carried, forwarded and
+//! checked entirely outside the bytes the stage id is computed from. A worker that pulls from
+//! another worker forwards it through the [`TaskContext`](datafusion::execution::TaskContext) it
+//! executes under; see [`crate::plan_assertion`] for why that, and not a task-local, is the channel.
 //!
 //! # …and over what
 //!
@@ -102,6 +114,9 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, FleetAuth, bearer_header, bearer_token};
+use crate::plan_assertion::{
+    AssertionError, PLAN_ASSERTION_HEADER, PlanAuth, SignedAssertion, VerifiedAssertion,
+};
 use crate::retry::{Retriability, RetryPolicy, classify};
 use crate::stage_cache::{MaterializedStage, StageCache, stage_id_of};
 use crate::tls::ServerTls;
@@ -132,6 +147,36 @@ fn fleet_status(error: AuthError) -> Status {
          {} value.",
         crate::auth::FLEET_TOKEN_ENV
     ))
+}
+
+/// Map a plan-assertion refusal onto its gRPC status.
+///
+/// Two codes, and the split is the same one [`crate::server`] makes between "get a credential" and
+/// "get a grant": a missing, malformed, wrongly-signed or expired assertion is `UNAUTHENTICATED`,
+/// while an assertion that verifies and simply does not *cover* what the plan reads is
+/// `PERMISSION_DENIED`. Both are [`Retriability::Fatal`] (see [`crate::retry`]), which is what stops
+/// a refusal walking the whole fleet: an identical fleet would refuse identically.
+fn assertion_status(error: AssertionError) -> Status {
+    match error {
+        AssertionError::NotCovered { .. } | AssertionError::Traversal(_) => {
+            Status::permission_denied(error.to_string())
+        }
+        _ => Status::unauthenticated(error.to_string()),
+    }
+}
+
+/// Map a failed materialization onto a status, keeping an authorization refusal legible.
+///
+/// The covering check runs *inside* the once-closure (it has to: that is the last point before the
+/// files are opened), and that closure hands back an [`anyhow::Error`]. Reporting a refusal as
+/// `INTERNAL` would tell the operator the worker broke, and — worse — `INTERNAL` and
+/// `PERMISSION_DENIED` are both fatal but only one of them names the fix. So the refusal is
+/// recovered from the error rather than flattened into a string.
+fn materialize_status(stage_id: u64, error: anyhow::Error) -> Status {
+    match error.downcast::<AssertionError>() {
+        Ok(refusal) => assertion_status(refusal),
+        Err(other) => Status::internal(format!("materialize stage {stage_id}: {other}")),
+    }
 }
 
 /// Number of fixed header bytes in a ticket: `stage_id` (u64) + `partition` (u32).
@@ -202,6 +247,10 @@ pub struct WorkerFlightService {
     /// What this worker requires of whoever connects. [`FleetAuth::Open`] is the no-configuration
     /// default and is warned about at startup; see [`crate::auth`].
     auth: FleetAuth,
+    /// What this worker requires of each individual *request*: a plan assertion signed with a key
+    /// derived from the same fleet secret. Derived from `auth` rather than configured separately,
+    /// so the two postures cannot disagree — see [`crate::plan_assertion`].
+    plan_auth: PlanAuth,
 }
 
 impl WorkerFlightService {
@@ -220,7 +269,34 @@ impl WorkerFlightService {
     /// worker without mutating the process environment — `set_var` is `unsafe` in edition 2024 and
     /// would race every other test sharing the process.
     pub fn new_with_auth(ctx: SessionContext, cache: Arc<StageCache>, auth: FleetAuth) -> Self {
-        Self { ctx, cache, auth }
+        let plan_auth = PlanAuth::from_fleet_auth(&auth);
+        Self::new_with_postures(ctx, cache, auth, plan_auth)
+    }
+
+    /// A worker whose two postures — fleet membership and per-request authorization — are set
+    /// **independently**. A test seam, and the only one of these constructors that can express a
+    /// combination production never produces.
+    ///
+    /// In a real deployment both come from `LLDB_FLEET_TOKEN` through [`Self::new_with_auth`], which
+    /// is what makes "the fleet secret is set, therefore assertions are checked" true by
+    /// construction rather than by configuration. This exists because the thing that makes those two
+    /// agree is also what makes them untestable together in one process: `ambient_fleet_auth` is a
+    /// `OnceLock` over the environment, `set_var` is `unsafe` in edition 2024, and a *worker*
+    /// dialling another worker presents the ambient token — so two closed workers in one test
+    /// process can never authenticate to each other. A worker that checks the assertion and not the
+    /// fleet token is how `worker_plan_assertion` observes the forwarding path in isolation.
+    pub fn new_with_postures(
+        ctx: SessionContext,
+        cache: Arc<StageCache>,
+        auth: FleetAuth,
+        plan_auth: PlanAuth,
+    ) -> Self {
+        Self {
+            ctx,
+            cache,
+            auth,
+            plan_auth,
+        }
     }
 
     /// The stage cache this worker serves from.
@@ -241,6 +317,28 @@ impl WorkerFlightService {
             .and_then(|value| value.to_str().ok())
             .and_then(|value| bearer_token(value).ok());
         self.auth.check(presented).map_err(fleet_status)
+    }
+
+    /// Verify the request's plan assertion — the *per-request* half of the door.
+    ///
+    /// `Ok(None)` only for a worker with no fleet secret, which has no key and therefore nothing to
+    /// verify; that is the same no-configuration path [`FleetAuth::Open`] keeps open. The metadata
+    /// key is read rather than the ticket for the reason this module's header gives: the ticket is
+    /// hashed into the stage id.
+    fn verify_assertion<T>(
+        &self,
+        request: &Request<T>,
+    ) -> Result<Option<VerifiedAssertion>, Status> {
+        if !self.plan_auth.is_required() {
+            return Ok(None);
+        }
+        let presented = request
+            .metadata()
+            .get(PLAN_ASSERTION_HEADER)
+            .and_then(|value| value.to_str().ok());
+        self.plan_auth
+            .verify(presented, std::time::SystemTime::now())
+            .map_err(assertion_status)
     }
 }
 
@@ -274,6 +372,28 @@ pub async fn serve_worker_with_auth(
     auth: FleetAuth,
 ) -> Result<()> {
     serve_worker_with(listener, ctx, cache, auth, ServerTls::plaintext()).await
+}
+
+/// Like [`serve_worker_with_auth`] but setting the per-request posture independently.
+///
+/// The serving half of [`WorkerFlightService::new_with_postures`] — read that for why a seam that
+/// can express an inconsistent pair exists at all, and why production cannot reach it.
+pub async fn serve_worker_with_postures(
+    listener: TcpListener,
+    ctx: SessionContext,
+    cache: Arc<StageCache>,
+    auth: FleetAuth,
+    plan_auth: PlanAuth,
+) -> Result<()> {
+    auth.log_posture();
+    let service = FlightServiceServer::new(WorkerFlightService::new_with_postures(
+        ctx, cache, auth, plan_auth,
+    ));
+    Server::builder()
+        .add_service(service)
+        .serve_with_incoming(TcpListenerStream::new(listener))
+        .await
+        .context("Flight server terminated")
 }
 
 /// Like [`serve_worker_with_auth`] but also choosing what the port is served *over*.
@@ -321,8 +441,10 @@ impl FlightService for WorkerFlightService {
         request: Request<Ticket>,
     ) -> Result<Response<Self::DoGetStream>, Status> {
         // Before the ticket is even decoded: an unauthenticated caller must not be able to make
-        // this process deserialize bytes it chose.
+        // this process deserialize bytes it chose. Two credentials, both required when this worker
+        // is configured with a fleet secret — the deployment's, then this request's.
         self.check_credential(&request)?;
+        let verified = self.verify_assertion(&request)?;
 
         let ticket = request.into_inner();
         let (ticket_stage_id, partition, plan_bytes) = decode_ticket(&ticket.ticket)
@@ -344,19 +466,59 @@ impl FlightService for WorkerFlightService {
         // once-closure, i.e. only on a cache miss.
         let plan_bytes = plan_bytes.to_vec();
         let ctx = self.ctx.clone();
+        // The verified assertion, hung on the `TaskContext` this stage executes under so that every
+        // operator beneath it travels with it — in particular a `FlightReaderExec` leaf, which dials
+        // *another* worker and must present the same assertion there. It is deliberately not in the
+        // plan bytes; see this module's header and [`crate::plan_assertion`].
+        let task_ctx = crate::plan_assertion::task_ctx_with(
+            &ctx.task_ctx(),
+            verified.as_ref().map(|v| v.signed.clone()),
+        );
+        let plan_auth = self.plan_auth.clone();
+        let materializing = verified.clone();
         let materialized = self
             .cache
             .get_or_materialize(stage_id, || async move {
-                let plan = deserialize_plan(&plan_bytes, &ctx)?;
+                let plan = crate::remote::deserialize_plan(&plan_bytes, task_ctx.as_ref())
+                    .context("deserializing physical plan")?;
+                // **Before a single byte is read.** What the plan actually touches must be inside
+                // what the assertion covers, and this is the last moment that is true: one line
+                // further down the files are open. Inside the once-closure so a refusal is not
+                // cached and the next, authorized puller still materializes normally.
+                let reads = crate::plan_assertion::plan_reads(&plan);
+                plan_auth.check_cover(materializing.as_ref(), &reads)?;
                 let schema = plan.schema();
                 // Drive every output partition concurrently — a RepartitionExec fans its single
                 // input read into per-partition channels, so draining them one-at-a-time can
                 // deadlock. See `stage_cache` for the full rationale.
-                let partitions = collect_partitioned(plan, ctx.task_ctx()).await?;
-                Ok(Arc::new(MaterializedStage { schema, partitions }))
+                let partitions = collect_partitioned(plan, task_ctx).await?;
+                Ok(Arc::new(MaterializedStage {
+                    schema,
+                    partitions,
+                    reads,
+                }))
             })
             .await
-            .map_err(|e| Status::internal(format!("materialize stage {stage_id}: {e}")))?;
+            .map_err(|e| materialize_status(stage_id, e))?;
+
+        // The other two ways into this line: a cache **hit**, and a single-flight follower whose
+        // sibling did the materializing. Neither ran the check above, and both are about to be
+        // handed the same rows — so the requester is checked against what the stage recorded it
+        // reads. Without this, a stage materialized for one authorized caller would serve any later
+        // caller whose assertion merely *verified*, which is the second-fleet-token failure this
+        // whole module exists to avoid. It is cheap because the read set was computed once, when the
+        // stage was deserialized.
+        self.plan_auth
+            .check_cover(verified.as_ref(), &materialized.reads)
+            .map_err(assertion_status)?;
+        if let Some(verified) = &verified {
+            tracing::debug!(
+                stage_id,
+                partition,
+                caller = %verified.assertion,
+                "serving a stage under a verified plan assertion"
+            );
+        }
 
         let idx = partition as usize;
         if idx >= materialized.partition_count() {
@@ -458,13 +620,17 @@ impl FlightService for WorkerFlightService {
 
 /// Ship `plan` to the worker at `worker_url` (e.g. `http://127.0.0.1:50051`), execute its
 /// `partition`, and collect the streamed result batches.
+///
+/// Carries no plan assertion, so a worker with a fleet secret refuses it. That is the right default
+/// for the callers it has — tests and tools driving an open, single-node worker; the query path goes
+/// through [`fetch_with_failover`], which takes one.
 pub async fn fetch(
     worker_url: &str,
     partition: u32,
     plan: Arc<dyn ExecutionPlan>,
 ) -> Result<Vec<RecordBatch>> {
     let plan_bytes = serialize_plan(plan)?;
-    fetch_partition(worker_url, partition, plan_bytes).await
+    fetch_partition(worker_url, partition, plan_bytes, None).await
 }
 
 /// Ship `plan` to the first worker in `candidates` that can serve it, failing over to the next on a
@@ -479,14 +645,26 @@ pub async fn fetch(
 ///
 /// Uses the default [`RetryPolicy`]; each candidate is tried at most once, in order.
 ///
+/// `assertion` is the per-request authorization this pull presents — the coordinator's offload path
+/// passes what it minted, and `None` means "this fleet has no secret, so there is nothing to
+/// present". See [`crate::plan_assertion`].
+///
 /// [`FlightReaderExec`]: crate::remote::FlightReaderExec
 pub async fn fetch_with_failover(
     candidates: &[String],
     partition: u32,
     plan: Arc<dyn ExecutionPlan>,
+    assertion: Option<&SignedAssertion>,
 ) -> Result<Vec<RecordBatch>> {
     let plan_bytes = serialize_plan(plan)?;
-    fetch_partition_with_failover(candidates, partition, plan_bytes, &RetryPolicy::default()).await
+    fetch_partition_with_failover(
+        candidates,
+        partition,
+        plan_bytes,
+        &RetryPolicy::default(),
+        assertion,
+    )
+    .await
 }
 
 /// Pull one partition **completely** from one worker.
@@ -497,8 +675,16 @@ async fn fetch_partition(
     worker_url: &str,
     partition: u32,
     plan_bytes: Vec<u8>,
+    assertion: Option<&SignedAssertion>,
 ) -> Result<Vec<RecordBatch>> {
-    let stream = fetch_stream(worker_url.to_string(), partition, plan_bytes).await?;
+    let stream = fetch_stream_with(
+        worker_url.to_string(),
+        partition,
+        plan_bytes,
+        ambient_fleet_auth(),
+        assertion,
+    )
+    .await?;
     stream
         .try_collect::<Vec<_>>()
         .await
@@ -524,6 +710,7 @@ pub async fn fetch_partition_with_failover(
     partition: u32,
     plan_bytes: Vec<u8>,
     policy: &RetryPolicy,
+    assertion: Option<&SignedAssertion>,
 ) -> Result<Vec<RecordBatch>> {
     if candidates.is_empty() {
         bail!("no worker candidates to fetch partition {partition} from");
@@ -531,7 +718,9 @@ pub async fn fetch_partition_with_failover(
 
     let mut last_error: Option<anyhow::Error> = None;
     for (attempt, worker_url) in candidates.iter().enumerate() {
-        match fetch_partition(worker_url, partition, plan_bytes.clone()).await {
+        // The same assertion goes to every candidate, which is what makes reassignment work at all:
+        // it authorizes *what this plan reads*, not *which worker reads it*.
+        match fetch_partition(worker_url, partition, plan_bytes.clone(), assertion).await {
             Ok(batches) => {
                 if attempt > 0 {
                     tracing::info!(
@@ -607,7 +796,14 @@ pub async fn fetch_stream(
     partition: u32,
     plan_bytes: Vec<u8>,
 ) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
-    fetch_stream_with_auth(worker_url, partition, plan_bytes, ambient_fleet_auth()).await
+    fetch_stream_with(
+        worker_url,
+        partition,
+        plan_bytes,
+        ambient_fleet_auth(),
+        None,
+    )
+    .await
 }
 
 /// [`fetch_stream`] with an explicit fleet credential instead of the process's ambient one.
@@ -621,6 +817,23 @@ pub async fn fetch_stream_with_auth(
     partition: u32,
     plan_bytes: Vec<u8>,
     auth: &FleetAuth,
+) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
+    fetch_stream_with(worker_url, partition, plan_bytes, auth, None).await
+}
+
+/// The full-fidelity pull: both credentials, explicitly.
+///
+/// Both are optional in effect and both follow the same rule — a fleet with no secret presents
+/// neither and a worker with no secret checks neither — but they answer different questions. `auth`
+/// says which deployment is calling; `assertion` says which request this is and what it authorizes
+/// reading. A closed worker requires both, so a caller that presents only the fleet token is refused
+/// as `UNAUTHENTICATED`, naming the missing header.
+pub async fn fetch_stream_with(
+    worker_url: String,
+    partition: u32,
+    plan_bytes: Vec<u8>,
+    auth: &FleetAuth,
+    assertion: Option<&SignedAssertion>,
 ) -> Result<impl Stream<Item = Result<RecordBatch, FlightError>> + Send + 'static> {
     // Derive the stage id from the plan bytes themselves: every consumer of one producer ships
     // byte-identical bytes (only `partition` differs), so they all name the same cache entry on the
@@ -649,6 +862,16 @@ pub async fn fetch_stream_with_auth(
             )
         })?;
         request.metadata_mut().insert(AUTHORIZATION_HEADER, value);
+    }
+    // Beside the fleet token, and beside it for the same reason: the ticket is hashed into a stage
+    // id and cached. This one is per request, so putting it there would also make every request a
+    // different stage.
+    if let Some(assertion) = assertion {
+        let value = assertion
+            .as_header_value()
+            .parse()
+            .context("the plan assertion is not usable as an HTTP header value")?;
+        request.metadata_mut().insert(PLAN_ASSERTION_HEADER, value);
     }
 
     let flight_data = client
@@ -694,9 +917,10 @@ mod tests {
     /// instead of returning an empty result that would look like a legitimately empty partition.
     #[tokio::test]
     async fn an_empty_candidate_list_is_rejected() {
-        let err = fetch_partition_with_failover(&[], 0, b"plan".to_vec(), &RetryPolicy::default())
-            .await
-            .expect_err("no candidates is invalid");
+        let err =
+            fetch_partition_with_failover(&[], 0, b"plan".to_vec(), &RetryPolicy::default(), None)
+                .await
+                .expect_err("no candidates is invalid");
         assert!(
             err.to_string().contains("no worker candidates"),
             "got: {err}"
@@ -731,10 +955,15 @@ mod tests {
             dead_worker_url().await,
         ];
 
-        let err =
-            fetch_partition_with_failover(&candidates, 7, b"plan".to_vec(), &instant_policy())
-                .await
-                .expect_err("every candidate is unreachable");
+        let err = fetch_partition_with_failover(
+            &candidates,
+            7,
+            b"plan".to_vec(),
+            &instant_policy(),
+            None,
+        )
+        .await
+        .expect_err("every candidate is unreachable");
 
         let message = err.to_string();
         assert!(
@@ -765,10 +994,15 @@ mod tests {
             dead_worker_url().await,
         ];
 
-        let err =
-            fetch_partition_with_failover(&candidates, 0, b"plan".to_vec(), &instant_policy())
-                .await
-                .expect_err("a malformed url cannot be fetched from");
+        let err = fetch_partition_with_failover(
+            &candidates,
+            0,
+            b"plan".to_vec(),
+            &instant_policy(),
+            None,
+        )
+        .await
+        .expect_err("a malformed url cannot be fetched from");
 
         let message = err.to_string();
         assert!(message.contains("not retried"), "got: {message}");

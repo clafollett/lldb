@@ -22,6 +22,7 @@
 //! | [`services`]     | Postgres control plane: tenants, and the schema later issues fill in | 5 |
 //! | [`auth`]         | Who is asking: API keys, users, principals — and the fleet secret     | 5 |
 //! | [`rbac`]         | What they may touch: grants, checked on the logical plan before dispatch | 5 |
+//! | [`plan_assertion`] | Carrying that answer to a worker: a signed, short-lived statement of who authorized a plan and which locations it may read | 5 |
 //! | [`warehouse`]    | Virtual warehouses: named, resizable, suspend/resume compute pools    | 5 |
 //! | [`engine`]       | Running one query: plan → distribute → collect, shared by both front ends | 5 |
 //! | [`scheduler`]    | Admission control: how many queries a warehouse runs at once          | 5 |
@@ -43,6 +44,11 @@
 //! Iceberg snapshot the coordinator planned against. A worker registers no tables, loads no
 //! manifest and holds no catalog credential; what it must have is read access to the object store
 //! the plan names.
+//!
+//! Self-contained is not the same as self-*authorizing*, and the difference is [`plan_assertion`]:
+//! a worker with a fleet secret executes a plan only when the request beside it carries a live,
+//! MAC'd statement of who authorized it and which locations it may read, and only when the plan's
+//! own file scans sit inside those locations.
 
 /// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -68,6 +74,7 @@ pub mod iceberg_scan;
 pub mod lakehouse;
 pub mod liveness;
 pub mod manifest;
+pub mod plan_assertion;
 pub mod query_log;
 pub mod rbac;
 pub mod reaper;
@@ -113,6 +120,10 @@ pub use liveness::{
 pub use manifest::{
     CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef, TableFormat,
     TableSource,
+};
+pub use plan_assertion::{
+    AssertionError, AssertionKey, PLAN_ASSERTION_HEADER, PlanAssertion, PlanAuth, QueryIdentity,
+    SignedAssertion, plan_reads,
 };
 pub use query_log::{QueryRecord, QueryState};
 pub use rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization, Requirement};

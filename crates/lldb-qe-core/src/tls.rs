@@ -71,11 +71,13 @@
 //! - **Which fleet member you are.** This is *server-authenticated* TLS: a client verifies the
 //!   server's certificate; the server does not verify the client's. mTLS at the worker boundary —
 //!   whether a client certificate should *replace* [`crate::auth::FleetAuth`]'s shared secret — is
-//!   its own decision and is settled elsewhere (issue #34). Nothing here makes `LLDB_FLEET_TOKEN`
+//!   its own decision and is still open (issue #32). Nothing here makes `LLDB_FLEET_TOKEN`
 //!   redundant: it is unchanged, still required when set, and still the only thing proving a caller
 //!   belongs to this deployment.
-//! - **Per-request identity at the worker boundary.** A worker still authenticates the *fleet*, not
-//!   the user, and TLS does not change what claim a shared secret makes. See [`crate::auth`].
+//! - **Per-request identity at the worker boundary.** Closed by [`crate::plan_assertion`], not by
+//!   anything here: TLS stops observation, an assertion stops a valid-but-unauthorized plan, and the
+//!   two are complementary. What TLS contributes is that the assertion — which is authorization-
+//!   bearing for as long as it is live — is no longer readable off the wire by anyone on the path.
 //! - **A downgrade a client chooses.** Trust flows from the URL: `https://` dials TLS, `http://`
 //!   does not. That is not a hole, because the *server* is what refuses — a TLS-serving worker
 //!   fails a plaintext client's handshake rather than answering it — but it does mean the operator
