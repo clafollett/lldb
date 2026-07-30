@@ -6,8 +6,11 @@ Iceberg tables on object storage.
 
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 
-> **Status:** early / experimental. Built in the open as a learning-grade reimplementation
-> of a production architecture. Not production-ready.
+> **Status:** production-track, not production-ready. It began as a learning-grade
+> reimplementation of a production architecture; the distributed-execution core and a real
+> control plane — Postgres-backed catalog and accounts, virtual warehouses, a query scheduler,
+> RBAC, TLS — are in place, and the code is built to be kept rather than thrown away. It has
+> not been run in anger by anyone, and the gaps are tracked as open issues rather than hidden.
 
 ## Why
 
@@ -60,9 +63,19 @@ Writes are not distributed at all: the coordinator commits them itself.
 
 | Crate | Role |
 | - | - |
-| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, services-DB connection layer |
-| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds the control-plane one-shots `lldb-qe-migrate` and `lldb-qe-warehouse` |
+| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, staging planner, services-DB layer, scheduler, access control |
+| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds the operator binaries below |
 | `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
+
+`lldb-qe-coordinator` runs **one** query and exits. The binaries it also builds:
+
+| Binary | Role |
+| - | - |
+| `lldb-qe-server` | The long-running front end — concurrent submissions over Arrow Flight, admission control, query history. **The only binary that authenticates** |
+| `lldb-qe-migrate` | Applies the services-DB migrations; an explicit one-shot, never startup magic |
+| `lldb-qe-warehouse` | Create / list / resize / suspend / resume a virtual warehouse |
+| `lldb-qe-auth` | Accounts, API keys, roles, grants |
+| `lldb-qe-reap` | Resolves query-history rows stranded by a coordinator that died |
 
 ## Services database (control plane)
 
@@ -123,6 +136,61 @@ orchestrator SDK, so the same rows can drive ECS, compose, or whatever runs work
 mutation prints the exact apply command. Without a services database configured, none of this is
 in the way: `--workers` behaves exactly as it always has.
 
+## Serving many queries
+
+`lldb-qe-coordinator` runs one query and exits — useful in a shell, and what the compose cluster
+smoke test drives. The long-running shape is **`lldb-qe-server`**: it accepts concurrent
+submissions over Arrow Flight, admits a bounded number per warehouse, queues the rest, and records
+every query in the services database.
+
+Admission is **fleet-wide**, not per process. Two servers pointed at one warehouse admit *K*
+between them rather than *K* each, because the bound is held in Postgres against the coordinator's
+liveness lease — a per-process counter would be self-consistently wrong exactly when it matters.
+Cancelling a running query returns its slot, so the queue behind it advances. A coordinator that
+dies leaves rows stranded in `queued`/`running`; `lldb-qe-reap` resolves them, and only those whose
+coordinator's lease has actually expired.
+
+## Access control
+
+`lldb-qe-server` is the only binary that authenticates. A caller presents an API key; the grant
+check runs **at plan time**, against the tables the plan actually resolved, and *before* the result
+cache is consulted — so revoking `SELECT` refuses the next query even when the answer is still
+cached.
+
+```bash
+AUTH="cargo run -q -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+  --metadata-url postgres://lldb:lldb@localhost:5432/lldb"
+
+$AUTH user create --name alice
+$AUTH key  create --user alice --name cli     # the token prints once, and is stored nowhere
+$AUTH role create --name analyst
+$AUTH role assign --role analyst --user alice
+$AUTH grant --role analyst --privilege SELECT --object-type namespace --object-name lldb.sales
+$AUTH show
+```
+
+Privileges are `SELECT | INSERT | DELETE | UPDATE | USAGE | CANCEL | ALL`. `CANCEL` is held on a
+warehouse and permits stopping any query running on it; `USAGE` — which every submitter needs —
+deliberately does not imply it, and `ALL` does.
+
+`lldb-qe-auth` has the same posture as `lldb-qe-warehouse`: its credential **is** the Postgres
+password, so treat that as the deployment's root credential.
+
+Three properties worth naming, because each is a place the obvious design is wrong:
+
+- **Anything we cannot name is refused.** DDL, `COPY TO`, `DESCRIBE` and unknown plan extensions
+  fail closed rather than falling through to allowed.
+- **The worker boundary carries the request's identity, not just the fleet's.** A plan arriving at
+  a worker is accompanied by a signed, short-lived assertion naming the tables the plan-time check
+  approved. It travels *beside* the plan bytes, not inside them — inside, it would change the
+  content-addressed stage id and turn every request into a stage-cache miss.
+- **Each tenant gets its own catalog and warehouse root**, so two accounts can own the same
+  qualified table name and a catalog-wide grant still reaches only its own account's data.
+
+TLS is available on both Flight hops (client→coordinator and coordinator→worker); certificates are
+files the deployment mounts, and the engine issues none. A plaintext port is something you have to
+ask for.
+
 ## Catalogs & schemas
 
 Tables are declared as **data**, not code. A [manifest](manifests/) describes arbitrary
@@ -182,9 +250,51 @@ cargo test
   `n`), a staging planner that cuts arbitrary SQL into stages, a persistent shared SQL catalog on
   Postgres, and Iceberg scans resolved to their snapshot's files — the piece that makes an Iceberg
   query distributable at all
-- [ ] **Next** — Real network-shuffle exec node + worker-to-worker `do_exchange`; REST catalog;
-  distributed reads of partitioned tables and of tables carrying row-level deletes; publish
-  versioned images to a registry from CI
+- [x] **Phase 10** — Control plane: PostgreSQL services DB, virtual warehouses, a stage DAG with
+  broadcast joins and distributed sort, stage reassignment when a worker is lost, and a
+  cross-query result cache keyed on the SQL and the snapshots it read
+- [x] **Phase 11** — Multi-query: `lldb-qe-server`, a scheduler that admits a bounded number per
+  warehouse fleet-wide, queues the rest, records every query, cancels a running one and hands its
+  slot back — plus a coordinator liveness lease and the reaper that acts on it
+- [x] **Phase 12** — Writes: `INSERT` / `DELETE` / `UPDATE` committing real Iceberg snapshots,
+  with the concurrent-writer race asserted on the data
+- [x] **Phase 13** — Security: accounts, API keys and RBAC enforced at plan time; a catalog and
+  warehouse root per tenant; TLS on both Flight boundaries; and a signed, short-lived assertion
+  that carries the plan-time check's answer to the worker
+
+Open work is tracked as [issues](https://github.com/clafollett/lldb/issues). The themes:
+
+- **Observability** — no query profile and no execution metrics ([#61]), and query history cannot
+  say who ran a query ([#60])
+- **Storage** — Iceberg time travel is paid for but unreachable ([#59]); DML is a whole-table
+  rewrite and `MERGE` is unimplemented ([#39]); multi-statement transactions ([#66])
+- **Execution** — no `MemoryPool` is configured ([#64]); the Iceberg rewrite discards every
+  manifest statistic ([#63]); distributed reads of partitioned tables and of tables carrying
+  row-level delete files
+- **Control plane** — nothing makes a warehouse's desired size real ([#41]), which blocks
+  auto-suspend/resume ([#67]); multi-cluster warehouses ([#68]); nothing bounds what a tenant can
+  spend ([#62])
+- **Security** — RBAC is whole-table allow/deny; column-level, row-level and masking need a plan
+  rewrite the cache key cannot see ([#69])
+- **Platform** — the `iceberg-datafusion` 0.10 version wall, tracking DataFusion 54 ([#40]); a
+  REST catalog; publishing versioned images to a registry from CI ([#7]); validating the CDK
+  stack with a real deploy ([#9])
+
+[#7]: https://github.com/clafollett/lldb/issues/7
+[#9]: https://github.com/clafollett/lldb/issues/9
+[#39]: https://github.com/clafollett/lldb/issues/39
+[#40]: https://github.com/clafollett/lldb/issues/40
+[#41]: https://github.com/clafollett/lldb/issues/41
+[#59]: https://github.com/clafollett/lldb/issues/59
+[#60]: https://github.com/clafollett/lldb/issues/60
+[#61]: https://github.com/clafollett/lldb/issues/61
+[#62]: https://github.com/clafollett/lldb/issues/62
+[#63]: https://github.com/clafollett/lldb/issues/63
+[#64]: https://github.com/clafollett/lldb/issues/64
+[#66]: https://github.com/clafollett/lldb/issues/66
+[#67]: https://github.com/clafollett/lldb/issues/67
+[#68]: https://github.com/clafollett/lldb/issues/68
+[#69]: https://github.com/clafollett/lldb/issues/69
 
 ## Deploying to AWS
 
@@ -208,8 +318,9 @@ not independently.
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md). This project practices trunk-based development and is
-licensed under Apache-2.0.
+See [CONTRIBUTING.md](CONTRIBUTING.md). Every change lands through a feature branch and a
+reviewed pull request — `main` stays releasable and is never pushed to directly. Licensed under
+Apache-2.0.
 
 ## License
 
