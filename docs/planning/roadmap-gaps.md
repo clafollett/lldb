@@ -58,33 +58,40 @@ be read in context.
 | #60 | Query history cannot say who ran a query |
 | #61 | No query profile — no execution metrics collected anywhere |
 | #62 | Nothing bounds tenant spend, and there is no unit of consumption |
+| #63 | The Iceberg rewrite discards every manifest statistic — and runs too late to use one |
+| #64 | No `MemoryPool` is configured, and the largest buffer is one no pool can see |
+| #65 | `DELETE`/`UPDATE` are unreachable from `lldb-qe-server`, the only binary that authenticates |
+| #66 | Multi-statement transactions — settle the session question first |
+| #67 | Auto-suspend and auto-resume (blocked on #41) |
+| #68 | Multi-cluster warehouses — scale out on concurrency |
+| #69 | Column-level, row-level and masking — RBAC is whole-table allow/deny |
 
 ## Not yet filed
 
-### A. Awaiting a research spike
+### A. Awaiting a research spike — *all graduated 2026-07-30*
 
-Real gaps where writing an implementation ticket today would produce fiction. Each needs a bounded
-investigation whose *output* is the issue.
+This bucket is empty. The three items in it were researched against source and filed as #63
+(statistics), #64 (memory pressure) and #66 (transactions). Each is filed **spike-first or with its
+governing decision stated up front** rather than as an implementation ticket, which is the outcome
+this bucket exists to produce — the research did not make them ready to build, it made them ready to
+*decide*.
 
-- **Statistics and pruning.** The single widest gap. The question that must be answered first is the
-  boundary between what DataFusion 53.1 already does with statistics we simply never supply, what
-  Iceberg manifests could supply (per-file row counts, column bounds, null counts) and what would
-  have to be built. Note `iceberg_scan.rs` resolves a scan to its snapshot's files and the manifest
-  data is in hand at that moment — whether any of it survives into the plan is the thing to check.
-  Related: the rewrite lands after the physical optimizer, so parquet row-group pruning is already
-  known to be lost.
-- **Spilling and memory pressure.** What happens today when a query does not fit in RAM is not
-  characterised. DataFusion has a `MemoryPool` and a `DiskManager` and several spill-capable
-  operators; whether the runtime is configured with either is the first question. Separately, the
-  materialize-once shuffle is ours, and if it buffers a stage entirely in memory it has no spill
-  path at all regardless of what DataFusion would do.
-- **Multi-statement transactions.** Needs a design proposal before a ticket. The hard part is not
-  Iceberg's commit model but session state: a transaction needs a session, and it is not established
-  that anything in this system has one — Flight requests may be entirely stateless. Settle that
-  first, because it decides whether the feature is expensive or impossible.
+Three findings from that research are worth keeping here, because they change how neighbouring work
+should be read:
 
-> These three are under active research as of this snapshot. When the briefs land they should become
-> issues and move to the Filed table.
+- **Statistics cannot influence a plan under the current architecture.** `resolve_iceberg_scans`
+  runs *after* `create_physical_plan` (`engine.rs:471` → `:493`), so every statistics consumer has
+  already run against `Statistics::new_unknown`. Populating statistics in the rewrite would change
+  `EXPLAIN` and nothing else. #63 is therefore a decision about *where scan resolution happens*
+  before it is anything else.
+- **The largest per-worker allocation is invisible to any memory pool.** `MaterializedStage` holds
+  every output partition of a producer stage and takes no `MemoryReservation`, so configuring a pool
+  squeezes the operators *underneath* the untracked buffer that is actually consuming the memory.
+  See #64 — the two halves must land together.
+- **A whole write path was found missing.** `DELETE`/`UPDATE` are unreachable from `lldb-qe-server`
+  entirely; they exist only in the one-shot `lldb-qe-coordinator`, which is deliberately *not*
+  access-controlled. Filed as #65. It blocks both #66 and the write half of #69, and nothing
+  documented it.
 
 ### B. Blocked on measurement
 
@@ -143,10 +150,11 @@ Real gaps where the decision is "not now" rather than "not ready". Grouped by wh
   cardinality-violation rule cannot be approximated safely.
 
 **Security**
-- **Column-level and row-level security, and masking.** Under active research as of this snapshot;
-  expected to become an issue. Categorically harder than the current allow/deny model because
-  masking and row filters require plan *rewriting*, and a rewritten plan interacts with both cache
-  keys and the worker plan assertion.
+- **Column-level and row-level security, and masking** — now **#69**. Kept here for the finding: the
+  natural implementation (a DataFusion `AnalyzerRule`) fires *after* the result-cache key is composed
+  and after the lookup, so an unmasked result stored by one role would be served to another. The
+  current allow/deny model is safe only because denial is all-or-nothing; RLS and masking break that
+  premise, because both users are *allowed* and must get different answers.
 - **Network policies / IP allowlists.** Not started.
 - **Key management, customer-managed keys, encryption at rest.** Not started.
 - **Asymmetric plan-assertion keys.** Named as the intended end state in `plan_assertion.rs`: the
@@ -158,9 +166,11 @@ Real gaps where the decision is "not now" rather than "not ready". Grouped by wh
   with a window during a rolling restart where the halves disagree. Needs a *set* of accepted keys.
 
 **Control plane and elasticity**
-- **Auto-suspend / auto-resume**, and **multi-cluster scale-out**. Under active research as of this
-  snapshot; both expected to become issues. Both are gated on #41 — without an actuator, suspend is
-  a row change that nothing acts on.
+- **Auto-suspend / auto-resume** — now **#67**. **Multi-cluster scale-out** — now **#68**, and
+  gated on #67 rather than parallel to it. Both remain hard-blocked on #41: without an actuator,
+  auto-suspend stops routing while ECS keeps billing, and auto-resume replaces an actionable "resume
+  it first" error with a worse one. Note #68's honest caveat — no measurement shows concurrency is
+  the binding constraint, so it may be a feature wanted because Snowflake has it.
 - **Fleet-wide FIFO fairness.** `fleet_admission.rs` polls, so FIFO holds within a coordinator and
   not between them. `LISTEN`/`NOTIFY` is the identified next step.
 - **Per-tenant admission queues.** The process-local gate is keyed by warehouse *name*, so two
