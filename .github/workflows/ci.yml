@@ -1,9 +1,29 @@
 name: CI
 
+# A markdown-only change runs no code, so it should not spend ~25 minutes in the cross-container
+# cluster job. Nothing in this repo takes a `.md` file as a build or test input — the manifests the
+# tests read are TOML, and `build.rs` reads only the git sha — so ignoring them costs no coverage.
+#
+# `paths-ignore` skips the WORKFLOW, which is only safe while `main` has no required status checks:
+# a workflow that never runs never reports, so a required check would sit "Expected — Waiting for
+# status" forever and the PR would be unmergeable. `main` is unprotected today. **If you turn on
+# branch protection with required checks, this block has to change** — move the filtering into the
+# jobs (a `changes` job plus `if:` on each one), because a job skipped via `if:` still reports and
+# satisfies the requirement, whereas an absent workflow does not.
+#
+# Deliberately NOT ignored: `.github/**` (a CI change must run CI) and every non-markdown file.
+#
+# The list is written out twice rather than shared through a YAML anchor: GitHub Actions does not
+# support anchors or aliases in workflow files, so `&docs-only` / `*docs-only` parses locally and
+# then fails on the runner. Keep the two lists identical by hand.
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - '**/*.md'
   pull_request:
+    paths-ignore:
+      - '**/*.md'
 
 concurrency:
   group: ci-${{ github.ref }}
