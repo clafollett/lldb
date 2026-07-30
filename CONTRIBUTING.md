@@ -26,15 +26,14 @@ feature branch → pull request → review → green CI → squash-merge to main
 
 New checkout? Run `./scripts/bootstrap.sh` first — it installs the TPC-H data generator and generates the benchmark data the test suite needs.
 
-```sh
-cargo build                                  # build
-cargo test                                   # run the test suite
-cargo fmt --all                              # format (run before committing)
-cargo clippy --workspace --all-targets       # lint (keep it warning-clean)
-```
+Run `cargo fmt --all` to *fix* formatting as you work. Before you push, run the three gates — these
+are verbatim what CI runs, and all three must pass:
 
-Please make sure `cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-and `cargo test --workspace` all pass before you push. Those are exactly what CI runs.
+```sh
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
 
 Two things that surprise people:
 
