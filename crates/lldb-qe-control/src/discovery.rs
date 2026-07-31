@@ -194,11 +194,14 @@ impl Endpoint {
     /// Parse `scheme://host:port` with [`Url`], then apply the two rules Flight adds on top of it:
     /// the scheme must be one we dial, and the port must be written out.
     ///
-    /// Do **not** relax the "must have a host" rule to make some spelling run. `host:port` with the
-    /// scheme left off parses happily as a *scheme* with the rest as a path and no host at all —
-    /// `w1:50051` is scheme `w1`, path `50051` — and that is the same refusal `WorkerIdentity`
-    /// makes for the same reason: with no host there is no origin, so every such spelling would key
-    /// alike and the second worker would vanish.
+    /// Do **not** drop the host check on the grounds that `Url` already guarantees a host for a
+    /// special scheme — it does, an empty host is a parse error for `http`/`https`, and the scheme
+    /// check below would refuse the rest anyway. What it buys is the *message*: an endpoint written
+    /// without its scheme parses as a scheme with the rest as a path and no host at all
+    /// (`w1:50051` is scheme `w1`, path `50051`), and reporting that as "unsupported scheme `w1`"
+    /// sends an operator looking for the wrong bug. The refusal being over-determined is the point
+    /// — every URL this module emits has an origin, so `WorkerIdentity` can key all of them, and
+    /// never has to fall back to comparing whole strings.
     fn parse(raw: &str) -> Result<Self> {
         let url = Url::parse(raw).map_err(|err| match err {
             // `url`'s own words for a string with no scheme are "relative URL without a base",
@@ -569,9 +572,10 @@ mod tests {
         }
     }
 
-    /// The converse, and why "must have a host" is not negotiable: an endpoint written without its
-    /// scheme parses into a scheme with a path and *no host*. That is the shape #109's review
-    /// caught, and this module is the gate that keeps it out of the fleet list.
+    /// The converse property, on the shape #109's review caught: an endpoint written without its
+    /// scheme parses into a scheme with a path and *no host*. Which of `parse`'s checks refuses it
+    /// is an implementation detail; that discovery refuses it here — rather than resolving it into
+    /// the fleet list, where nothing downstream can key it — is not.
     #[test]
     fn an_endpoint_with_no_origin_is_refused_here() {
         for raw in ["w1:50051", "worker.local:50051", "mailto:ops@example.com"] {
