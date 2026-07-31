@@ -368,6 +368,12 @@ rotation is a restart. That is a decision and not an oversight; `crates/lldb-qe-
 section argues it under #83. The fleet secret above and a new `imageTag` are restarts for the same
 reason, so when more than one is due, do them in **one** restart rather than three.
 
+Every `--secret-id` below spells the **default** prefix, `lldb/fleet-tls`. A stack deployed with
+`-c tlsSecretPrefix=team/x` reads `team/x-{ca,cert,key}` instead, so substitute throughout and pass
+the matching `--prefix` to every `mint-fleet-tls.sh` run — the script defaults the prefix on each
+invocation exactly as it defaults `--domain`, and forgetting it writes a perfectly good certificate
+to secrets the fleet does not read.
+
 **A leaf near expiry, same CA — one rolling restart, no query outage.** Every task trusts the same
 root before and after, so a half-replaced fleet still handshakes. This is the common case.
 
@@ -427,19 +433,19 @@ with, so the CA secret is written by hand in passes 1 and 3.
 ./scripts/mint-fleet-tls.sh --ca-dir ./fleet-tls-ca-new --prefix lldb/fleet-tls-unused
 cat ./fleet-tls-ca/ca.crt ./fleet-tls-ca-new/ca.crt > ./both-roots.pem
 aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca --secret-string file://./both-roots.pem
-aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment   # wait for it
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> --force-new-deployment   # wait for it
 
 # Pass 2 — leaves re-issued under the new root, both roots still trusted. The two commands go back
 # to back: the script overwrites the CA secret with the new root alone, and a task that happens to
 # start in that gap cannot dial a peer still serving the old leaf.
 ./scripts/mint-fleet-tls.sh --ca-dir ./fleet-tls-ca-new
 aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca --secret-string file://./both-roots.pem
-aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment   # wait for it
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> --force-new-deployment   # wait for it
 
 # Pass 3 — old root retired.
 aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca \
   --secret-string file://./fleet-tls-ca-new/ca.crt
-aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> --force-new-deployment
 ```
 
 Each pass is rolling-safe on its own, because at every moment every task trusts the root that signed
