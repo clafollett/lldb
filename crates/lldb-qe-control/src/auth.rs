@@ -1051,8 +1051,17 @@ mod tests {
         assert!(!verify_token(&secret[..secret.len() - 1], &hash));
         assert!(!verify_token(&format!("{secret}x"), &hash));
         let mut flipped = secret.clone();
-        flipped.replace_range(TOKEN_PREFIX_LEN..TOKEN_PREFIX_LEN + 1, "-");
-        assert_ne!(flipped, secret);
+        // Flip RELATIVE to the character that is there, never to a fixed one. Substituting a
+        // constant is only a flip if that constant differs from the original — and `-` is in the
+        // URL-safe base64 alphabet this token is drawn from, so roughly one generated token in 64
+        // already began with it, the replacement was a no-op, and `assert_ne!` below failed. A
+        // 1-in-64 flake is the worst frequency there is: too rare to reproduce on demand, common
+        // enough to redden CI and teach everyone to re-run rather than look. Choosing relative to
+        // the current character cannot collide, and stays correct if the encoding ever changes.
+        let first_body = &secret[TOKEN_PREFIX_LEN..TOKEN_PREFIX_LEN + 1];
+        let replacement = if first_body == "A" { "B" } else { "A" };
+        flipped.replace_range(TOKEN_PREFIX_LEN..TOKEN_PREFIX_LEN + 1, replacement);
+        assert_ne!(flipped, secret, "the flip must actually change the token");
         assert!(!verify_token(&flipped, &hash));
 
         // And an entirely different token must not verify against this hash.
