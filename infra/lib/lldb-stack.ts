@@ -871,13 +871,21 @@ function validateSecretPrefix(prefix: string): string {
 }
 
 /**
- * A DNS name: dot-separated labels of `[A-Za-z0-9-]`, none leading or trailing a `-`. Deliberately
- * no `*`: this is the name a client *verifies*, and rustls matches a wildcard that is in the
- * certificate against a concrete name — a wildcard on this side matches nothing.
+ * A DNS name: dot-separated labels of `[A-Za-z0-9-]`, none leading or trailing a `-`, and **none
+ * longer than 63 characters** — RFC 1035's limit on a label, which rustls enforces when it parses
+ * `LLDB_TLS_DOMAIN` into a `ServerName`. Without the `{0,61}` bound a 100-character label passes
+ * here and is refused there, on a deployed fleet at client-config time, which is the failure this
+ * whole function exists to move to synth.
+ *
+ * Deliberately no `*`: this is the name a client *verifies*, and rustls matches a wildcard that is
+ * in the certificate against a concrete name — a wildcard on this side matches nothing.
  */
-const TLS_DOMAIN_RE = /^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$/;
+const TLS_DOMAIN_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?';
+const TLS_DOMAIN_RE = new RegExp(`^${TLS_DOMAIN_LABEL}(?:\\.${TLS_DOMAIN_LABEL})*$`);
 /** A DNS name's own limit, and the limit on a certificate's `DNS:` SAN with it. */
 const MAX_TLS_DOMAIN_LEN = 253;
+/** RFC 1035's limit on a single label, enforced by {@link TLS_DOMAIN_LABEL}'s `{0,61}`. */
+const MAX_TLS_LABEL_LEN = 63;
 
 /**
  * Refuse a TLS domain that could never verify, at synth time.
@@ -896,8 +904,9 @@ function validateTlsDomain(domain: string): string {
   if (typeof domain !== 'string' || domain.length > MAX_TLS_DOMAIN_LEN || !TLS_DOMAIN_RE.test(domain)) {
     throw new Error(
       `tlsDomain ${JSON.stringify(domain)} is not a DNS name: up to ${MAX_TLS_DOMAIN_LEN} characters of ` +
-        'dot-separated [A-Za-z0-9-] labels, no wildcard (it becomes LLDB_TLS_DOMAIN, and must be a ' +
-        'name the minted certificate carries as a SAN — see scripts/mint-fleet-tls.sh --domain)',
+        `dot-separated [A-Za-z0-9-] labels, each at most ${MAX_TLS_LABEL_LEN}, no wildcard ` +
+        '(it becomes LLDB_TLS_DOMAIN, and must be a name the minted certificate carries as a SAN ' +
+        '— see scripts/mint-fleet-tls.sh --domain)',
     );
   }
   return domain;

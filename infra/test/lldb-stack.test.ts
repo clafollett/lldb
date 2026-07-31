@@ -643,6 +643,11 @@ describe('transport security', () => {
     ['a port', 'fleet.example.com:50051'],
     ['a trailing dot', 'fleet.example.com.'],
     ['an empty string', ''],
+    // RFC 1035 caps a label at 63 characters, and rustls enforces it when it parses
+    // LLDB_TLS_DOMAIN into a ServerName — so without this the value is refused on a deployed
+    // fleet at client-config time, which is the failure the validator exists to move to synth.
+    ['a label over 63 characters', `${'a'.repeat(64)}.example.com`],
+    ['an over-long single label', 'a'.repeat(64)],
   ])('refuses a tlsDomain with %s', (_label, tlsDomain) => {
     expect(() => synth({ tls: 'fleet', tlsDomain })).toThrow(/is not a DNS name/);
   });
@@ -650,7 +655,13 @@ describe('transport security', () => {
   test('accepts the shapes a real deployment actually uses', () => {
     // Guard against a regex tightened into uselessness: a single label, a hyphenated one, and an
     // ordinary public name all have to survive.
-    for (const tlsDomain of ['fleet', 'lldb-fleet.corp.internal', 'fleet.example.com']) {
+    for (const tlsDomain of [
+      'fleet',
+      'lldb-fleet.corp.internal',
+      'fleet.example.com',
+      // Exactly at RFC 1035's label limit: the bound must reject 64, not 63.
+      `${'a'.repeat(63)}.example.com`,
+    ]) {
       expect(() => synth({ tls: 'fleet', tlsDomain })).not.toThrow();
     }
   });
