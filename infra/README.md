@@ -445,7 +445,8 @@ aws ecs update-service --cluster <ClusterName> --service <each> --force-new-depl
 Each pass is rolling-safe on its own, because at every moment every task trusts the root that signed
 every leaf being served. Let each deployment finish before starting the next — passes that overlap
 are the one-pass swap by another route. Then clean up: keep `./fleet-tls-ca-new/ca.key` offline,
-discard the old CA directory, and delete the three secrets pass 1 left behind.
+discard the old CA directory, and delete the three secrets pass 1 left behind — one of them is a
+private key, minted only because the script has no CA-only mode, and read by nothing.
 
 ```bash
 for part in ca cert key; do

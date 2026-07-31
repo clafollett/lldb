@@ -263,9 +263,9 @@ rather than creating them so that a private key is never something CDK holds. It
 `ServerTls::configure` hands rustls the acceptor once at startup, and each binary calls
 `install_client_trust` once from its own parsed flags. Nothing watches a file and nothing reloads on
 a signal, so replaced material takes effect when the **process** is replaced and not before. That is
-the previous section's 6 in different material — every secret this fleet holds is read once per
-process — and it is why #73 rejected AWS Private CA: automatic renewal renews something nothing
-re-reads.
+the previous section's 5 in different material — what is process-global is also process-lifetime —
+and it is half of why #73 rejected AWS Private CA: its one differentiator, automatic renewal, renews
+something nothing re-reads. The $400/month is the other half.
 
 The two shapes cost differently, and the difference is the whole operational story:
 
