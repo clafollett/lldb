@@ -389,7 +389,17 @@ describe('services database', () => {
     template.hasResourceProperties('AWS::RDS::DBInstance', { DBInstanceClass: 'db.serverless' });
     // The password is generated into Secrets Manager, never written into the template.
     template.resourceCountIs('AWS::SecretsManager::Secret', 1);
-    expect(JSON.stringify(template.toJSON())).not.toContain('GeneratePassword');
+    // Assert the RECIPE is present and no literal value is. The previous version checked for
+    // `GeneratePassword`, which is not a CloudFormation property — the real one is
+    // `GenerateSecretString` — so it passed unconditionally, and would have passed just as happily
+    // against a template with the password embedded. A negative assertion on a string that never
+    // appears for an unrelated reason is not a weak test, it is camouflage: it sits where a real
+    // check would go and reports success. All three lines below were verified to fail when
+    // inverted or when their needle was corrupted.
+    const dbTemplate = JSON.stringify(template.toJSON());
+    expect(dbTemplate).toContain('GenerateSecretString');
+    expect(dbTemplate).not.toContain('"SecretString"');
+    expect(dbTemplate).not.toContain('SecretStringValue');
   });
 
   test('Postgres is reachable from the task security groups only — never the world', () => {
