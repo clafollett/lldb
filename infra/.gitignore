@@ -3,3 +3,10 @@ cdk.out/
 *.js
 *.d.ts
 !jest.config.js
+
+# Ignored deliberately. `cdk synth` writes the results of environment lookups here — including the
+# AWS account ID — and the walkthrough in README.md tells operators to run it, so the file appears
+# in a working tree as a consequence of following the docs. CDK's own guidance is that committing it
+# makes synth reproducible across machines; that trade is right for a repo that deploys one
+# environment, and wrong for a public reference implementation that deploys none. Ignore it.
+cdk.context.json
