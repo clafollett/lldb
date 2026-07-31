@@ -43,12 +43,15 @@
 //! paths with no network at all. The generic-closure shape needs no `async-trait` and no new
 //! dependency — `std::future::Future` is enough.
 
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 
 use anyhow::{Context, Result, anyhow, bail};
 use url::{ParseError, Url};
+
+use crate::services::REDACTED;
 
 /// The token a warehouse endpoint template must contain, replaced with the warehouse's name.
 pub const WAREHOUSE_PLACEHOLDER: &str = "{warehouse}";
@@ -135,6 +138,9 @@ where
     let mut fleet = Vec::new();
 
     for raw in endpoints {
+        // Both messages below quote `raw` unredacted, which is safe only because this line
+        // succeeded: `Endpoint::parse` refuses an endpoint carrying userinfo, so a `raw` that
+        // reaches here provably has none.
         let endpoint = Endpoint::parse(raw)?;
 
         let addrs = resolve(endpoint.authority()).await.with_context(|| {
@@ -158,6 +164,44 @@ where
     }
 
     Ok(fleet)
+}
+
+/// `raw` with any password in its userinfo replaced, for a message that has to name an endpoint.
+///
+/// Textual rather than [`Url`]-based, and that is the whole reason it exists rather than
+/// [`services::redact_url`](crate::services::redact_url) being reused: the messages that most need
+/// redacting are the ones where [`Url::parse`] has already **failed**. `user:pass@w1:50051` — an
+/// endpoint written without its scheme, which is the commonest `--workers` mistake — is not a URL
+/// at all, and `redact_url` answers `<unparseable metadata url (redacted)>`, which drops the host
+/// the operator has to see along with the password they must not. Here the host survives.
+///
+/// The authority is everything after `scheme://` up to the first `/`, `?` or `#`, and the **last**
+/// `@` in it opens the host, because a password may itself contain one. A string with no such `@`
+/// is returned borrowed and untouched, so the common path allocates nothing.
+///
+/// Its failure mode is over-redaction, never under: a `//` that is really part of a path puts the
+/// authority window in the wrong place and can only blank text that is not a password. Do not
+/// "improve" it by parsing first — that is precisely the case it is here to cover.
+pub fn redact_endpoint(raw: &str) -> Cow<'_, str> {
+    let start = raw.find("//").map_or(0, |i| i + 2);
+    let authority = match raw[start..].find(['/', '?', '#']) {
+        Some(end) => &raw[start..start + end],
+        None => &raw[start..],
+    };
+    let Some(at) = authority.rfind('@') else {
+        return Cow::Borrowed(raw);
+    };
+    // No `:` in the userinfo means there is no password to hide, and blanking anyway would invent
+    // one — a bare `user@host` would render as `user:****@host` and send the reader looking for a
+    // credential nobody wrote.
+    let Some((name, _)) = authority[..at].split_once(':') else {
+        return Cow::Borrowed(raw);
+    };
+    Cow::Owned(format!(
+        "{}{name}:{REDACTED}{}",
+        &raw[..start],
+        &raw[start + at..]
+    ))
 }
 
 /// A parsed `scheme://host:port` worker endpoint.
@@ -203,25 +247,50 @@ impl Endpoint {
     /// — every URL this module emits has an origin, so `WorkerIdentity` can key all of them, and
     /// never has to fall back to comparing whole strings.
     fn parse(raw: &str) -> Result<Self> {
+        // Every message below names `redact_endpoint(raw)` and never `raw`, including the ones that
+        // fire before anything has been parsed. Refusing userinfo (just below) is not enough on its
+        // own, because the refusal can only see the credentials `Url` *recognizes* as such: a
+        // scheme-less `user:pass@w1:50051` — the exact string #124 is about — parses as scheme
+        // `user` with `pass@w1:50051` in its path, so `username()` is empty and `password()` is
+        // `None` while the password is right there in the text. Redaction covers the shapes the
+        // refusal cannot see; the refusal covers the shapes redaction would otherwise have to be
+        // trusted about forever.
+        let shown = redact_endpoint(raw);
         let url = Url::parse(raw).map_err(|err| match err {
             // `url`'s own words for a string with no scheme are "relative URL without a base",
             // which tells an operator staring at `--workers` nothing.
             ParseError::RelativeUrlWithoutBase => {
-                anyhow!("worker endpoint `{raw}` is missing a `scheme://` (expected http or https)")
+                anyhow!(
+                    "worker endpoint `{shown}` is missing a `scheme://` (expected http or https)"
+                )
             }
-            other => anyhow!("worker endpoint `{raw}` is not a URL: {other}"),
+            other => anyhow!("worker endpoint `{shown}` is not a URL: {other}"),
         })?;
+
+        // A worker URL has no legitimate userinfo: Flight credentials travel in gRPC metadata
+        // (`AUTHORIZATION_HEADER`, `lldb-plan-assertion`), and nothing in the dial path reads it —
+        // `tls::dial` hands the string to `Channel::from_shared`, which routes on the origin. So
+        // this is a fail-closed case rather than a redaction case: silently ignoring a password
+        // leaves it in the fleet list, and every future message naming an endpoint then has to
+        // remember not to print it.
+        if !url.username().is_empty() || url.password().is_some() {
+            bail!(
+                "worker endpoint `{shown}` carries `user:password@`, which a worker URL has no use \
+                 for — a worker authenticates a caller by `LLDB_FLEET_TOKEN` in gRPC metadata, \
+                 never by anything in the URL. Remove the credential from the endpoint."
+            );
+        }
 
         let host = url.host_str().with_context(|| {
             format!(
-                "worker endpoint `{raw}` has no host — it parses as scheme `{}` with the rest as a \
-                 path, which is what a `scheme://` left off does",
+                "worker endpoint `{shown}` has no host — it parses as scheme `{}` with the rest as \
+                 a path, which is what a `scheme://` left off does",
                 url.scheme()
             )
         })?;
         if url.scheme() != "http" && url.scheme() != "https" {
             bail!(
-                "worker endpoint `{raw}` has unsupported scheme `{}` (expected http or https)",
+                "worker endpoint `{shown}` has unsupported scheme `{}` (expected http or https)",
                 url.scheme()
             );
         }
@@ -230,7 +299,7 @@ impl Endpoint {
             Some(port) => port,
             None => Self::written_default_port(raw, &url).with_context(|| {
                 format!(
-                    "worker endpoint `{raw}` is missing a `:port` (Flight needs an explicit port)"
+                    "worker endpoint `{shown}` is missing a `:port` (Flight needs an explicit port)"
                 )
             })?,
         };
@@ -472,9 +541,6 @@ mod tests {
             // Rejected: `://` was matched literally, and a special scheme tolerates any number of
             // slashes.
             ("http:/w.local:50051", "w.local:50051"),
-            // Accepted as host `user:pass@w.local`, which `authority()` then re-bracketed into the
-            // fabricated IPv6 literal `[user:pass@w.local]:50051`.
-            ("http://user:pass@w.local:50051", "w.local:50051"),
             // Handed to the resolver as raw UTF-8 / still percent-encoded; getaddrinfo speaks
             // neither, so both were guaranteed NXDOMAIN.
             ("http://wörker.local:50051", "xn--wrker-jua.local:50051"),
@@ -492,6 +558,13 @@ mod tests {
         }
 
         let refused = [
+            // Accepted by the hand-rolled parser as host `user:pass@w.local`, which `authority()`
+            // then re-bracketed into the fabricated IPv6 literal `[user:pass@w.local]:50051`. #123
+            // made `Url` resolve it correctly, which was the wrong fix on its own: resolving it
+            // kept the password in the fleet list and therefore in every message naming it, so
+            // #124 refuses it outright. That is the stronger guarantee, and it belongs on this
+            // list rather than the one above.
+            "http://user:pass@w.local:50051",
             // Accepted with a host holding a character no resolver accepts.
             "http://w local:50051",
             "http://x|y:50051",
@@ -587,6 +660,85 @@ mod tests {
             assert!(
                 Endpoint::parse(raw).is_err(),
                 "`{raw}` has no origin, so discovery must refuse it rather than resolve it"
+            );
+        }
+    }
+
+    /// #124. A worker URL has no legitimate userinfo, so it is refused rather than ignored — and
+    /// the refusal names the endpoint without naming the credential.
+    #[test]
+    fn an_endpoint_carrying_a_credential_is_refused() {
+        let err = Endpoint::parse("http://ops:hunter2@w1:50051")
+            .err()
+            .expect("an endpoint carrying a credential must be refused");
+        let rendered = format!("{err:#}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        // Still diagnosable: the host and the user survive, which is what tells an operator which
+        // `--workers` entry to edit.
+        assert!(rendered.contains("w1:50051"), "{rendered}");
+        assert!(rendered.contains("ops"), "{rendered}");
+        assert!(rendered.contains("LLDB_FLEET_TOKEN"), "{rendered}");
+    }
+
+    /// The property the refusal alone does not deliver, and the reason `parse` redacts every
+    /// message rather than only that one: a credential must not survive into a message **whichever
+    /// way the endpoint fails**, including the ways `Url` does not recognize as credentials at all.
+    ///
+    /// One row per message arm in `Endpoint::parse`. The second is the shape #124 is actually
+    /// about — with no scheme it parses as scheme `ops` and an opaque path, so `url.password()` is
+    /// `None` and the refusal above never fires while the password sits in the text.
+    #[test]
+    fn a_credential_reaches_no_message_however_the_endpoint_fails() {
+        let leaky = [
+            "http://ops:hunter2@w1:50051", // the userinfo refusal
+            "ops:hunter2@w1:50051",        // parses as a scheme with no host
+            "http://ops:hunter2@w1",       // no port written
+            "ftp://ops:hunter2@w1:50051",  // unsupported scheme
+            "http://ops:hunter2@[bad",     // not a URL at all
+        ];
+        for raw in leaky {
+            let err = Endpoint::parse(raw)
+                .err()
+                .unwrap_or_else(|| panic!("`{raw}` must be refused"));
+            let rendered = format!("{err:#}");
+            assert!(!rendered.contains("hunter2"), "`{raw}` leaked: {rendered}");
+            assert!(
+                rendered.contains(REDACTED),
+                "`{raw}` unredacted: {rendered}"
+            );
+        }
+    }
+
+    /// The contrast that justifies a second redactor existing at all: `services::redact_url` drops
+    /// an unparseable string whole, which is right for a connection URL and wrong here, because the
+    /// commonest leaky `--workers` value is exactly the one `Url` cannot parse.
+    #[test]
+    fn redact_endpoint_keeps_the_host_where_redact_url_drops_it() {
+        let raw = "ops:hunter2@w1:50051";
+        let redacted = redact_endpoint(raw);
+        assert_eq!(redacted, "ops:****@w1:50051");
+        let dropped = crate::services::redact_url(raw);
+        assert!(
+            !dropped.contains("w1"),
+            "expected the host dropped: {dropped}"
+        );
+        assert!(!dropped.contains("hunter2"), "{dropped}");
+    }
+
+    /// No credential means no rewrite and no allocation, and a bare `user@host` counts as no
+    /// credential — blanking it would invent a password nobody wrote.
+    #[test]
+    fn redact_endpoint_leaves_an_endpoint_with_nothing_to_hide_alone() {
+        for raw in [
+            "http://w1:50051",
+            "https://[::1]:50051",
+            "ops@w1:50051",
+            "http://w1:50051/a@b",
+            "",
+        ] {
+            assert!(
+                matches!(redact_endpoint(raw), Cow::Borrowed(same) if same == raw),
+                "`{raw}` was rewritten"
             );
         }
     }

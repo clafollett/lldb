@@ -298,11 +298,17 @@ impl WorkerIdentity {
 }
 
 impl DisplayAs for FlightReaderExec {
+    /// The worker URL is redacted here even though [`crate::discovery`] refuses one carrying a
+    /// credential, because this is the one place that cannot refuse anything: `fmt_as` returns
+    /// `fmt::Result`, an `EXPLAIN` rendering is a log line and a `DataFusionError` body, and a
+    /// `FlightReaderExec` can be built from a string that never went through `resolve_fleet`.
+    /// Enforce where a URL enters, redact where one is printed.
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         write!(
             f,
             "FlightReaderExec: worker={}, partition={}",
-            self.worker_url, self.remote_partition
+            crate::discovery::redact_endpoint(&self.worker_url),
+            self.remote_partition
         )?;
         if !self.fallbacks.is_empty() {
             write!(f, ", fallbacks={}", self.fallbacks.len())?;
@@ -1296,6 +1302,25 @@ mod tests {
         let reader = FlightReaderExec::new("http://w:50051", 0, inner).unwrap();
         assert!(reader.fallbacks().is_empty());
         assert_eq!(reader.candidates(), vec!["http://w:50051".to_string()]);
+    }
+
+    /// #124's engine half. `discovery` refuses an endpoint carrying a credential, so a fleet list
+    /// cannot deliver one here — but `fmt_as` is the site that could not refuse it if it did, and
+    /// an `EXPLAIN` rendering reaches a log and a `DataFusionError` body. Constructing the leaf
+    /// directly is the point of the test, not a shortcut around the refusal: it is the one way in
+    /// that does not pass through `resolve_fleet`.
+    #[tokio::test]
+    async fn explain_never_renders_a_credential() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let reader =
+            FlightReaderExec::new("http://ops:hunter2@w:50051", 0, inner).expect("build the leaf");
+        let rendered = format!(
+            "{}",
+            datafusion::physical_plan::displayable(&reader).indent(true)
+        );
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("ops:****@w:50051"), "{rendered}");
     }
 
     /// The primary must not burn one of the bounded attempts twice just because the fleet list it
