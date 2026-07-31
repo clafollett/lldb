@@ -84,6 +84,10 @@ use crate::auth_rbac::{Tenant, cloud_map, db_or_skip, provision, status_of};
 use crate::result_cache_db::{NS, insert_rows, manifest};
 use crate::support::{Cleanup, DbCleanup, Servers, unique_name};
 
+/// How this suite names itself in the skip report. Its own name and not `auth_rbac`'s, even though
+/// it borrows that file's `db_or_skip`: the suite that did not run is this one.
+const SUITE: &str = "cache_grant_ordering";
+
 /// Workers behind the tenant's warehouse. More than one so "the fleet" is not a euphemism for "a
 /// worker"; the warehouse row is resized to match so the size/fleet mismatch warning stays quiet.
 const WORKERS: usize = 2;
@@ -190,7 +194,7 @@ fn rendered(batches: &[RecordBatch]) -> String {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revoked_grant_refuses_a_query_whose_answer_is_already_cached() -> Result<()> {
-    let Some((db, target)) = db_or_skip("the cache/grant ordering").await? else {
+    let Some((db, target)) = db_or_skip(SUITE).await? else {
         return Ok(());
     };
     // The catalog manifest needs the URL as a string of its own: a `sql` catalog opens its own

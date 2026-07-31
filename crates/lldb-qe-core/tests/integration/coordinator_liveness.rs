@@ -29,19 +29,20 @@ use lldb_qe_core::liveness::{
 };
 use lldb_qe_core::services::ServicesDb;
 
+use crate::support::gates;
 use crate::support::{Cleanup, DbCleanup, resolve_target, unique_name};
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "coordinator_liveness";
 
 /// The fastest cadence the schema can express: `renew_interval_secs` is whole seconds, so this is
 /// also the shortest threshold any real deployment could be configured with.
 const RENEW: Duration = Duration::from_secs(1);
 
-/// Connect and migrate, or say why the test is skipping.
+/// Connect and migrate, or report why the suite is skipping.
 async fn database(target: &crate::support::Target) -> Result<Option<ServicesDb>> {
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise coordinator liveness"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;

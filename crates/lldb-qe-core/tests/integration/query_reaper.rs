@@ -38,18 +38,19 @@ use lldb_qe_core::query_log::{QueryState, peak_concurrency};
 use lldb_qe_core::reaper::{DEFAULT_REAP_BATCH, ReapReason};
 use lldb_qe_core::services::ServicesDb;
 
+use crate::support::gates;
 use crate::support::{Cleanup, DbCleanup, Target, resolve_target, unique_name};
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "query_reaper";
 
 /// The fastest cadence the schema can express, so the threshold under test is 3s.
 const RENEW: Duration = Duration::from_secs(1);
 
-/// Connect and migrate, or say why the test is skipping.
+/// Connect and migrate, or report why the suite is skipping.
 async fn database(target: &Target) -> Result<Option<ServicesDb>> {
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise the query reaper"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;

@@ -108,7 +108,7 @@ jobs:
       - run: ./scripts/check-path-refs.sh
 
   # Fast path: format, lint, and the in-process test suite. Integration tests that need SF1
-  # data or Docker skip themselves, so this stays green without either.
+  # data or Docker skip themselves — reporting it, since #112 — so this stays green without either.
   check:
     name: fmt • clippy • test
     needs: changes
@@ -119,6 +119,8 @@ jobs:
     # settle — that the migrations apply, that re-applying them is a no-op, and that deleting an
     # account cascades to its warehouses. It skips itself when no database is reachable, so
     # without this container CI would report green on a test that never ran. Same 18.4 as compose.
+    # `LLDB_TEST_REQUIRE_GATED` on the Test step below turns that "would" into "cannot": drop this
+    # service, or the port mapping, and the run fails instead of quietly skipping.
     services:
       postgres:
         image: postgres:18.4-alpine
@@ -129,7 +131,8 @@ jobs:
         # This job runs directly on the runner, not inside a `container:`. In that mode the
         # service's Docker-network hostname (`postgres`) does NOT resolve from a step — the port
         # has to be published and reached over `localhost`. Do not "simplify" this to
-        # `postgres:5432` and drop the mapping; the test would go back to silently skipping.
+        # `postgres:5432` and drop the mapping — since #112 that no longer degrades quietly, it
+        # fails the job, which is the guard below working rather than a new breakage.
         # The host side is deliberately not 5432: nothing should collide with a runner that
         # happens to have its own Postgres up.
         ports:
@@ -170,9 +173,26 @@ jobs:
 
       - name: Test
         env:
-          # Point the services-database test at the service container above so it actually runs
-          # instead of printing its skip message.
+          # Point the services-database tests at the service container above so they actually run
+          # instead of reporting a skip.
           LLDB_TEST_POSTGRES_URL: postgres://lldb:lldb@localhost:55432/lldb?sslmode=disable
+          # …and make that a property this job *enforces* rather than one it hopes for. Before #112
+          # the only evidence the database tests had run was how long the binary took; now, if the
+          # URL above stops resolving to a reachable server — the service dropped, the port mapping
+          # dropped, the value emptied — those suites fail instead of quietly skipping.
+          #
+          # Presence is the assertion and the value is never read, which is why it is prose rather
+          # than `1`: see `crates/lldb-qe-core/tests/integration/support/gates.rs`, which spells the
+          # rule the same way `crates/lldb-qe-control/src/auth.rs` spells `LLDB_REQUIRE_FLEET_TOKEN`.
+          # Emptying this line therefore does nothing; turning the enforcement off means DELETING it,
+          # which is a structural diff a reviewer sees.
+          #
+          # It is deliberately scoped to the services-DB prerequisite and covers neither the TPC-H
+          # data suites nor the cross-container cluster: this job generates no SF1 parquet and
+          # builds no image (`docker-cluster` below is a *different* job), so enforcing those here
+          # would fail CI for want of things this job has no way to supply. Both still report their
+          # skips; making either strict is a separate switch, not a widening of this one.
+          LLDB_TEST_REQUIRE_GATED: "the postgres service above must actually be used"
         run: cargo test --workspace
 
   # Proves the distributed communication path across real containers (MinIO + worker fleet +

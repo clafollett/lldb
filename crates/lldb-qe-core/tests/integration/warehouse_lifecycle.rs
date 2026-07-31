@@ -18,21 +18,22 @@
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration warehouse_lifecycle
 //!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration warehouse_lifecycle -- --nocapture
 
+use crate::support::gates;
 use crate::support::{self, DbCleanup, resolve_target, unique_name};
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "warehouse_lifecycle";
 use anyhow::{Context, Result};
 use lldb_qe_core::discovery::DEFAULT_WAREHOUSE_ENDPOINT;
 use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::WarehouseState;
 
 /// Skip-or-connect, shared by every test in this file. Returns `None` when there is no database,
-/// having already printed why.
-async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+/// having already reported it (`support::gates`).
+async fn db_or_skip() -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP ({what}): set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with \
-             a Docker daemon, to exercise the warehouse lifecycle"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;
@@ -44,7 +45,7 @@ async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_lifecycle_round_trips_and_illegal_moves_are_refused() -> Result<()> {
-    let Some((db, target)) = db_or_skip("lifecycle").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -225,7 +226,7 @@ async fn the_lifecycle_round_trips_and_illegal_moves_are_refused() -> Result<()>
 
 #[tokio::test(flavor = "multi_thread")]
 async fn two_accounts_can_own_the_same_warehouse_name() -> Result<()> {
-    let Some((db, target)) = db_or_skip("tenancy").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -303,7 +304,7 @@ async fn two_accounts_can_own_the_same_warehouse_name() -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn the_schema_itself_refuses_an_illegal_warehouse() -> Result<()> {
-    let Some((db, target)) = db_or_skip("constraints").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target

@@ -40,6 +40,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::gates;
 use crate::support::{self, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use arrow_flight::Ticket;
@@ -62,17 +63,21 @@ use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::WarehouseState;
 use lldb_qe_core::{DEFAULT_WAREHOUSE_ENDPOINT, flight};
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "auth_rbac";
+
 /// Workers standing behind each tenant's warehouse.
 const WAREHOUSE_SIZE: i32 = 1;
 
 /// Skip-or-connect, shared by every test in this file.
-pub(crate) async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+///
+/// Takes the caller's suite name rather than reading `module_path!()` here: `cache_grant_ordering`
+/// borrows this helper, and a report that attributed its skip to `auth_rbac` would name a suite
+/// that is not the one that failed to run.
+pub(crate) async fn db_or_skip(suite: &str) -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP ({what}): set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a \
-             Docker daemon, to exercise authentication and RBAC"
-        );
+        gates::skip(suite, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;
@@ -372,7 +377,7 @@ fn scalar(batches: &[RecordBatch]) -> Result<i64> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn unauthenticated_is_rejected_and_authenticated_is_scoped_to_its_account() -> Result<()> {
-    let Some((db, target)) = db_or_skip("authentication").await? else {
+    let Some((db, target)) = db_or_skip(SUITE).await? else {
         return Ok(());
     };
     let url = target
@@ -515,7 +520,7 @@ async fn authentication_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_role_without_select_cannot_query_until_the_grant_is_added() -> Result<()> {
-    let Some((db, target)) = db_or_skip("grants").await? else {
+    let Some((db, target)) = db_or_skip(SUITE).await? else {
         return Ok(());
     };
     let url = target
@@ -660,7 +665,7 @@ async fn grant_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_accounts_cannot_see_or_query_each_others_objects() -> Result<()> {
-    let Some((db, target)) = db_or_skip("tenant isolation").await? else {
+    let Some((db, target)) = db_or_skip(SUITE).await? else {
         return Ok(());
     };
     let url = target
@@ -949,7 +954,7 @@ async fn a_worker_with_a_fleet_secret_serves_only_the_fleet() -> Result<()> {
 /// means it got past identity.
 #[tokio::test]
 async fn a_malformed_credential_is_refused_even_when_anonymous_is_allowed() -> Result<()> {
-    let Some((db, _target)) = db_or_skip("anonymous").await? else {
+    let Some((db, _target)) = db_or_skip(SUITE).await? else {
         return Ok(());
     };
 

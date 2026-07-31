@@ -18,8 +18,8 @@
 //!
 //! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is (CI's service container, or a local server).
 //! 2. **`LLDB_DOCKER=1`** — start a throwaway `postgres:18.4-alpine`, remove it afterwards.
-//! 3. **Neither** — print why and pass. `cargo test --workspace` on a laptop with no Postgres
-//!    and no Docker stays green.
+//! 3. **Neither** — report the skip (`support::gates`) and pass. `cargo test --workspace` on a
+//!    laptop with no Postgres and no Docker stays green.
 //!
 //! Safe to rerun and to run concurrently with itself: the Iceberg catalog name is suffixed with
 //! a pid + nanoseconds, and `iceberg_tables` is keyed by `(catalog_name, namespace, table)`, so
@@ -44,8 +44,11 @@ use lldb_qe_core::manifest::{
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
+use crate::support::gates;
 use crate::support::{Cleanup, DbCleanup};
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "shared_sql_catalog";
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -55,7 +58,7 @@ const NS: &str = "sales";
 
 /// How the test got its database — and, for the container case, what to tear down.
 enum Target {
-    /// Nothing available; the test prints a skip and passes.
+    /// Nothing available; the caller reports a skip through `support::gates` and passes.
     Skipped,
     /// A URL supplied by the environment. Not ours, so we touch only our own rows.
     Provided(String),
@@ -271,10 +274,7 @@ async fn insert_rows(ctx: &SessionContext, catalog: &str, table: &str, values: &
 async fn two_workers_share_one_catalog() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise the shared SQL catalog"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 

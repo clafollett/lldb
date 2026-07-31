@@ -12,6 +12,11 @@ use lldb_qe_core::manifest::{CatalogDef, Manifest, NamespaceDef, TableDef, Table
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 
+use crate::support::gates;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "iceberg_roundtrip";
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
@@ -60,10 +65,7 @@ fn scalar_i64(batches: &[datafusion::arrow::record_batch::RecordBatch]) -> i64 {
 async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
     let nation = sf1("nation");
     if !nation.exists() {
-        eprintln!(
-            "SKIP: no data at {} — run ./scripts/bootstrap.sh",
-            nation.display()
-        );
+        gates::skip(SUITE, &gates::TPCH_DATA);
         return Ok(());
     }
 
@@ -105,7 +107,7 @@ async fn nation_roundtrips_through_iceberg() -> anyhow::Result<()> {
 async fn lineitem_group_by_through_iceberg() -> anyhow::Result<()> {
     let lineitem = sf1("lineitem");
     if !lineitem.exists() {
-        eprintln!("SKIP: no data — run ./scripts/bootstrap.sh");
+        gates::skip(SUITE, &gates::TPCH_DATA);
         return Ok(());
     }
 

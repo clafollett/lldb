@@ -57,8 +57,8 @@
 //!
 //! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is (CI's service container, or a local server).
 //! 2. **`LLDB_DOCKER=1`** — start a throwaway `postgres:18.4-alpine`, remove it afterwards.
-//! 3. **Neither** — print why and pass. `cargo test --workspace` with no Postgres and no Docker
-//!    stays green.
+//! 3. **Neither** — report the skip (`support::gates`) and pass. `cargo test --workspace` with no
+//!    Postgres and no Docker stays green.
 //!
 //! Safe to rerun and to run concurrently with itself: the accounts and the Iceberg catalog name
 //! are suffixed with a pid + nanoseconds, and every row it creates is deleted at the end. It
@@ -90,8 +90,11 @@ use lldb_qe_core::{
 };
 use tokio::net::TcpListener;
 
+use crate::support::gates;
 use crate::support::{Cleanup, DbCleanup, Servers};
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "result_cache_db";
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -104,7 +107,7 @@ const WORKERS: usize = 2;
 
 /// How the test got its database — and, for the container case, what to tear down.
 enum Target {
-    /// Nothing available; the test prints a skip and passes.
+    /// Nothing available; the caller reports a skip through `support::gates` and passes.
     Skipped,
     /// A URL supplied by the environment. Not ours, so we touch only our own rows.
     Provided(String),
@@ -384,10 +387,7 @@ pub(crate) async fn insert_rows(ctx: &SessionContext, catalog: &str, values: &st
 async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise the result cache"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 
@@ -660,7 +660,7 @@ async fn a_repeat_query_is_served_from_cache_and_a_write_invalidates_it() -> Res
 async fn ttl_and_the_per_tenant_bound_evict_without_affecting_answers() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!("SKIP: no Postgres (see LLDB_TEST_POSTGRES_URL / LLDB_DOCKER)");
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 
