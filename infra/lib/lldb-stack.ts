@@ -441,9 +441,10 @@ export class LldbStack extends cdk.Stack {
     // only, and the coordinator's execution role is never granted it.
     //
     // The PEM travels as `LLDB_TLS_*_PEM` rather than as a path because ECS resolves a secret into
-    // an environment variable and offers no way to put one on a filesystem. `crates/lldb-qe-core/
-    // src/tls.rs` accepts either spelling for exactly this reason; compose and a laptop still use
-    // files. Note what does NOT appear anywhere below: `LLDB_ALLOW_PLAINTEXT`. Encrypting this
+    // an environment variable and offers no way to put one on a filesystem.
+    // `crates/lldb-qe-control/src/tls.rs` accepts either spelling for exactly this reason; compose
+    // and a laptop still use files. Note what does NOT appear anywhere below:
+    // `LLDB_ALLOW_PLAINTEXT`. Encrypting this
     // traffic is the point, and the escape hatch that disarms the engine's guard is not something
     // a stack sets on the way past (`infra/test/lldb-stack.test.ts` asserts its absence in *both*
     // modes).
