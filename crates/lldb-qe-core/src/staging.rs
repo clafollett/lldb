@@ -318,9 +318,9 @@ fn distribute_shuffle_seam(
         let inputs = children
             .iter()
             .map(|child| remote(workers, worker, i as u32, Arc::clone(child)))
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         let stage = Arc::clone(node).with_new_children(inputs)?;
-        leaves.push(remote(workers, worker, 0, single_partition(stage)));
+        leaves.push(remote(workers, worker, 0, single_partition(stage))?);
     }
     Ok(Some(UnionExec::try_new(leaves)?))
 }
@@ -398,13 +398,13 @@ fn distribute_broadcast_join(
     };
 
     // One `Arc`, shared by every join stage: identical bytes, one stage id, one materialization.
-    let build_leaf = remote(workers, &workers[0], 0, single_partition(build));
+    let build_leaf = remote(workers, &workers[0], 0, single_partition(build))?;
 
     let mut leaves = Vec::with_capacity(probe_stages.len());
     for (worker, probe_slice) in probe_stages {
         let stage =
             Arc::clone(node).with_new_children(vec![Arc::clone(&build_leaf), probe_slice])?;
-        leaves.push(remote(workers, &worker, 0, single_partition(stage)));
+        leaves.push(remote(workers, &worker, 0, single_partition(stage))?);
     }
     Ok(Some(UnionExec::try_new(leaves)?))
 }
@@ -476,7 +476,7 @@ fn distribute_aggregate(
             .into_iter()
             .zip(workers)
             .map(|(slice, worker)| remote(workers, worker, 0, single_partition(slice)))
-            .collect();
+            .collect::<Result<_>>()?;
         return Ok(Some(UnionExec::try_new(leaves)?));
     }
 
@@ -484,7 +484,7 @@ fn distribute_aggregate(
         let leaves: Vec<Arc<dyn ExecutionPlan>> = stages
             .into_iter()
             .map(|(worker, stage)| remote(workers, &worker, 0, single_partition(stage)))
-            .collect();
+            .collect::<Result<_>>()?;
         return Ok(Some(UnionExec::try_new(leaves)?));
     }
 
@@ -541,7 +541,7 @@ fn distribute_sort(
     let leaves: Vec<Arc<dyn ExecutionPlan>> = stages
         .into_iter()
         .map(|(worker, stage)| remote(workers, &worker, 0, merge_sorted(stage, sort)))
-        .collect();
+        .collect::<Result<_>>()?;
     let union = UnionExec::try_new(leaves)?;
     Ok(Some(Arc::clone(node).with_new_children(vec![union])?))
 }
@@ -650,19 +650,24 @@ fn is_partition_wise(node: &Arc<dyn ExecutionPlan>) -> bool {
 /// query, and threading the fleet through each rule separately would mean a rule added later
 /// silently loses reassignment. `worker`'s position in `workers` sets where the rotation starts —
 /// see [`failover_targets`] for why the list is rotated rather than always beginning at worker 0.
+///
+/// # Errors
+/// If `partition` is not a partition of `plan` — a bug in the rule that asked for it, raised here on
+/// the coordinator rather than discovered by a worker that has already materialized the stage. See
+/// [`crate::remote`]'s header.
 fn remote(
     workers: &[String],
     worker: &str,
     partition: u32,
     plan: Arc<dyn ExecutionPlan>,
-) -> Arc<dyn ExecutionPlan> {
+) -> Result<Arc<dyn ExecutionPlan>> {
     let primary = workers.iter().position(|w| w == worker).unwrap_or(0);
-    Arc::new(FlightReaderExec::with_fallbacks(
+    Ok(Arc::new(FlightReaderExec::with_fallbacks(
         worker,
         failover_targets(workers, primary),
         partition,
         plan,
-    ))
+    )?))
 }
 
 /// The rest of the fleet, as ordered failover targets for a stage whose primary is

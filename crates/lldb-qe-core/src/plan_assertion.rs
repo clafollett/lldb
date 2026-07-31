@@ -1057,11 +1057,9 @@ mod tests {
         // A `FlightReaderExec` reports no children on purpose — its sub-plan runs elsewhere — so a
         // plain tree walk would miss the files a worker is about to be asked to read. If this ever
         // regresses, every worker-to-worker pull is refused as uncovered.
-        let staged: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(
-            "http://w:50051",
-            0,
-            Arc::clone(&remote),
-        ));
+        let staged: Arc<dyn ExecutionPlan> = Arc::new(
+            FlightReaderExec::new("http://w:50051", 0, Arc::clone(&remote)).expect("stage leaf"),
+        );
         assert!(staged.children().is_empty(), "test premise");
 
         let reads = plan_reads(&staged);
