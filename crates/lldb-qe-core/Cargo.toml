@@ -39,6 +39,7 @@ sha2.workspace = true
 hmac.workspace = true
 subtle.workspace = true
 base64.workspace = true
+ring.workspace = true
 # `rustls`, `hex`, `rand` and `tracing-subscriber` left with the control plane (`tls`, `auth`,
 # `liveness`, `config`) and nothing in this crate reaches for them any more.
 # `tracing-subscriber` stays below as a dev-dependency: one integration test still installs one.
