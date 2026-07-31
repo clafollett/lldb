@@ -9,6 +9,11 @@ authors.workspace = true
 description = "Core library for lldb: storage abstraction, session/catalog setup, and execution nodes."
 
 [dependencies]
+# The control plane, DataFusion-free, one crate down. `lldb-qe-core` depends on it directly —
+# stacked, not siblings, and deliberately with zero port traits: the dependency graph is acyclic
+# once `rbac`'s vocabulary and `StorageConfig` live in `lldb-qe-types`, so an abstraction to invert
+# it would buy nothing but indirection. See issue #72.
+lldb-qe-control = { path = "../lldb-qe-control" }
 lldb-qe-types = { path = "../lldb-qe-types" }
 datafusion.workspace = true
 datafusion-proto.workspace = true
@@ -20,12 +25,10 @@ object_store.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
 tonic.workspace = true
-rustls.workspace = true
 futures.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
 url.workspace = true
 serde.workspace = true
 toml.workspace = true
@@ -35,9 +38,10 @@ chrono.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 subtle.workspace = true
-hex.workspace = true
-rand.workspace = true
 base64.workspace = true
+# `rustls`, `hex`, `rand` and `tracing-subscriber` left with the control plane (`tls`, `auth`,
+# `liveness`, `config`) and nothing in this crate reaches for them any more.
+# `tracing-subscriber` stays below as a dev-dependency: one integration test still installs one.
 
 [dev-dependencies]
 tokio.workspace = true

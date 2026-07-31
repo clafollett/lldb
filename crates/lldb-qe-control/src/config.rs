@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Args;
 
-// Straight from `lldb_qe_types`, deliberately NOT via `crate::storage` — that module re-exports
+// Straight from `lldb_qe_types`, deliberately NOT via `lldb_qe_core::storage` — that module re-exports
 // this type but also builds live `object_store` backends, and parsing four clap args must not
 // need one. Same rule as `crate::auth`'s `rbac` imports.
 use lldb_qe_types::storage::StorageConfig;

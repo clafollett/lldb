@@ -63,7 +63,9 @@ Writes are not distributed at all: the coordinator commits them itself.
 
 | Crate | Role |
 | - | - |
-| `lldb-qe-core` | Storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, staging planner, services-DB layer, scheduler, access control |
+| `lldb-qe-types` | The vocabulary — privileges and grants, the storage declaration. No datafusion / arrow / iceberg / parquet / object_store / sqlx |
+| `lldb-qe-control` | The control plane — services DB and migrations, accounts and API keys, warehouses, discovery, admission, cancellation, query history, liveness, the reaper, TLS, tenancy. Postgres, no query engine |
+| `lldb-qe-core` | The query engine — storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, staging planner, result cache, the plan-time grant check, and `server.rs`, which wires the control plane to the engine |
 | `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds the operator binaries below |
 | `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
 
@@ -84,7 +86,7 @@ warehouses and query history are facts the whole fleet has to agree on while it 
 they live in a shared PostgreSQL database rather than in any one process's memory.
 
 Schema changes are migrations checked into
-[`crates/lldb-qe-core/migrations/`](crates/lldb-qe-core/migrations/), embedded into the binaries
+[`crates/lldb-qe-control/migrations/`](crates/lldb-qe-control/migrations/), embedded into the binaries
 at compile time and applied by an explicit one-shot — `lldb-qe-migrate` — never on startup. A
 rolling fleet must not race to apply the same DDL.
 

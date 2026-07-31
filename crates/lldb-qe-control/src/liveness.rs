@@ -49,7 +49,7 @@
 //! # Decision 2 — how it renews, and what a failed renewal does to the process
 //!
 //! A background task renews on a fixed interval with a conditional `UPDATE ... WHERE slot = $1 AND
-//! incarnation = $2` — the same CAS shape [`crate::dml`] commits a snapshot with, for the same
+//! incarnation = $2` — the same CAS shape `lldb_qe_core::dml` commits a snapshot with, for the same
 //! reason: one row, one serialization point, and the loser learns it lost from `rows_affected == 0`
 //! rather than from an error.
 //!
@@ -60,7 +60,7 @@
 //!   worth arguing about. Refusing to serve would convert every control-plane hiccup into a
 //!   data-plane outage, in a codebase whose standing rule is the opposite: history writes after
 //!   acceptance are best effort so "a query that is already executing must not be killed because the
-//!   services database hiccuped" ([`crate::server::Coordinator::run_query`]), and the result cache's
+//!   services database hiccuped" (`lldb_qe_core::server::Coordinator::run_query`), and the result cache's
 //!   rule is that not caching is always a legal answer. Continuing is not free, and the honest cost
 //!   is named rather than hidden: past the threshold this coordinator's rows *may* be concluded dead
 //!   by whoever reads this table, so [`CoordinatorRegistration::is_stale`] goes true and the log

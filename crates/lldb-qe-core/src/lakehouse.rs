@@ -35,7 +35,7 @@
 //! `SqlCatalog::new` issues `CREATE TABLE IF NOT EXISTS` for `iceberg_tables` and
 //! `iceberg_namespace_properties` every time a catalog is opened. Those two tables are
 //! `iceberg-catalog-sql`'s, not ours, so they deliberately do **not** appear in
-//! `crates/lldb-qe-core/migrations/` — our migrations own the services schema (accounts, users,
+//! `crates/lldb-qe-control/migrations/` — our migrations own the services schema (accounts, users,
 //! warehouses, queries) and nothing else. Two owners for one table is how a schema ends up
 //! half-migrated. The bootstrap is idempotent, which is why this one is allowed to be startup
 //! magic when [`crate::services::ServicesDb`] is not: `IF NOT EXISTS` on a fixed two-table schema

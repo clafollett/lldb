@@ -68,7 +68,7 @@
 //!
 //! A lease is released by a `DELETE` issued from [`crate::scheduler::QuerySlot`]'s destructor, and a
 //! destructor cannot await one — so it is handed to the runtime, which makes it **best effort**,
-//! exactly like every other write this codebase issues from a `Drop` ([`crate::server`]'s
+//! exactly like every other write this codebase issues from a `Drop` (`lldb_qe_core::server`'s
 //! `ActiveQuery` is the precedent). Two consequences had to be designed for rather than hoped about,
 //! because a leased slot that is *not* released is strictly worse than the per-process bug this
 //! replaced: it shrinks a warehouse permanently instead of enlarging it.
@@ -519,7 +519,7 @@ impl FleetGate for FleetAdmission {
         let holder = self.identity.incarnation().to_string();
         let slot = self.identity.slot().to_string();
 
-        // `Handle::try_current` rather than a bare `tokio::spawn`, for `crate::server`'s
+        // `Handle::try_current` rather than a bare `tokio::spawn`, for `lldb_qe_core::server`'s
         // `ActiveQuery` reason: dropping a guard after the runtime has gone (shutdown, a test)
         // would otherwise panic inside a destructor. A process that is exiting is also one whose
         // registration is about to stop renewing, so the rows it leaves behind become claimable on

@@ -5,14 +5,14 @@
 //! catalog was the exception: `iceberg_tables` and `iceberg_namespace_properties` are created and
 //! owned by `iceberg-catalog-sql`, carry no account column, and every tenant on a deployment shared
 //! one catalog namespace. Isolation over table data therefore rested on the plan-time grant check
-//! in [`crate::rbac`] and on nothing else — a check, where everywhere else there was a constraint.
+//! in [`lldb_qe_types::rbac`] and on nothing else — a check, where everywhere else there was a constraint.
 //!
 //! A [`TenantScope`] closes that by giving each account its **own catalog and its own warehouse
 //! root**. Two knobs, and the important thing about them is that they are *not* independent:
 //!
 //! 1. **The catalog name partitions the database.** `catalog_name` is already the leading
 //!    primary-key column of both of `iceberg-catalog-sql`'s tables, and every statement that crate
-//!    issues carries `WHERE catalog_name = ?` — as does our own pointer swap in [`crate::dml`]. So
+//!    issues carries `WHERE catalog_name = ?` — as does our own pointer swap in `lldb_qe_core::dml`. So
 //!    a distinct catalog name per account buys row separation with no schema change at all. The
 //!    "tenant column `iceberg-catalog-sql` does not have" turned out to exist already, under
 //!    another name.
@@ -46,10 +46,10 @@
 //! separate their *access*, and the difference matters:
 //!
 //! - A **coordinator** only ever registers one account's catalogs into that account's session (see
-//!   [`crate::engine::TenantSessions`]), so a query cannot name another tenant's catalog — not
+//!   `lldb_qe_core::engine::TenantSessions`), so a query cannot name another tenant's catalog — not
 //!   because a check refuses it, but because the name does not resolve. That is the improvement.
 //! - A **worker** is a different story. Since resolved Iceberg scans name data files by absolute
-//!   path (see [`crate::iceberg_scan`]), a worker reads warehouse files with its own credentials
+//!   path (see `lldb_qe_core::iceberg_scan`), a worker reads warehouse files with its own credentials
 //!   and has no idea whose they are. Any worker that can read tenant A's plan can read tenant B's
 //!   files if it is handed a plan naming them. Per-request identity at the worker boundary is a
 //!   separate piece of work; until it lands, worker ports stay on a private network and the fleet
@@ -104,8 +104,8 @@ impl TenantScope {
     ///
     /// **This is not the name SQL uses.** A tenant's session registers the catalog under its
     /// declared name, so a query still reads `FROM lldb.sales.orders` whichever tenant runs it —
-    /// see [`crate::lakehouse::Lakehouse::catalog_name`] versus
-    /// [`crate::lakehouse::Lakehouse::iceberg_catalog_name`]. Putting the account id only in the
+    /// see `lldb_qe_core::lakehouse::Lakehouse::catalog_name` versus
+    /// `lldb_qe_core::lakehouse::Lakehouse::iceberg_catalog_name`. Putting the account id only in the
     /// storage-facing name is what keeps a query portable between tenants while still giving each
     /// of them its own rows: two accounts' `lldb` catalogs are two different catalogs that happen
     /// to answer to the same word inside their own sessions.

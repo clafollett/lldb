@@ -43,6 +43,24 @@
 //! `object_store` to be defined. That lives in [`lldb_qe_types`] and is re-exported from
 //! [`rbac`] and [`storage`] here, so every path that already worked still does.
 //!
+//! ## The control plane is a crate, not a set of modules
+//!
+//! Thirteen of the rows in that table — [`auth`], [`cancel`], [`config`], [`discovery`],
+//! [`fleet_admission`], [`liveness`], [`query_log`], [`reaper`], [`scheduler`], [`services`],
+//! [`tenancy`], [`tls`] and [`warehouse`] — live in [`lldb_qe_control`] and are **re-exported
+//! here unchanged**, so `lldb_qe_core::auth::…` and every other existing path still resolves.
+//!
+//! The split is a build fact rather than a taste one: none of those modules needs DataFusion,
+//! Arrow, Iceberg or parquet, and while they sat in this crate, editing `scheduler.rs` recompiled
+//! `staging.rs` — twice, because a `#[cfg(test)]` build is a second compilation unit. What it buys
+//! is the operator one-shots (`lldb-qe-migrate`, `lldb-qe-warehouse`, `lldb-qe-auth`,
+//! `lldb-qe-reap`) linking a DataFusion-free crate, and a control-plane test binary that runs
+//! without waiting on a query engine to build.
+//!
+//! [`server`] is the exception that proves the boundary. It imports eight control-plane modules
+//! because it is the **composition root** — the thing that wires a control plane to an execution
+//! engine — and that belongs above both halves, which is here.
+//!
 //! Its counterpart above the storage layer, and the reason a worker can be as thin as it is:
 //! **a plan is self-contained.** Everything a worker needs to answer its stage travels inside the
 //! plan bytes — file paths, byte ranges, and, since [`iceberg_scan`], the data files of the exact
@@ -56,48 +74,40 @@
 //! own file scans sit inside those locations.
 
 /// This crate's semantic version (from `Cargo.toml`, unified across the workspace).
-pub const VERSION: &str = env!("CARGO_PKG_VERSION");
-/// The git commit this build was cut from — a 12-char short SHA, or `unknown`. Injected by
-/// `build.rs` from `$LLDB_GIT_SHA` (Docker) or `git` (local).
-pub const GIT_SHA: &str = env!("LLDB_GIT_SHA");
-/// Full build identifier `"<version>+<sha>"`. This is what a running coordinator/worker reports
-/// (via `--version` and a startup log line) so an operator can confirm the whole fleet is the
-/// identical build — the precondition for shipping serialized DataFusion plans between them.
-pub const BUILD_VERSION: &str = env!("LLDB_BUILD_VERSION");
+///
+/// Stamped by `lldb-qe-control`'s build script and re-exported, so every existing
+/// `lldb_qe_core::VERSION` / `GIT_SHA` / `BUILD_VERSION` path still resolves.
+pub use lldb_qe_control::{BUILD_VERSION, GIT_SHA, VERSION};
 
-pub mod auth;
-pub mod cancel;
+// The control plane, one crate down: it needs none of DataFusion, Arrow, Iceberg or parquet, and
+// the whole point of the split is that it does not link them. Re-exported as modules rather than
+// re-listed item by item so `lldb_qe_core::auth::…` and `crate::auth::…` both keep working
+// unchanged — the binaries, the benches and the integration suite were not touched by the move.
+pub use lldb_qe_control::{
+    auth, cancel, config, discovery, fleet_admission, liveness, query_log, reaper, scheduler,
+    services, tenancy, tls, warehouse,
+};
+
 pub mod catalog;
-pub mod config;
-pub mod discovery;
 pub mod distributed;
 pub mod dml;
 pub mod engine;
-pub mod fleet_admission;
 pub mod flight;
 pub mod iceberg_scan;
 pub mod lakehouse;
-pub mod liveness;
 pub mod manifest;
 pub mod plan_assertion;
-pub mod query_log;
 pub mod rbac;
-pub mod reaper;
 pub mod remote;
 pub mod result_cache;
 pub mod retry;
 pub mod scan_split;
-pub mod scheduler;
 pub mod server;
-pub mod services;
 pub mod session;
 pub mod stage_cache;
 pub mod staging;
 pub mod storage;
-pub mod tenancy;
-pub mod tls;
 pub mod tpch;
-pub mod warehouse;
 
 pub use auth::{ApiKey, AuthError, FleetAuth, NewToken, Principal, Role, User};
 pub use cancel::{CANCEL_ACTION, Cancellation, QueryRegistry, RunningQuery};

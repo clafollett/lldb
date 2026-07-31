@@ -1,9 +1,14 @@
-# `lldb-qe-core` — the subsystems, and why each is shaped the way it is
+# `lldb-qe-core` / `lldb-qe-control` — the subsystems, and why each is shaped the way it is
 
 Loaded when a session works under `crates/lldb-qe-core/`. It holds the per-subsystem design
 rationale that used to sit in the root `CLAUDE.md` and cost every session ~8.8k tokens whether or
 not it was touching this crate. The root file keeps what is genuinely cross-cutting — the version
 wall, the workflow, the layout, the build profile, the testing bar, and the non-negotiables digest.
+
+**Half of what follows now lives in `crates/lldb-qe-control/`** — the control plane, the services
+DB, access control, TLS, tenancy, liveness, cancellation, the reaper and fleet-wide admission — and
+this file does **not** load automatically for a session working there. Read it explicitly before
+changing any of those. The arguments are unchanged by the move; only the crate boundary is new.
 
 **These sections argue for the shapes the code already has.** They are not a tour of the code; the
 module docs are that, in more detail. Read a section before changing the subsystem it describes,
@@ -101,7 +106,7 @@ immutable or deliberately per-process. **Control-plane** state — accounts, the
 warehouses, query history — is neither, so it lives in the services database (`services.rs`),
 where transactions and constraints arbitrate instead of hope. Two rules:
 
-1. **Schema changes are migrations** in `crates/lldb-qe-core/migrations/`, embedded at compile
+1. **Schema changes are migrations** in `crates/lldb-qe-control/migrations/`, embedded at compile
    time by `sqlx::migrate!` and applied only by `lldb-qe-migrate`. Coordinators and workers never
    migrate — a rolling fleet racing the same DDL is a production footgun.
 2. **An unconfigured services DB is legal.** `ServicesArgs::connect` returns `None`, and

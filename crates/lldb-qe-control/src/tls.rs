@@ -14,7 +14,7 @@
 //! the binaries themselves. Not an ALB, not a service mesh, not a sidecar — and that is a decision
 //! about *this* system's traffic rather than a preference. The whole transport is gRPC, and
 //! workers talk to **each other** directly: a reduce stage pulls its map stages worker-to-worker
-//! (see [`crate::remote`]), so the fleet is a mesh, not a fan-in behind one door. A single
+//! (see `lldb_qe_core::remote`), so the fleet is a mesh, not a fan-in behind one door. A single
 //! terminating front door would encrypt the client→coordinator hop and leave every
 //! coordinator→worker and worker→worker hop — the ones carrying the fleet secret and the plan
 //! bytes — in the clear. There is therefore no "or terminate in front" mode here, and adding one
@@ -32,11 +32,11 @@
 //!
 //! # The rule: a plaintext port is opt-in exactly when a credential is checked on it
 //!
-//! [`crate::server`]'s `--allow-anonymous` is the idiom this copies — default secure, explicit
+//! `lldb_qe_core::server`'s `--allow-anonymous` is the idiom this copies — default secure, explicit
 //! opt-in to insecure, a loud warning on every startup for as long as it is set. But the *analogue*
 //! of that idiom is not "TLS is on unless you said otherwise": that would make `cargo run` require
 //! certificates, which CLAUDE.md forbids in the same breath it forbids `cargo run` requiring
-//! Postgres. Nor is it "warn and carry on", which is what the disclosure in [`crate::server`]'s
+//! Postgres. Nor is it "warn and carry on", which is what the disclosure in `lldb_qe_core::server`'s
 //! module docs already was.
 //!
 //! The rule this implements is narrower and, I think, exactly right:
@@ -74,7 +74,7 @@
 //!   its own decision and is still open (issue #32). Nothing here makes `LLDB_FLEET_TOKEN`
 //!   redundant: it is unchanged, still required when set, and still the only thing proving a caller
 //!   belongs to this deployment.
-//! - **Per-request identity at the worker boundary.** Closed by [`crate::plan_assertion`], not by
+//! - **Per-request identity at the worker boundary.** Closed by `lldb_qe_core::plan_assertion`, not by
 //!   anything here: TLS stops observation, an assertion stops a valid-but-unauthorized plan, and the
 //!   two are complementary. What TLS contributes is that the assertion — which is authorization-
 //!   bearing for as long as it is live — is no longer readable off the wire by anyone on the path.
@@ -428,7 +428,7 @@ impl ClientTrust {
     pub async fn dial(&self, url: &str) -> Result<Channel> {
         // `Channel::from_shared`, not `Endpoint::from_shared`, and the difference is load-bearing
         // rather than stylistic: the former hands back `http::uri::InvalidUri` while the latter
-        // wraps it in a `tonic::transport::Error`, which [`crate::retry::classify`] reads as
+        // wraps it in a `tonic::transport::Error`, which `lldb_qe_core::retry::classify` reads as
         // *transport loss* and would therefore replay a malformed URL against every worker in the
         // fleet. See the caveat in that module. (It returns an `Endpoint` either way.)
         let endpoint =
@@ -449,9 +449,9 @@ impl ClientTrust {
 
 /// This process's dialing trust, shared by every outgoing Flight call.
 ///
-/// Ambient for exactly the reason [`crate::flight::ambient_fleet_auth`] is, and the argument is
+/// Ambient for exactly the reason `lldb_qe_core::flight::ambient_fleet_auth` is, and the argument is
 /// worth repeating because it is the one that rules out the obvious alternative: a
-/// [`FlightReaderExec`] is **serialized into a plan** and re-executed on a worker for
+/// `FlightReaderExec` is **serialized into a plan** and re-executed on a worker for
 /// worker-to-worker exchange, so a per-call TLS config would either have to travel inside those
 /// plan bytes — where it would be content-hashed into a stage id and cached — or be absent exactly
 /// where worker-to-worker pulls need it. A process-wide setting configured from that process's own
@@ -463,7 +463,6 @@ impl ClientTrust {
 /// rather than assuming: **it is consulted only for `https://` URLs**, so installing a CA changes
 /// nothing for any caller dialing `http://`. See `tests/integration/main.rs`.
 ///
-/// [`FlightReaderExec`]: crate::remote::FlightReaderExec
 fn ambient() -> &'static RwLock<ClientTrust> {
     static AMBIENT: OnceLock<RwLock<ClientTrust>> = OnceLock::new();
     AMBIENT.get_or_init(|| RwLock::new(ClientTrust::default()))
