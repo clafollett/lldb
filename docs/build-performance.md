@@ -20,6 +20,17 @@ one, and says so at length, because a table of numbers from two machines is wors
 `CARGO_INCREMENTAL` — they are the committed profile by another route, and a build whose profile
 differs from the previous one invalidates the whole target directory. See CLAUDE.md.
 
+**Check that the build stamp fingerprints in the layout you are measuring in — the layout is part
+of the protocol.** `lldb-qe-control/build.rs` tells cargo which files must change before it re-runs,
+and cargo treats a `rerun-if-changed` path that does *not* exist as permanently stale. Until issue
+#87 that path was a hard-coded `../../.git/HEAD`, which does not exist in a linked git worktree
+(`.git` is a file there), so the crate and everything downstream recompiled on every invocation: a
+no-op `cargo build --workspace` cost **18.7 s in a worktree versus 0.19 s after the fix**, on the
+same box in the same session. Any warm number taken in a worktree before that fix was measuring the
+bug, and cannot be compared with one taken in a clone. The cheap check before trusting a warm run:
+two consecutive no-op builds, and the second must recompile nothing —
+`CARGO_LOG=cargo::core::compiler::fingerprint=info` names the culprit when it does.
+
 ## Baseline (`main` at 265f2af, no `.cargo/config.toml`)
 
 The warm-cycle rows are the ones that matter: the edit-test loop pays them, and dependencies are
