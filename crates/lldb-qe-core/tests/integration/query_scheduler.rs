@@ -77,7 +77,7 @@ use lldb_qe_core::liveness::{
 };
 use lldb_qe_core::query_log::{QueryRecord, QueryState, peak_concurrency};
 use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
-use lldb_qe_core::scheduler::FleetLease;
+use lldb_qe_core::scheduler::{FleetGate, FleetLease};
 use lldb_qe_core::server::{
     Coordinator, CoordinatorConfig, QueryRequest, serve_coordinator, submit_query_as,
 };
@@ -92,6 +92,23 @@ const SUBMISSIONS: usize = 12;
 /// Workers behind the warehouse — and therefore, since the limit is sized from the warehouse's
 /// row, the concurrency limit `K`. Chosen `< SUBMISSIONS` so the queue is forced to engage.
 const WAREHOUSE_SIZE: i32 = 2;
+
+/// How long any wait-for-an-asynchronous-state-change loop in this file runs before giving up.
+///
+/// Two writes here cannot be observed synchronously, and both are issued from a destructor that
+/// cannot await: `server::ActiveQuery`'s terminal history row, and `FleetAdmission::release`'s
+/// `DELETE` of the fleet lease. One bound covers both — a second constant sized from a different
+/// worst case is a second thing to get wrong, and `query_cancel.rs` spells this same number for
+/// this same reason.
+///
+/// Deliberately generous, and the generosity costs nothing: every loop exits the instant the state
+/// it wants appears, so this bound is only ever reached on a genuine failure. It is sized for the
+/// worst case that actually happens — `cargo test --workspace` runs this binary alongside two dozen
+/// others on a saturated machine, and a spawned write has to be *scheduled* before it can even
+/// begin its database round trip. A tight bound here would produce a test that fails under load and
+/// passes alone, which is worse than having no test at all — and a fixed `sleep` of any length is
+/// that same mistake with the failure hidden behind whichever constant was picked.
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Skip-or-connect, shared by every test in this file. Returns `None` when there is no database,
 /// having already reported it (`support::gates`).
@@ -185,6 +202,11 @@ struct Node {
     coordinator: Arc<Coordinator>,
     /// What this process writes into `queries.coordinator`.
     slot: String,
+    /// This node's half of the fleet-wide gate, kept so a failure can be *described*. Its counters
+    /// tell the two halves of a slot that never came back apart: `released` short of `granted` is a
+    /// `DELETE` that was never issued, `leaked` non-zero is one that was issued and failed. See
+    /// [`wait_for_every_slot_to_come_back`].
+    fleet: Arc<FleetAdmission>,
     _registration: CoordinatorRegistration,
 }
 
@@ -306,6 +328,9 @@ impl Harness {
             )
             .await?;
             let fleet = FleetAdmission::for_registration(db.clone(), &registration);
+            // The coordinator takes the gate as a trait object; the node below keeps the concrete
+            // `FleetAdmission`, whose counters are what describe a slot that never came back.
+            let gate: Arc<dyn FleetGate> = fleet.clone();
 
             let coordinator = Arc::new(
                 Coordinator::new(
@@ -328,7 +353,7 @@ impl Harness {
                     },
                 )
                 .with_resolver(cloud_map(authority.clone(), workers.clone()))
-                .with_fleet_admission(fleet),
+                .with_fleet_admission(gate),
             );
 
             let serving = Arc::clone(&coordinator);
@@ -342,6 +367,7 @@ impl Harness {
                 url: format!("http://{addr}"),
                 coordinator,
                 slot: identity.slot().to_string(),
+                fleet,
                 _registration: registration,
             });
         }
@@ -829,16 +855,6 @@ async fn a_query_abandoned_by_its_client_is_closed_out_rather_than_left_active()
     abandonment_body(&harness).await
 }
 
-/// How long the abandonment test will wait for an asynchronous state change before giving up.
-///
-/// Deliberately generous, and the generosity costs nothing: both waits below exit the instant the
-/// state they want appears, so this bound is only ever reached on a genuine failure. It is sized
-/// for the worst case that actually happens — `cargo test --workspace` runs this binary alongside
-/// two dozen others on a saturated machine, and the guard's terminal write is a spawned task that
-/// has to be scheduled and then make a database round trip. A tight bound here would produce a
-/// test that fails under load and passes alone, which is worse than having no test at all.
-const PATIENCE: std::time::Duration = std::time::Duration::from_secs(60);
-
 async fn abandonment_body(harness: &Harness) -> Result<()> {
     // Hold every permit the warehouse has, so the query below cannot be admitted and parks at the
     // one await that matters. Taken from the coordinator's own gate, keyed by warehouse name, so
@@ -1117,15 +1133,51 @@ async fn fleet_admission_body(harness: &Harness) -> Result<()> {
     );
 
     // Nothing is still holding a warehouse slot in the services database.
-    assert!(
-        harness
-            .db
-            .admission_slots(harness.warehouse_id)
-            .await?
-            .is_empty(),
-        "every fleet-wide slot must be given back when its query ends"
-    );
-    Ok(())
+    wait_for_every_slot_to_come_back(harness).await
+}
+
+/// Wait until no fleet-wide slot on the harness's warehouse is claimed, and fail if that never
+/// happens.
+///
+/// **This is a wait, not a sample, and that is issue #144.** A `QuerySlot` carries the permit *and*
+/// the lease, and gives both back by being dropped. The permit moves synchronously; the lease is a
+/// `DELETE` a destructor cannot await, so `FleetAdmission::release` hands it to the runtime
+/// (fleet-admission decision 4). "Every query has returned" and "every release has landed" are
+/// therefore two different instants, and sampling the table at the first one is a race — one CI run
+/// lost it with every other property of the fleet bound holding, and a 10 ms delay injected into
+/// that spawned task loses it every time.
+///
+/// A fixed `sleep` would be the wrong repair twice over: it would slow the suite by its constant on
+/// every run and still flake on a runner slower than whoever picked it, and it would turn a real
+/// regression in release latency into a test that still passes.
+///
+/// **The table is the instrument, not `FleetAdmission::released()`.** That counter is incremented
+/// for every release whose statement came back without an *error*, including one that matched no
+/// rows because the slot had already been reclaimed — so it can reach the number of grants with a
+/// row still sitting there, which is exactly the leak this assertion exists to catch. The gates'
+/// counters are read only to describe a failure.
+async fn wait_for_every_slot_to_come_back(harness: &Harness) -> Result<()> {
+    let deadline = std::time::Instant::now() + PATIENCE;
+    loop {
+        let held = harness.db.admission_slots(harness.warehouse_id).await?;
+        if held.is_empty() {
+            return Ok(());
+        }
+        // Fails on the deadline rather than waiting forever, so a slot that is genuinely never
+        // given back still reddens — which is the whole point of keeping the assertion.
+        assert!(
+            std::time::Instant::now() < deadline,
+            "every fleet-wide slot must be given back when its query ends, but {} were still \
+             claimed {PATIENCE:?} after the last query returned: {held:?}. Gates: {:?}",
+            held.len(),
+            harness
+                .nodes
+                .iter()
+                .map(|node| &node.fleet)
+                .collect::<Vec<_>>()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
 }
 
 /// **A coordinator killed holding slots does not permanently consume them** — the issue's second
