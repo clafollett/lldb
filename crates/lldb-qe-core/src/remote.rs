@@ -316,12 +316,24 @@ impl ExecutionPlan for FlightReaderExec {
 /// into an error instead of an allocation.
 const MAX_ENCODED_FALLBACKS: u32 = 1024;
 
-/// Wire format version, leading every encoded [`FlightReaderExec`].
+/// Fixed marker every encoded [`FlightReaderExec`] opens with, ahead of the version byte.
+///
+/// A version byte alone would be a *probabilistic* check, which is the wrong guarantee for a field
+/// whose entire job is deterministic diagnosis. The payload that predates versioning began with
+/// `u32 LE url_len`, so its first byte is that length's low byte — and a worker URL of length 1,
+/// 257, 513 … makes it `0x01`, colliding with `FORMAT_VERSION` exactly. Such a payload would clear
+/// the version check and then misparse, failing later with a "truncated url" that points at the
+/// bytes rather than at the fleet. Four bytes no length prefix can spell turn that into a refusal
+/// on the first field, every time.
+const WIRE_MAGIC: &[u8; 4] = b"LLDB";
+
+/// Wire format version, following [`WIRE_MAGIC`] in every encoded [`FlightReaderExec`].
 ///
 /// Bumped whenever the encoding below changes; a decoder refuses anything else rather than guessing,
 /// exactly as [`crate::plan_assertion`] does with its own payload. Note what a mismatch *means*
 /// here: this byte is written and read by the same build, so seeing another value at all says the
-/// two ends of a Flight hop are not the same binary.
+/// two ends of a Flight hop are not the same binary. The magic guards the version's meaning — past
+/// the magic, this byte is known to be a version and not some other field's low byte.
 const FORMAT_VERSION: u8 = 1;
 
 /// Extension codec that teaches `datafusion_proto` about [`FlightReaderExec`].
@@ -329,7 +341,7 @@ const FORMAT_VERSION: u8 = 1;
 /// Wire format:
 ///
 /// ```text
-/// u8 FORMAT_VERSION
+/// WIRE_MAGIC (4 bytes, b"LLDB") | u8 FORMAT_VERSION
 ///   | u32 LE url_len | url | u32 LE remote_partition
 ///   | u32 LE fallback_count | (u32 LE len | url)*
 ///   | serialized inner plan
@@ -338,13 +350,14 @@ const FORMAT_VERSION: u8 = 1;
 /// The fallback list sits **before** the inner plan because the plan is "the rest of the buffer" —
 /// it has no length prefix of its own, so anything variable-length has to precede it.
 ///
-/// There is no backward-compatibility obligation across a bump, and the version byte does not
-/// create one: the coordinator and every worker must run the identical build (`CLAUDE.md`), which
-/// the Flight boundary already requires for DataFusion plan bytes to mean the same thing on both
-/// ends. What the byte buys is the *failure*. Without it a fleet running two builds fed a changed
-/// field layout into an unchanged buffer shape and parsed it into garbage; with it the decode
-/// refuses up front and names both versions, so "your fleet is not one build" is read off the error
-/// rather than inferred from a wrong answer.
+/// There is no backward-compatibility obligation across a bump, and the header does not create one:
+/// the coordinator and every worker must run the identical build (`CLAUDE.md`), which the Flight
+/// boundary already requires for DataFusion plan bytes to mean the same thing on both ends. What
+/// the header buys is the *failure*. Without it a fleet running two builds fed a changed field
+/// layout into an unchanged buffer shape and parsed it into garbage; with it the decode refuses on
+/// the first field it reads, so "your fleet is not one build" is read off the error rather than
+/// inferred from a wrong answer. Both halves are checked in order — magic, then version — because
+/// only the magic can rule out a payload that predates versioning entirely.
 ///
 /// The output schema is *not* encoded — it is recovered by deserializing the inner plan and
 /// asking it, which keeps the two from ever disagreeing. Encoding the inner plan recurses
@@ -359,7 +372,11 @@ impl PhysicalExtensionCodec for LldbCodec {
         _inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (version, rest) = take_u8(buf)?;
+        // Magic first, version second. The order is the point: only the magic can reject a payload
+        // that predates versioning, whose first byte is a length's low byte and can equal any
+        // version we might pick.
+        let rest = take_magic(buf)?;
+        let (version, rest) = take_u8(rest)?;
         if version != FORMAT_VERSION {
             // `Execution`, not `Internal` like its neighbours below: `Internal`'s `Display` appends
             // "likely caused by a bug in DataFusion's code, please file a bug report", which is
@@ -414,6 +431,7 @@ impl PhysicalExtensionCodec for LldbCodec {
             )));
         }
 
+        buf.extend_from_slice(WIRE_MAGIC);
         buf.push(FORMAT_VERSION);
         put_str(buf, &reader.worker_url);
         buf.extend_from_slice(&reader.remote_partition.to_le_bytes());
@@ -483,6 +501,36 @@ fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+/// Consume and validate the leading [`WIRE_MAGIC`], returning everything after it.
+///
+/// This is the first thing a decode reads, and the only check that can rule out a payload written
+/// before the header existed — see [`WIRE_MAGIC`] for why the version byte cannot do it alone. The
+/// refusal reaches the same conclusion as the version one because it has the same single cause: a
+/// buffer that does not open with these four bytes was written by something that is not this
+/// format, and the only thing that writes this format is another lldb build.
+fn take_magic(buf: &[u8]) -> DFResult<&[u8]> {
+    if buf.starts_with(WIRE_MAGIC) {
+        return Ok(&buf[WIRE_MAGIC.len()..]);
+    }
+    // Hex, because whatever is there is by definition not the text we expected, and a lossy
+    // string rendering of arbitrary bytes hides exactly the difference worth seeing.
+    let found: Vec<String> = buf
+        .iter()
+        .take(WIRE_MAGIC.len())
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    Err(DataFusionError::Execution(format!(
+        "FlightReaderExec payload does not start with the lldb wire marker {:?} — it begins [{}] \
+         and is only {} byte(s) long. Nothing but an lldb build writes this format, so the plan \
+         came from a different build than this process is running: your fleet is not one build. \
+         Every coordinator and worker must run the identical binary, so check that a rolling \
+         deploy finished and that every role runs one image tag.",
+        String::from_utf8_lossy(WIRE_MAGIC),
+        found.join(" "),
+        buf.len()
+    )))
+}
+
 fn take_u8(buf: &[u8]) -> DFResult<(u8, &[u8])> {
     match buf.split_first() {
         Some((first, rest)) => Ok((*first, rest)),
@@ -528,6 +576,13 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
+
+    /// A well-formed payload header — magic then version — for tests that hand-build the rest.
+    fn header() -> Vec<u8> {
+        let mut buf = WIRE_MAGIC.to_vec();
+        buf.push(FORMAT_VERSION);
+        buf
+    }
 
     /// A tiny local plan to stand in for a remote stage.
     async fn sample_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
@@ -750,7 +805,7 @@ mod tests {
         let codec = LldbCodec;
 
         // url "u", partition 0, promises 2 fallbacks, then runs out after one.
-        let mut truncated = vec![FORMAT_VERSION];
+        let mut truncated = header();
         put_str(&mut truncated, "u");
         truncated.extend_from_slice(&0u32.to_le_bytes());
         truncated.extend_from_slice(&2u32.to_le_bytes());
@@ -758,7 +813,7 @@ mod tests {
         assert!(codec.try_decode(&truncated, &[], &task_ctx).is_err());
 
         // A count far beyond the bound is refused outright.
-        let mut absurd = vec![FORMAT_VERSION];
+        let mut absurd = header();
         put_str(&mut absurd, "u");
         absurd.extend_from_slice(&0u32.to_le_bytes());
         absurd.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -790,10 +845,14 @@ mod tests {
             .try_encode(Arc::clone(&node), &mut buf)
             .expect("encode");
 
+        assert!(
+            buf.starts_with(WIRE_MAGIC),
+            "the magic must lead, so a decoder can rule out a foreign payload before reading fields"
+        );
         assert_eq!(
-            buf.first(),
+            buf.get(WIRE_MAGIC.len()),
             Some(&FORMAT_VERSION),
-            "the version must be the first byte, so a decoder can check it before anything else"
+            "the version must sit immediately behind the magic"
         );
 
         let back = codec.try_decode(&buf, &[], &task_ctx).expect("decode");
@@ -820,10 +879,11 @@ mod tests {
         let mut buf = Vec::new();
         codec.try_encode(node, &mut buf).expect("encode");
 
-        // Everything after the first byte is a payload this build understands perfectly. Only the
-        // version differs — which is the whole failure mode: same shape, different meaning.
+        // The magic is left intact and everything behind the version is a payload this build
+        // understands perfectly. Only the version differs — which is the whole failure mode: same
+        // shape, different meaning, and the magic is what proves it got this far honestly.
         let foreign = FORMAT_VERSION.wrapping_add(7);
-        buf[0] = foreign;
+        buf[WIRE_MAGIC.len()] = foreign;
 
         let err = codec
             .try_decode(&buf, &[], &task_ctx)
@@ -860,14 +920,19 @@ mod tests {
         let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(url, 0, inner));
         let mut bytes = serialize_plan(plan).expect("encode");
 
-        // The extension payload is `version | u32 LE url_len | url | …`, so the version byte sits
-        // five bytes ahead of the url. Asserted rather than assumed, so a format change fails here
-        // instead of quietly testing nothing.
+        // The extension payload is `magic | version | u32 LE url_len | url | …`, so the version
+        // byte sits five bytes ahead of the url and the magic nine. Asserted rather than assumed,
+        // so a format change fails here instead of quietly testing nothing.
         let at = bytes
             .windows(url.len())
             .position(|w| w == url.as_bytes())
             .expect("the url is in the serialized plan");
         let version_at = at - 5;
+        assert_eq!(
+            &bytes[at - 5 - WIRE_MAGIC.len()..version_at],
+            &WIRE_MAGIC[..],
+            "expected the magic immediately ahead of the version byte"
+        );
         assert_eq!(
             bytes[version_at], FORMAT_VERSION,
             "expected the version byte five bytes ahead of the url"
@@ -884,9 +949,9 @@ mod tests {
         );
     }
 
-    /// Nothing after the version byte, and nothing at all: both are errors, neither is a panic.
+    /// Truncated at every point in the header, and empty: all errors, none a panic.
     #[tokio::test]
-    async fn a_payload_truncated_at_or_before_the_version_errors_rather_than_panics() {
+    async fn a_payload_truncated_in_the_header_errors_rather_than_panics() {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
         let codec = LldbCodec;
@@ -897,8 +962,94 @@ mod tests {
             "an empty payload must not panic"
         );
         assert!(
-            codec.try_decode(&[FORMAT_VERSION], &[], &task_ctx).is_err(),
-            "a version byte with no url behind it must not panic"
+            codec.try_decode(&WIRE_MAGIC[..2], &[], &task_ctx).is_err(),
+            "half a magic must not panic"
+        );
+        assert!(
+            codec.try_decode(WIRE_MAGIC, &[], &task_ctx).is_err(),
+            "a magic with no version behind it must not panic"
+        );
+        assert!(
+            codec.try_decode(&header(), &[], &task_ctx).is_err(),
+            "a header with no url behind it must not panic"
+        );
+    }
+
+    /// A payload that is not this format at all is refused on the magic, and lands on the same
+    /// conclusion as a version mismatch — because it has the same one cause.
+    #[tokio::test]
+    async fn a_wrong_magic_is_refused_with_the_same_diagnosis() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        let node: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner));
+        let mut buf = Vec::new();
+        codec.try_encode(node, &mut buf).expect("encode");
+        buf[0] = b'X';
+
+        let err = codec
+            .try_decode(&buf, &[], &task_ctx)
+            .expect_err("a payload that is not this format must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wire marker"),
+            "the error must name the check that failed; got: {msg}"
+        );
+        assert!(
+            msg.contains("fleet is not one build"),
+            "the magic refusal must reach the same conclusion as the version one; got: {msg}"
+        );
+        assert!(
+            !msg.contains("datafusion/issues"),
+            "a deployment fact must not be reported as a DataFusion bug; got: {msg}"
+        );
+    }
+
+    /// **The reason the magic exists.** A payload written before the header was added begins with
+    /// `u32 LE url_len`, so its first byte is that length's *low byte* — and a worker URL of length
+    /// 1 (or 257, or 513) makes that byte `0x01`, colliding with `FORMAT_VERSION` exactly. A
+    /// version check alone would wave such a payload through and then misparse it, reporting a
+    /// "truncated url" that points at the bytes instead of at the fleet. The magic makes it
+    /// deterministic.
+    #[tokio::test]
+    async fn a_legacy_payload_whose_url_len_collides_with_the_version_is_refused_on_the_magic() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        // Exactly the pre-version encoding: no magic, no version, straight into `u32 LE url_len`.
+        // A one-character url is what makes the low byte collide.
+        let mut legacy = Vec::new();
+        put_str(&mut legacy, "u");
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // remote_partition
+        legacy.extend_from_slice(&0u32.to_le_bytes()); // fallback_count
+        legacy.extend_from_slice(&serialize_plan(inner).expect("inner plan"));
+
+        assert_eq!(
+            legacy[0], FORMAT_VERSION,
+            "test setup: this payload's first byte must actually collide with the version, \
+             otherwise this test proves nothing"
+        );
+
+        let err = codec
+            .try_decode(&legacy, &[], &task_ctx)
+            .expect_err("a pre-version payload must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("wire marker"),
+            "it must be the magic that catches this, not a later field; got: {msg}"
+        );
+        assert!(
+            msg.contains("fleet is not one build"),
+            "the operator must be pointed at the fleet; got: {msg}"
+        );
+        assert!(
+            !msg.contains("truncated"),
+            "the collision must not survive into a misleading downstream parse error; got: {msg}"
         );
     }
 
