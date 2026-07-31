@@ -539,3 +539,50 @@ machine #97 exists for.
 Measured, recorded, not implemented. The lever that works on this workspace is the **number of
 artifacts that statically link the whole dependency graph** — which is what #44's consolidation did,
 what the crate split could not do, and what gating the benches does.
+
+# The number every measurement above missed: worktrees (#107)
+
+Everything above measures **one** `target/`. On the machine this work was done on, that was not
+where the disk went.
+
+Merging #104 could not delete its local branch, because a leftover git worktree still held it.
+Looking at why found **eight worktrees, every one on an already-merged branch, holding 36 GB**:
+
+| Branch | PR | Size |
+| - | - | - |
+| `claude/issue-97-gate-benches` | #104 | 7.3 GB |
+| `claude/issue-79-encode-error-path` | #91 | 6.4 GB |
+| `claude/issue-73-fargate-tls` | #81 | 5.8 GB |
+| `claude/issue-87-buildrs-rerun` | #94 | 5.2 GB |
+| `claude/issue-92-admin-package` | #95 | 4.7 GB |
+| `claude/issue-72-control-crate` | #85 | 3.3 GB |
+| `claude/issue-74-codec-version` | #75 | 2.8 GB |
+| `claude/issue-32-fleet-token` | #99 | 255 MB |
+
+All were clean. Removing them reclaimed **35.8 GiB**.
+
+Put beside the rest of this document: **#97 won 660–730 MiB. The crate split won nothing on disk.
+And the disk budget this whole effort is measured against is a 30 GB VM.** Stale worktrees alone
+exceeded that budget outright, by roughly fifty times the margin gating the benches recovered.
+
+Nothing above is wrong. Every measurement of `target/` still holds, and the lever named in the
+previous section is still the right lever *for that directory*. The correction is one of scope: a
+worktree is a full independent checkout **with its own `target/`** — that is precisely what the
+isolation buys — so the quantity that actually fills the disk is `target/` **times the number of
+worktrees nobody removed**, and only the first factor was ever being measured.
+
+`scripts/sweep-worktrees.sh` is the recurring fix. It removes a worktree only when its branch has a
+merged PR and its tree is clean, and never one that is `locked`. Two details are load-bearing:
+
+- **Merged-ness comes from `gh pr list --state merged`, not `git branch --merged`.** Branches here
+  land by *squash* merge, which gives the merge commit a different identity, so `git branch --merged`
+  reports a demonstrably merged branch as unmerged — verified on `claude/issue-97-gate-benches`,
+  whose PR had just merged. A sweep trusting it would skip exactly the branches it exists for.
+- **It is a dry run unless given `--apply`**, and it refuses locked or dirty trees. Both signals
+  were already present and correct when this was found by hand: the one live agent's worktree was
+  locked, and the eight dead ones were clean.
+
+Considered and not adopted: pointing agent worktrees at a shared `CARGO_TARGET_DIR`. It would
+collapse N copies into one, but it serialises builds behind a shared lock and re-links whenever two
+agents' flags differ — the contention worktree isolation exists to avoid. Worth measuring before
+adopting; a sweep is the cheaper answer and it is the one implemented.
