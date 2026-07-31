@@ -108,19 +108,26 @@
 //! Issue #121 added the seventh, and it is the counter the bullet above says would not be safe —
 //! so the difference is the whole justification:
 //!
-//! - **`support::CONTAINER_SEQ`**, which distinguishes two throwaway Postgres containers started in
-//!   the same microsecond. `ABANDONED_CLOSED` is dangerous because `query_scheduler` *reads* it;
-//!   this one is consumed only to build a container name and is read by no test, no assertion and
-//!   no failure message. Test order therefore permutes which container gets which integer, which is
-//!   not a fact anything can observe. The state has to be process-global to do its job at all: the
-//!   collision it removes is between two threads of *this* process, which is exactly the scope one
-//!   binary made possible.
+//! - **`support::NAME_SEQ`**, which distinguishes two names minted in the same microsecond.
+//!   `ABANDONED_CLOSED` is dangerous because `query_scheduler` *reads* it; this one is consumed
+//!   only to build a name and is read by no test, no assertion and no failure message. Test order
+//!   therefore permutes which caller gets which integer, which is not a fact anything can observe.
+//!   The state has to be process-global to do its job at all: the collision it removes is between
+//!   two threads of *this* process, which is exactly the scope one binary made possible.
+//!
+//!   Issue #141 widened it from container names to `support::unique_name` rather than adding an
+//!   eighth entry here, and the choice is the point: a second counter would have been equally
+//!   correct and would have arrived with a verbatim copy of the paragraph above, which is the
+//!   duplication #121 spent itself removing one function over. Adding a caller to this one costs
+//!   nothing, because the integer is a discriminator and not a count — the gaps each caller leaves
+//!   in the other's run are unobservable for exactly the reason the order-permutation is.
 //!
 //! Everything else these tests touch is per-instance: sessions, catalogs, stage caches and
 //! warehouses are constructed per test, every server binds `127.0.0.1:0`, and every file that
 //! writes to disk writes into its own `tempfile::tempdir()`. The database-gated files name their
-//! rows with a pid + nanosecond suffix, which was always required to survive a shared CI server
-//! and is unaffected by the process count.
+//! rows through `support::unique_name`, which was always required to survive a shared CI server
+//! and is unaffected by the process count — though what makes it hold *within* one process is the
+//! counter above and not the pid + nanosecond suffix it used to be.
 //!
 //! ## Teardown is a `Drop` guard, and that is a consequence of this file
 //!

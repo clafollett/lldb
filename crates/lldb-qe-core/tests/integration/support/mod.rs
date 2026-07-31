@@ -38,16 +38,17 @@
 //! than a quiet skip, so a copy drifting from this one could fail the build for the wrong reason.
 //!
 //! What the fold dropped was their distinct container-name prefixes, and that turned out to be load
-//! bearing in a way worth recording: the prefixes were partitioning a name space that
-//! [`CONTAINER_SEQ`] documents as too small, so folding them into one exposed a latent tie. Names
-//! carry that counter now, which is strictly stronger than any prefix scheme — what is genuinely
-//! lost is only that `docker ps` no longer says which suite owns which container.
+//! bearing in a way worth recording: the prefixes were partitioning a name space that [`NAME_SEQ`]
+//! documents as too small, so folding them into one exposed a latent tie. Names carry that counter
+//! now, which is strictly stronger than any prefix scheme — what is genuinely lost is only that
+//! `docker ps` no longer says which suite owns which container.
 //!
 //! Every test using this must be safe to run repeatedly against the same database *and*
 //! concurrently with another copy of itself — the URL it is handed may well be someone's dev
 //! instance, and in CI every database-gated test shares one container. Hence [`unique_name`]: a
-//! pid + nanosecond suffix, so no run can collide with another, and each test deletes exactly the
-//! rows it made and nothing global.
+//! pid + nanosecond + [`NAME_SEQ`] suffix, so no run can collide with another **and** no two
+//! callers within a run can collide with each other (#141 — the clock alone did not manage the
+//! second), and each test deletes exactly the rows it made and nothing global.
 //!
 //! This module used to carry `#![allow(dead_code)]`, because it was compiled separately into each
 //! integration-test binary and each of them legitimately used only the parts it needed. That
@@ -72,21 +73,31 @@ pub const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// What tells two containers apart when the clock cannot.
+/// What tells two names apart when the clock cannot — container names and [`unique_name`] alike.
 ///
 /// [`nanos`] carries `SystemTime`'s resolution, and on macOS that is **microseconds** — the last
-/// three digits are always zero. Fourteen libtest threads reaching [`start_container`] at once
-/// therefore tie on it, and `docker run --name` refuses the loser with a name conflict rather than
-/// starting a second Postgres. While the three private copies of this resolution existed (#121)
-/// each had its own name prefix, which partitioned the space and hid the tie for those suites; one
-/// prefix shared by every suite exposes it, reproducibly, at six concurrent containers.
+/// three digits are always zero. Threads reaching either caller inside one of those ticks tie on
+/// it, and the two ties fail very differently. `docker run --name` refuses the loser with a name
+/// conflict, which is loud: while the three private copies of the database resolution existed
+/// (#121) each had its own container-name prefix, partitioning the space and hiding the tie, and
+/// one prefix shared by every suite exposed it reproducibly at six concurrent containers. Two
+/// tests handed the same database, namespace, table or warehouse name do **not** fail at creation
+/// — they interfere, and the failure lands on whichever runs second (#141). That one measured
+/// 7497 duplicates in 8192 names across 16 threads, and had never been noticed.
 ///
 /// A counter removes the tie rather than making it rarer: two names minted by one process differ
-/// here even inside one microsecond, and the pid still separates processes. It is process-global
-/// mutable state, which `main.rs` is deliberately suspicious of — safe because it is append-only,
-/// read by nothing but the name it builds, and asserted on by no test, so ordering permutes which
-/// container gets which integer and nothing else.
-static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
+/// here even inside one microsecond, and the pid still separates processes.
+///
+/// **One counter, not one per caller.** The two name spaces are disjoint by prefix, so a second
+/// counter would be correct too; what it would cost is a second entry in `main.rs`'s audit of
+/// process-global state carrying a verbatim copy of this argument, which is the shape #121 spent
+/// itself removing. Sharing is free because the value is a discriminator and not a count — nothing
+/// reads it, so the gaps each caller leaves in the other's run of integers are unobservable.
+///
+/// It is process-global mutable state, which `main.rs` is deliberately suspicious of — safe
+/// because it is monotonic, read by nothing but the names it builds, and asserted on by no test,
+/// so ordering permutes which caller gets which integer and nothing else.
+static NAME_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// How the test got its database — and, for the container case, what to tear down.
 pub enum Target {
@@ -135,7 +146,7 @@ fn start_container() -> Result<Target> {
         "lldb-services-test-{}-{}-{}",
         std::process::id(),
         nanos(),
-        CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed)
+        NAME_SEQ.fetch_add(1, Ordering::Relaxed)
     );
 
     // `--rm` is not enough on its own (a killed test leaves the container running), hence the
@@ -230,12 +241,24 @@ pub fn nanos() -> u128 {
         .as_nanos()
 }
 
-/// A name no other run — or concurrent copy of this run — will pick.
+/// A name no other run — or concurrent copy of this run, or concurrent *caller* — will pick.
+///
+/// The pid separates processes and [`nanos`] separates runs; [`NAME_SEQ`] is what separates two
+/// libtest threads calling this inside one tick of a clock whose real resolution is microseconds.
+/// Read that static before dropping the counter as redundant: without it this returns the same
+/// string to concurrent callers routinely rather than rarely, and the tests that receive it go on
+/// to create one account, namespace, table or warehouse between them and quietly interfere.
 ///
 /// Warehouse names must also be DNS labels (lowercase, `[a-z0-9-]`), which is why this uses only
-/// characters legal in both an account name and a warehouse name.
+/// characters legal in both an account name and a warehouse name — the counter is decimal digits
+/// and stays inside that alphabet.
 pub fn unique_name(tag: &str) -> String {
-    format!("lldb-test-{tag}-{}-{}", std::process::id(), nanos())
+    format!(
+        "lldb-test-{tag}-{}-{}-{}",
+        std::process::id(),
+        nanos(),
+        NAME_SEQ.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -480,4 +503,65 @@ async fn delete(conn: &mut sqlx::postgres::PgConnection, item: &Cleanup) -> Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::sync::{Arc, Barrier};
+
+    /// The property [`unique_name`]'s name claims, asserted the way it actually breaks.
+    ///
+    /// Sequentially it holds on every platform and always did; the case that matters is two callers
+    /// inside one tick of whatever clock the name is built from, which is what a barrier plus
+    /// `THREADS` minting threads produces deliberately. Against the pid+nanosecond name alone this
+    /// failed on macOS at these sizes, because `SystemTime` there resolves to microseconds. The
+    /// message counts the duplicates rather than naming one, because the count is the diagnosis: a
+    /// handful means a coarse clock, thousands means the discriminator is gone entirely.
+    #[test]
+    fn concurrent_unique_names_never_collide() {
+        const THREADS: usize = 16;
+        const PER_THREAD: usize = 512;
+
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let minting: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    (0..PER_THREAD)
+                        .map(|_| unique_name("collision"))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+
+        let minted: Vec<String> = minting
+            .into_iter()
+            .flat_map(|thread| thread.join().expect("a minting thread panicked"))
+            .collect();
+        let distinct: BTreeSet<&str> = minted.iter().map(String::as_str).collect();
+
+        assert_eq!(
+            distinct.len(),
+            minted.len(),
+            "{} of {} concurrently minted names were duplicates — two tests handed the same name \
+             for a database, namespace, table or warehouse do not fail at creation, they interfere",
+            minted.len() - distinct.len(),
+            minted.len(),
+        );
+    }
+
+    /// Every character has to be legal in an account name, a warehouse name **and** a DNS label, so
+    /// no discriminator added to the name may widen its alphabet.
+    #[test]
+    fn a_unique_name_stays_a_dns_label() {
+        let name = unique_name("tag");
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+            "not a DNS label: {name}"
+        );
+    }
 }
