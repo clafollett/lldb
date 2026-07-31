@@ -113,7 +113,7 @@ CREATE INDEX IF NOT EXISTS admission_slots_holder_idx
     ON admission_slots (holder_incarnation);
 
 COMMENT ON TABLE admission_slots IS
-    'Fleet-wide admission control: one row per query slot a coordinator is holding on a warehouse. A warehouse of size K has slots 0..K-1, so the concurrency bound is the primary key rather than a counter. A slot is reclaimable when its holder (holder_slot, holder_incarnation) has no live row in coordinators, or when the holder is the claiming process and the token is one it no longer holds. See crates/lldb-qe-core/src/fleet_admission.rs.';
+    'Fleet-wide admission control: one row per query slot a coordinator is holding on a warehouse. A warehouse of size K has slots 0..K-1, so the concurrency bound is the primary key rather than a counter. A slot is reclaimable when its holder (holder_slot, holder_incarnation) has no live row in coordinators, or when the holder is the claiming process and the token is one it no longer holds. See crates/lldb-qe-control/src/fleet_admission.rs.';
 COMMENT ON COLUMN admission_slots.holder_token IS
     'Identifies one claim within a holding process, so a leaked row can be reclaimed by its own coordinator and so releasing is a compare-and-swap rather than an unconditional delete.';
 

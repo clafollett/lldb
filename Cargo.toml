@@ -61,7 +61,7 @@ tokio-stream = { version = "0.1", features = ["net"] }
 # `tls-aws-lc` would add a whole second crypto stack, which the one-version-tree-wide rule in
 # CLAUDE.md forbids. Deliberately NOT `tls-native-roots` / `tls-webpki-roots`: this fleet verifies
 # against a CA file the deployment mounts (`--tls-ca`), so a bundled trust store would be a
-# dependency bought for nothing. See crates/lldb-qe-core/src/tls.rs.
+# dependency bought for nothing. See crates/lldb-qe-control/src/tls.rs.
 tonic = { version = "0.14", features = ["tls-ring"] }
 futures = "0.3"
 
@@ -98,10 +98,17 @@ chrono = { version = "0.4", default-features = false, features = ["std", "clock"
 #
 # rand is pinned to 0.9 deliberately: 0.8 and 0.10 are both in the tree transitively, and picking
 # the one datafusion/iceberg already resolve to is what keeps the duplicate count unchanged.
-sha2 = "0.10"      # hash an API token (NOT a KDF — see crates/lldb-qe-core/src/auth.rs)
+sha2 = "0.10"      # hash an API token (NOT a KDF — see crates/lldb-qe-control/src/auth.rs)
 # HMAC-SHA256 over the same `digest` traits sha2 already implements, so it adds no second hash
-# implementation and no second `digest` — verified with `cargo tree -d` (48 duplicated crates
-# before and after). It signs the per-request plan assertion the worker boundary checks; see
+# implementation and no second `digest` — verified with `cargo tree -d`, which must keep reporting
+# ZERO duplicates of arrow, datafusion, object_store and iceberg. That per-crate claim is the rule
+# CLAUDE.md actually imposes, and `scripts/check-dep-dupes.sh` enforces it in CI. A raw duplicate
+# total is deliberately NOT recorded here. It drifts with every unrelated crate, and it is not even
+# a well-defined number: `cargo tree -d` today prints 59 entries covering 27 distinct crate names,
+# and lists some crates twice at the SAME version, so "48 duplicated crates" (the figure this
+# comment used to carry) cannot be compared against it without knowing which was counted. A
+# contributor who finds it stale stops trusting the check it was meant to justify.
+# It signs the per-request plan assertion the worker boundary checks; see
 # crates/lldb-qe-core/src/plan_assertion.rs for why that is a MAC keyed by the fleet secret and
 # not a signature. Hand-rolling HMAC over sha2 was the alternative: 20 lines, no dependency, and
 # no reason to prefer a fresh implementation of a specified construction over the audited one.
@@ -133,8 +140,8 @@ tempfile = "3"
 # `default-features = false` + `ring` is NOT cosmetic: rcgen 0.14 defaults to **aws-lc-rs**, which
 # would put a second crypto provider in the tree. That breaks the one-version rule in CLAUDE.md and,
 # worse, makes rustls's provider inference ambiguous — turning `ServerConfig::builder()` into a
-# panic in exactly the tests that exercise TLS. Verified with `cargo tree -d`: 48 duplicates before
-# and after. Dev-only; no binary links it.
+# panic in exactly the tests that exercise TLS. Verified the same way as the credential crates
+# above: no duplicate of the four pinned crates, before or after. Dev-only; no binary links it.
 rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 
 [profile.dev]

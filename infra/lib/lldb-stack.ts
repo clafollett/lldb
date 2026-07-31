@@ -84,7 +84,7 @@ const FLEET_TOKEN_LENGTH = 64;
  *
  * This is the infrastructure half of the concept whose control-plane half lives in the services
  * database's `warehouses` table. The database holds **desired state** — the engine deliberately
- * carries no AWS SDK and calls no ECS API (see `crates/lldb-qe-core/src/warehouse.rs`) — and this
+ * carries no AWS SDK and calls no ECS API (see `crates/lldb-qe-control/src/warehouse.rs`) — and this
  * stack is one of the two things that *applies* it. The other is an operator running
  * `aws ecs update-service --desired-count`, which is the no-deploy path for a resize or a
  * suspend; a redeploy with an edited `warehouses` list is the durable one.

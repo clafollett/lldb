@@ -248,7 +248,7 @@ dials several warehouses, so there is exactly one name available to verify again
 Be clear about the claim: a shared leaf authenticates **the fleet, not the member**. A client learns
 that its peer holds the fleet's key, not which worker it is. That is already the documented scope of
 this engine's TLS — it is server-authenticated, and per-member identity is `LLDB_FLEET_TOKEN`'s
-claim with mTLS still an open decision (#32).
+claim with mTLS still an open decision (#106).
 
 ### Rotating
 

@@ -5,7 +5,7 @@
 -- nothing whatsoever about whether that process still exists. Two open issues — #36 (reap query
 -- rows stranded in queued/running) and #37 (fleet-wide admission) — each have to answer that
 -- question before they can be built, and neither owns it. This migration is the storage for the one
--- answer both will use; `crates/lldb-qe-core/src/liveness.rs` is the mechanism and carries the four
+-- answer both will use; `crates/lldb-qe-control/src/liveness.rs` is the mechanism and carries the four
 -- decisions (identity, renewal-failure behaviour, threshold units, who evaluates) in prose.
 --
 -- It does NOT edit 0004. An applied migration is history and sqlx verifies its checksum on every
@@ -95,7 +95,7 @@ ALTER TABLE queries
     ADD COLUMN IF NOT EXISTS coordinator_incarnation TEXT;
 
 COMMENT ON TABLE coordinators IS
-    'One row per coordinator deployment slot. A row is live when shutdown_at IS NULL and last_seen_at is within a fixed multiple of renew_interval_secs. See crates/lldb-qe-core/src/liveness.rs.';
+    'One row per coordinator deployment slot. A row is live when shutdown_at IS NULL and last_seen_at is within a fixed multiple of renew_interval_secs. See crates/lldb-qe-control/src/liveness.rs.';
 COMMENT ON COLUMN coordinators.slot IS
     'Stable deployment identity (--coordinator-id), matching queries.coordinator. Survives a restart.';
 COMMENT ON COLUMN coordinators.incarnation IS
