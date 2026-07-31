@@ -705,7 +705,7 @@ async fn fetch_partition(
     stream.try_collect::<Vec<_>>().await.with_context(|| {
         format!(
             "streaming partition {partition} from worker {}",
-            redact_endpoint(&worker_url)
+            redact_endpoint(worker_url)
         )
     })
 }
