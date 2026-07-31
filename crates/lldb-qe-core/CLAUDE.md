@@ -215,7 +215,7 @@ door would encrypt one hop of a mesh. Certificates are **supplied, never minted*
 3. **`LLDB_FLEET_TOKEN` is untouched, and TLS does not make it redundant.** This is *server*
    authentication: a client verifies the server, never the reverse. Which fleet member is calling is
    still the shared secret's claim alone, and mTLS at the worker boundary is a separate decision
-   (#32, still open). Say so rather than letting "we have TLS now" imply more than it does. What a
+   (#106, still open). Say so rather than letting "we have TLS now" imply more than it does. What a
    request *is* — the per-request half — is `plan_assertion.rs`'s job, not TLS's; the two are
    complementary and the next section covers it.
 4. **The scheme is the switch, and there is no fallback.** `https://` dials TLS, `http://` does not,

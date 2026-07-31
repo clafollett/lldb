@@ -37,7 +37,7 @@
 # sets LLDB_ACCOUNT, so every role runs as `default` — the account `db-migrate` seeds — and they all
 # see one catalog, which is what this demo is for. Workers are unaffected either way: since a plan
 # names its data files directly, a worker opens no catalog at all. See
-# crates/lldb-qe-core/src/tenancy.rs.
+# crates/lldb-qe-control/src/tenancy.rs.
 # ---- Virtual warehouses, locally -----------------------------------------------------------
 #
 # Two named pools of compute over the *same* MinIO warehouse and the same catalog: `analytics`
@@ -67,7 +67,7 @@
 #
 # That two-step is the design, not an omission: the services database holds *desired* state and
 # something else actuates it (compose here, `aws ecs update-service` or a deploy on AWS). The
-# engine carries no orchestrator SDK — see crates/lldb-qe-core/src/warehouse.rs for why.
+# engine carries no orchestrator SDK — see crates/lldb-qe-control/src/warehouse.rs for why.
 #
 # ---- One query, or many ---------------------------------------------------------------------
 #
@@ -406,7 +406,7 @@ services:
   # `--coordinator-id` (a claim's expiry is its holder's liveness registration, and two replicas
   # sharing one id cost one of them that registration). To scale, give each replica a distinct id —
   # `--scale query-server=N` alone would hand them all `compose-query-server` below.
-  # See crates/lldb-qe-core/src/fleet_admission.rs and .../scheduler.rs.
+  # See crates/lldb-qe-control/src/fleet_admission.rs and .../scheduler.rs.
   query-server:
     build: *lldb-build
     image: ${LLDB_IMAGE:-lldb:latest}
@@ -424,7 +424,7 @@ services:
       # registration — and a coordinator with no registration holds no fleet-wide admission slots,
       # so it silently falls back to bounding the warehouse by itself. The per-process half of the
       # identity is minted at startup and is not configurable.
-      # See crates/lldb-qe-core/src/liveness.rs.
+      # See crates/lldb-qe-control/src/liveness.rs.
       - "--coordinator-id"
       - "compose-query-server"
       # This cluster is a demo you are expected to be able to query the moment it comes up, and an

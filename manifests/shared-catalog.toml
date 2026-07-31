@@ -23,7 +23,7 @@
 # applying this same file get two catalogs and two directories while both still writing
 # `SELECT ... FROM shared.sales.orders`. That is the point: the manifest stays portable and the
 # tenants stay apart. With no services database configured there are no accounts, so the names here
-# are used verbatim — see `crates/lldb-qe-core/src/tenancy.rs`.
+# are used verbatim — see `crates/lldb-qe-control/src/tenancy.rs`.
 #
 # Corollary worth knowing before adding a table: `format = "listing"` is OUTSIDE that boundary. A
 # listing table is a bare path in DataFusion's default catalog with no catalog row and no warehouse

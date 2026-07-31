@@ -56,7 +56,7 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # test depend on that, unchanged). `lldb-qe-server` is the long-running shape: concurrent
 # submissions over Arrow Flight, a bounded number running per warehouse, the rest queued, every
 # query recorded in `queries`. Admission control is FLEET-WIDE with a services DB: two servers on
-# one warehouse admit K between them, not K each (crates/lldb-qe-core/src/fleet_admission.rs).
+# one warehouse admit K between them, not K each (crates/lldb-qe-control/src/fleet_admission.rs).
 # The `query_scheduler` module carries both acceptance tests — the two-coordinator K-not-2K one
 # (asserted on `peak_concurrency` across every `queries.coordinator` value, which is exactly where
 # a per-process counter is self-consistently wrong), and the one that kills a slot-holder and

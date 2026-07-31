@@ -94,7 +94,7 @@
 //! - **Which fleet member you are.** This is *server-authenticated* TLS: a client verifies the
 //!   server's certificate; the server does not verify the client's. mTLS at the worker boundary —
 //!   whether a client certificate should *replace* [`crate::auth::FleetAuth`]'s shared secret — is
-//!   its own decision and is still open (issue #32). Nothing here makes `LLDB_FLEET_TOKEN`
+//!   its own decision and is still open (issue #106). Nothing here makes `LLDB_FLEET_TOKEN`
 //!   redundant: it is unchanged, still required when set, and still the only thing proving a caller
 //!   belongs to this deployment.
 //! - **Per-request identity at the worker boundary.** Closed by `lldb_qe_core::plan_assertion`, not by

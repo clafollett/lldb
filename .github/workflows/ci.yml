@@ -95,6 +95,18 @@ jobs:
           echo "rust=$rust infra=$infra"
           printf 'rust=%s\ninfra=%s\n' "$rust" "$infra" >> "$GITHUB_OUTPUT"
 
+  # Deliberately NOT gated on `needs.changes.outputs.rust`, and deliberately not folded into the
+  # job below. The references this checks live in .md, .yml, .toml and .sql — a docs-only PR is
+  # exactly the change that introduces a broken one, and exactly the change the rust filter skips.
+  # Needs no toolchain, so running it unconditionally costs a checkout.
+  paths:
+    name: path references
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-path-refs.sh
+
   # Fast path: format, lint, and the in-process test suite. Integration tests that need SF1
   # data or Docker skip themselves, so this stays green without either.
   check:
@@ -140,6 +152,11 @@ jobs:
 
       - name: Format
         run: cargo fmt --all --check
+
+      # The pins in Cargo.toml are justified by a claim — "this adds no second version of anything"
+      # — that nothing used to verify, so it went stale (#78). This is that claim as a gate.
+      - name: Dependency pins
+        run: ./scripts/check-dep-dupes.sh
 
       # `--features lldb-qe-core/benches` is NOT optional and must not be dropped to save time.
       # The two criterion benches are behind `required-features = ["benches"]` so a default build

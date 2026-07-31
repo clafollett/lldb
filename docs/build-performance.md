@@ -82,6 +82,10 @@ file compiled plus one 294 MB binary linked. (Both paths are as they were at 265
 now `tests/integration/first_light.rs` and is no longer a target of its own — which is exactly the
 change this measurement motivated.)
 
+<!-- The path above is deliberately the one that existed at 265f2af; repointing it would misreport
+     what was measured. scripts/check-path-refs.sh is told so here rather than in the prose:
+     path-refs-allow: crates/lldb-qe-core/tests/first_light.rs -->
+
 Method 1 puts the link at ~2.0 s, so method 2 leaves ~0.7 s for compiling the test file itself —
 the two agree. Extrapolating: 26 linked test/bench binaries × ~2.0 s ≈ **52 s of the 189.7 s of
 unit CPU, about 27%**; at 4-way parallelism roughly 13 s of the ~58 s warm wall clock, about 22%.
