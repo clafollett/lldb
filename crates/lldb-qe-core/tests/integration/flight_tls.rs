@@ -162,6 +162,52 @@ async fn a_query_round_trips_over_tls_on_both_flight_boundaries() -> Result<()> 
     Ok(())
 }
 
+/// The same round trip with **no filesystem in the TLS path at all**: certificate, key and CA are
+/// each handed over inline, exactly as ECS Fargate delivers a Secrets Manager value (issue #73).
+///
+/// It is the acceptance test above run through the other spelling, on purpose. Asserting that
+/// `TlsArgs` *resolves* inline material is a unit test and already exists; what only a socket can
+/// prove is that the bytes rustls ends up with are the same bytes either way — that nothing about
+/// the file path (a trailing newline, a read that normalises something) was load-bearing. A worker
+/// and a coordinator both serve from injected PEM, the client verifies against an injected CA, and
+/// the answer has to survive both hops.
+///
+/// The ambient trust installed here is *value-identical* to [`certs::install_test_trust`]'s — same
+/// CA, same domain — so it composes with the rest of this shared binary rather than racing it. See
+/// `support/certs.rs`.
+#[tokio::test]
+async fn an_identity_injected_as_pem_serves_the_same_query_with_no_files() -> Result<()> {
+    lldb_qe_core::tls::install_client_trust(certs::inline_trust()?);
+    let tmp = tempfile::tempdir()?;
+    seed_table(tmp.path())?;
+
+    let mut servers = Servers::new();
+    let worker = start_worker(&mut servers, certs::server_tls_inline()?).await?;
+    let coordinator = start_coordinator(
+        &mut servers,
+        tmp.path(),
+        // Dialed by IP while the certificate names `localhost` — the shape `discovery.rs` produces
+        // on ECS, resolved by `--tls-domain` rather than by an IP SAN nobody can mint in advance.
+        vec![format!("https://{worker}")],
+        certs::server_tls_inline()?,
+    )
+    .await?;
+
+    let submitted = submit_query(
+        &format!("https://{coordinator}"),
+        &QueryRequest::new("SELECT sum(v) AS total FROM rows"),
+    )
+    .await
+    .context("submitting over TLS configured entirely from injected PEM")?;
+
+    assert_eq!(
+        sum_of(&submitted.batches),
+        EXPECTED_SUM,
+        "injected PEM must be the same identity a mounted file would be"
+    );
+    Ok(())
+}
+
 /// A worker that serves TLS must not answer a plaintext caller — and must not leave it hanging.
 ///
 /// Both halves matter. "Refused" is the security property: a client cannot downgrade its way past

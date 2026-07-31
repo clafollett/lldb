@@ -49,9 +49,9 @@ aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> 
 
 Knobs: `-c workerCount=4` sizes the default fleet, `-c warehouses=analytics:4,etl:1` deploys named
 warehouses instead (see below), `-c egress=nat-instance` moves it into private subnets (see below),
-`-c servicesDb=none` drops the control plane (see below); `cpu`/`memoryLimitMiB` are stack props.
-The `TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task` network config for
-whichever mode you deployed.
+`-c servicesDb=none` drops the control plane (see below), `-c tls=fleet` encrypts Flight inside the
+VPC (see below); `cpu`/`memoryLimitMiB` are stack props. The `TaskSubnets` and `AssignPublicIp`
+outputs give you the right `run-task` network config for whichever mode you deployed.
 
 ## Virtual warehouses (`-c warehouses=…`)
 
@@ -155,6 +155,77 @@ have N tasks racing the same DDL). Run the `lldb-qe-migrate` binary from the sam
 one-shot ECS task before rolling the services, the way compose's `db-migrate` does. Its
 credentials come from the `ServicesDbSecretArn` output.
 
+## Transport security (`-c tls=…`)
+
+| Mode | What you get |
+| - | - |
+| `none` *(default)* | Every Flight port is plaintext. Legal, and not a hole: the engine refuses a plaintext port only when a credential is actually checked on it, and nothing here checks one yet. Traffic is confined to the VPC by the security groups. |
+| `fleet` | Workers serve TLS, every role dials `https://`, and the PEM arrives as `LLDB_TLS_*_PEM` from three Secrets Manager secrets. **~$1.20/mo.** |
+
+**Mint before you deploy.** This is a prerequisite step, like `cdk bootstrap`:
+
+```bash
+./scripts/mint-fleet-tls.sh                                  # writes lldb/fleet-tls-{ca,cert,key}
+cd infra && npx cdk deploy -c imageTag=0.1.0+<sha> -c tls=fleet
+```
+
+The stack **imports** those secrets rather than creating them, and both halves of that are
+deliberate. A private key CDK holds is a key that can reach `cdk.out`, which is an artifact that
+gets copied around; importing means CDK never sees the bytes at all. And creating them here would
+deadlock a first deploy — CloudFormation would make three empty secrets, the ECS service would fail
+to stabilise on the empty PEM, the deployment circuit breaker would fail the stack, and the
+rollback would delete the secrets you were about to fill.
+
+### Why the PEM is an environment variable and not a file
+
+The engine takes certificates as paths *or* as material (`LLDB_TLS_CERT` vs `LLDB_TLS_CERT_PEM`),
+and on Fargate only the second works: **ECS resolves a Secrets Manager value into an environment
+variable and offers no way to put one on a filesystem.** The alternatives were priced in issue #73
+and each is worse — a container entrypoint that writes the PEM to disk puts the key in the
+environment *and* on the task's ephemeral volume (Fargate does not support `tmpfs`, so that is a
+disk, not RAM); an EFS volume adds a stateful dependency to the boot path of a fleet whose premise
+is stateless workers, and nothing in CloudFormation can populate it without putting the key in a
+deploy artifact; AWS Private CA costs **$400/month** and its one advantage, automatic renewal, is
+inert here because the engine builds its TLS acceptor once at startup and never re-reads it.
+
+Three separate whole-string secrets rather than one with JSON keys, because that is what makes the
+split a boundary: `ecs.Secret` grants read on a *secret*, so **the coordinator's execution role is
+granted the CA and never the fleet private key**. It binds no port, so an identity is material it
+has no use for. There is a test asserting exactly that, in IAM and not only in the task definition.
+
+### The name problem, and how it is actually solved
+
+`discovery.rs` expands a Cloud Map name into one URL **per task IP**, so what a client would verify
+is `https://10.0.1.47:50051` — and a certificate issued for `analytics.lldb.local` does not
+validate against that. IP SANs are not available as a fix: a Fargate task's IP is allocated at task
+start and changes on every replacement and every scale event, which is the elasticity `discovery.rs`
+exists to deliver, so nothing minted in advance can name them.
+
+So the fleet shares **one** certificate carrying `DNS:fleet.lldb.local`, and both roles get
+`LLDB_TLS_DOMAIN=fleet.lldb.local`. The URL's IP connects; that SAN verifies. It is one fleet-wide
+name rather than one per warehouse because the engine's dialing trust is process-global — a
+`FlightReaderExec` is serialized into a plan and can carry nothing per-call — while one coordinator
+dials several warehouses, so there is exactly one name available to verify against.
+
+Be clear about the claim: a shared leaf authenticates **the fleet, not the member**. A client learns
+that its peer holds the fleet's key, not which worker it is. That is already the documented scope of
+this engine's TLS — it is server-authenticated, and per-member identity is `LLDB_FLEET_TOKEN`'s
+claim with mTLS still an open decision (#32).
+
+### Rotating
+
+The engine reads its certificate once, at startup. So rotation is: re-run the mint script (it reuses
+the CA in `./fleet-tls-ca` unless you delete it), then force a new deployment.
+
+```bash
+./scripts/mint-fleet-tls.sh
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> \
+  --force-new-deployment
+```
+
+Replacing the **CA** rather than the leaf is not rolling — every role has to restart together, since
+half a fleet trusting a root the other half does not sign under fails every handshake between them.
+
 ## Tests
 
 ```bash
@@ -169,6 +240,11 @@ reference rather than plain environment, task roles are scoped to the warehouse 
 egress and `servicesDb` mode builds what it claims to, warehouses become one service and one
 Cloud Map name each (with a suspended one at `desiredCount: 0`, and an unroutable name refused at
 synth), and — in *every* mode — no security group admits `0.0.0.0/0`.
+
+For TLS specifically: no PEM material of any kind appears in the synthesized template, the private
+key is unreadable by the coordinator's execution role in IAM, turning TLS on rewrites *every*
+worker URL to `https://` with the `{warehouse}` placeholder intact, both roles verify under the one
+fleet name, and `LLDB_ALLOW_PLAINTEXT` is absent in **both** modes.
 
 ## Egress: how tasks reach ECR (`-c egress=…`)
 

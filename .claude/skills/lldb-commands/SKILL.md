@@ -137,11 +137,14 @@ cargo test -p lldb-qe-core tls::tests
 # reassigned stage carries it to whichever worker serves it.
 cargo test -p lldb-qe-core --test integration worker_plan_assertion
 cargo test -p lldb-qe-core plan_assertion::tests
-# Serve TLS. Certificates are files the deployment mounts; the engine issues none.
+# Serve TLS. Certificates are supplied by the deployment; the engine issues none. Files, or —
+# where a file cannot be mounted (ECS Fargate) — LLDB_TLS_CERT_PEM/_KEY_PEM/_CA_PEM inline.
 cargo run -p lldb-qe-coordinator --bin lldb-qe-server -- \
   --tls-cert /certs/server.crt --tls-key /certs/server.key --tls-ca /certs/ca.crt \
   --workers https://worker-1.lldb.local:50051 --metadata-url postgres://lldb@localhost/lldb
 cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
+./scripts/mint-fleet-tls.sh                               # fleet CA + cert -> Secrets Manager
+cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet   # TLS fleet (mint first)
 ```
 

@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { LldbStack, EgressMode, ServicesDbMode, WarehouseDefinition } from '../lib/lldb-stack';
+import { LldbStack, EgressMode, ServicesDbMode, TlsMode, WarehouseDefinition } from '../lib/lldb-stack';
 
 const app = new cdk.App();
 
@@ -69,10 +69,22 @@ if (servicesDb && !['aurora', 'none'].includes(servicesDb)) {
   throw new Error(`unknown servicesDb mode '${servicesDb}' (expected aurora | none)`);
 }
 
+// `-c tls=fleet` encrypts Flight inside the VPC, reading the fleet's PEM from three Secrets
+// Manager secrets that `scripts/mint-fleet-tls.sh` fills. Run that script FIRST: the stack imports
+// the secrets rather than creating them, deliberately, so that the private key is never something
+// CDK holds and never something `cdk.out` could carry. Default `none` is today's plaintext fleet.
+const tls = app.node.tryGetContext('tls') as TlsMode | undefined;
+if (tls && !['none', 'fleet'].includes(tls)) {
+  throw new Error(`unknown tls mode '${tls}' (expected none | fleet)`);
+}
+const tlsSecretPrefix = app.node.tryGetContext('tlsSecretPrefix') as string | undefined;
+
 new LldbStack(app, 'LldbStack', {
   imageTag,
   egress,
   servicesDb,
+  tls,
+  tlsSecretPrefix,
   workerCount: workerCountCtx ? Number(workerCountCtx) : undefined,
   warehouses,
   env: {
