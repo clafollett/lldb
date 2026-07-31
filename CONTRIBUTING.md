@@ -65,10 +65,26 @@ same line, `path-refs-allow:`'s idiom:
 //! fleet-posture-allow: a DDL one-shot; binds no port, never handed LLDB_FLEET_TOKEN.
 ```
 
+The same run also verifies [`infra/fleet-posture.json`](infra/fleet-posture.json) — **a generated
+artifact; never hand-edit it** — and fails when the committed copy is not what it just derived.
+Regenerate it in the commit that changed the classification:
+
+```sh
+./scripts/check-fleet-posture.sh --json > infra/fleet-posture.json
+```
+
+That file is how the CDK tests learn which binaries check the posture without shelling out to cargo:
+`infra/test/fleet-posture.test.ts` requires every container the stack hands
+`LLDB_REQUIRE_FLEET_TOKEN` to run a binary the roster lists as checking, and one **absent** from the
+roster fails rather than being skipped as unknown — so a new binary breaks the build by default there
+too (#126). The freshness check lives here rather than in `npm test` because the `cdk synth • test`
+job has node and nothing else; a jest test that shelled out to cargo and jq would either fail there
+or be written to skip when they are missing, which is the silence #116 was filed about.
+
 It needs `jq` — `cargo metadata` is JSON, and hand-parsing it is how a check starts lying. It runs
 under the `rust` path filter rather than unconditionally like `check-path-refs.sh`, because its
-inputs are only manifests and `.rs` sources: a docs-only PR cannot add a binary target or delete a
-call.
+inputs are only manifests, `.rs` sources and the roster: a docs-only PR cannot add a binary target or
+delete a call.
 
 The `cargo doc` line is the one gate `cargo clippy` structurally cannot cover: **clippy never runs
 rustdoc**, so an intra-doc link pointing at a private, renamed or deleted item is invisible to
