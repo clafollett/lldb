@@ -39,8 +39,9 @@
 set -euo pipefail
 
 PREFIX="lldb/fleet-tls"
-DOMAIN="fleet.lldb.local"
-NAMESPACE_WILDCARD="*.lldb.local"
+# Must match the CDK stack's FLEET_TLS_DOMAIN — that is what every client is told to verify.
+DEFAULT_DOMAIN="fleet.lldb.local"
+DOMAIN="$DEFAULT_DOMAIN"
 DAYS=825           # the CA/Browser Forum's cap on leaf lifetime; a sane habit even privately.
 CA_DIR="./fleet-tls-ca"
 
@@ -58,6 +59,26 @@ done
 for tool in openssl aws; do
   command -v "$tool" >/dev/null 2>&1 || { echo "ERROR: $tool is not on PATH" >&2; exit 1; }
 done
+
+# A SAN list is comma-separated and a DNS name has no spaces, so either would corrupt the
+# extension rather than fail — and a certificate with a mangled SAN fails at handshake time on a
+# deployed fleet, which is the most expensive place to find out.
+if [[ -z "$DOMAIN" || "$DOMAIN" =~ [[:space:],] ]]; then
+  echo "ERROR: --domain must be a single DNS name with no spaces or commas (got '$DOMAIN')" >&2
+  exit 2
+fi
+
+# The wildcard is DERIVED from whatever --domain ended up being, never hard-coded: a fixed
+# `*.lldb.local` on a certificate issued for some other domain is an unrelated SAN nobody asked
+# for, and it would be an unrelated name this CA is now vouching for.
+#
+# `${DOMAIN#*.}` drops the first label — `fleet.lldb.local` -> `lldb.local`. A single-label domain
+# has no parent to wildcard, so it gets the exact name alone rather than a nonsense `*.fleet`.
+if [[ "$DOMAIN" == *.* ]]; then
+  SAN="DNS:$DOMAIN,DNS:*.${DOMAIN#*.}"
+else
+  SAN="DNS:$DOMAIN"
+fi
 
 WORK="$(mktemp -d)"
 # The leaf's key exists only inside this directory and only for as long as the upload takes.
@@ -85,7 +106,7 @@ fi
 # ---------------------------------------------------------------------------
 # 2. The leaf every worker serves.
 # ---------------------------------------------------------------------------
-echo "==> [2/3] Issuing a fleet certificate for $DOMAIN (valid ${DAYS}d)"
+echo "==> [2/3] Issuing a fleet certificate for $DOMAIN (SAN: $SAN, valid ${DAYS}d)"
 openssl req -newkey rsa:2048 -nodes -sha256 \
   -keyout "$WORK/fleet.key" -out "$WORK/fleet.csr" \
   -subj "/CN=$DOMAIN" 2>/dev/null
@@ -96,8 +117,8 @@ openssl req -newkey rsa:2048 -nodes -sha256 \
 openssl x509 -req -in "$WORK/fleet.csr" -sha256 -days "$DAYS" \
   -CA "$CA_DIR/ca.crt" -CAkey "$CA_DIR/ca.key" -CAcreateserial \
   -out "$WORK/fleet.crt" \
-  -extfile <(printf 'subjectAltName=DNS:%s,DNS:%s\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n' \
-    "$DOMAIN" "$NAMESPACE_WILDCARD") 2>/dev/null
+  -extfile <(printf 'subjectAltName=%s\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n' \
+    "$SAN") 2>/dev/null
 
 # ---------------------------------------------------------------------------
 # 3. Upload. Three whole-string secrets, not one with JSON keys: `ecs.Secret` grants read on a
@@ -123,11 +144,17 @@ put_secret "$PREFIX-ca"   "$CA_DIR/ca.crt"   "lldb fleet CA — what every role 
 put_secret "$PREFIX-cert" "$WORK/fleet.crt"  "lldb fleet certificate — served by every worker"
 put_secret "$PREFIX-key"  "$WORK/fleet.key"  "lldb fleet private key — workers only, never the coordinator"
 
+# Deleted HERE rather than left to the EXIT trap, so that the claim printed below is true at the
+# moment it is printed. The trap still runs and still cleans the rest up; this is not a substitute
+# for it, it is the difference between a guarantee and an intention.
+rm -f "$WORK/fleet.key"
+
 cat <<EOF
 
-Done. The fleet's private key is in Secrets Manager and nowhere else on this machine.
-The CA private key is in $CA_DIR/ca.key — it was NOT uploaded. Keep it offline, or delete it and
-accept that the next mint replaces the trust root (a full fleet restart, not a rolling one).
+Done. The fleet's private key was deleted from this machine after upload — it now exists only in
+Secrets Manager. The CA private key is a separate thing and IS still here, in $CA_DIR/ca.key: it
+was never uploaded. Keep it offline, or delete it and accept that the next mint replaces the trust
+root (a full fleet restart, not a rolling one).
 
 Next:
   cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet$([[ "$PREFIX" != "lldb/fleet-tls" ]] && echo " -c tlsSecretPrefix=$PREFIX")
@@ -137,3 +164,14 @@ Rotating later: re-run this script, then force a new deployment so tasks pick th
   aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> \\
     --force-new-deployment
 EOF
+
+if [[ "$DOMAIN" != "$DEFAULT_DOMAIN" ]]; then
+  cat >&2 <<EOF
+
+NOTE: this certificate is issued for '$DOMAIN', not the default '$DEFAULT_DOMAIN'.
+Every client verifies the name in LLDB_TLS_DOMAIN, and the CDK stack pins that to
+'$DEFAULT_DOMAIN' — so \`-c tls=fleet\` will fail EVERY handshake against this certificate.
+Use this only where you set LLDB_TLS_DOMAIN=$DOMAIN yourself (compose, or a hand-rolled task
+definition).
+EOF
+fi

@@ -346,12 +346,14 @@ impl TlsArgs {
                 )))
             }
             (Some(_), None) => bail!(
-                "a certificate is set without a private key ({KEY_FLAG} or {KEY_PEM_FLAG}): a \
-                 certificate cannot be served without its --tls-key"
+                "a certificate is set without a private key: a certificate cannot be served \
+                 without one. Set {KEY_FLAG} to a file, or {KEY_PEM_FLAG} to the material itself \
+                 where a file cannot be mounted."
             ),
             (None, Some(_)) => bail!(
-                "a private key is set without a certificate ({CERT_FLAG} or {CERT_PEM_FLAG}): a \
-                 private key names no --tls-cert to serve"
+                "a private key is set without a certificate: a private key names nothing to \
+                 serve. Set {CERT_FLAG} to a file, or {CERT_PEM_FLAG} to the material itself \
+                 where a file cannot be mounted."
             ),
             (None, None) => match (credential, self.allow_plaintext) {
                 (CredentialCheck::None, _) => {
@@ -751,22 +753,39 @@ mod tests {
     /// A half-configured identity is always a mistake, never a posture, so it is an error in both
     /// directions rather than a silent fall-through to plaintext — which is the failure mode that
     /// would turn a typo into an unencrypted production port.
+    ///
+    /// Each message must name **both** spellings of the half that is missing. Naming only the path
+    /// one would send an ECS operator looking for a flag their platform cannot satisfy — a file is
+    /// exactly what they do not have, which is the whole reason the `-pem` variants exist.
     #[test]
-    fn half_an_identity_is_an_error_either_way() {
+    fn half_an_identity_is_an_error_either_way_and_names_both_spellings() {
         let mut cert_only = args();
         cert_only.tls_cert = Some(PathBuf::from("/nonexistent/cert.pem"));
         let error = cert_only
             .resolve_server(CredentialCheck::None)
             .expect_err("a certificate with no key cannot be served");
-        assert!(format!("{error:#}").contains("--tls-key"), "got: {error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("--tls-key "), "got: {message}");
+        assert!(message.contains("--tls-key-pem"), "got: {message}");
 
         let mut key_only = args();
         key_only.tls_key = Some(PathBuf::from("/nonexistent/key.pem"));
         let error = key_only
             .resolve_server(CredentialCheck::None)
             .expect_err("a key with no certificate names nothing to serve");
+        let message = format!("{error:#}");
+        assert!(message.contains("--tls-cert "), "got: {message}");
+        assert!(message.contains("--tls-cert-pem"), "got: {message}");
+
+        // …and the same for an identity whose *present* half arrived inline, which is the shape a
+        // Fargate task actually has.
+        let mut inline_cert_only = args();
+        inline_cert_only.tls_cert_pem = Some(FAKE_PEM.to_string());
+        let error = inline_cert_only
+            .resolve_server(CredentialCheck::None)
+            .expect_err("an injected certificate with no key cannot be served");
         assert!(
-            format!("{error:#}").contains("--tls-cert"),
+            format!("{error:#}").contains("--tls-key-pem"),
             "got: {error:#}"
         );
     }

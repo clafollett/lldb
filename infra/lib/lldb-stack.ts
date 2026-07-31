@@ -141,9 +141,12 @@ export type ServicesDbMode = 'aurora' | 'none';
  * breaker would fail the stack, and the rollback would delete the secrets you were about to fill.
  *
  * Three whole-string secrets rather than one with JSON keys, because that is what buys the IAM
- * boundary worth having: **the coordinator's execution role is granted the CA and the certificate,
- * never the private key.** (`ecs.Secret` grants read on a whole secret; a JSON key selects a field,
- * it does not scope access.) It costs ~$1.20/month, and only in this mode.
+ * boundary worth having: **the coordinator's execution role is granted the CA alone — never the
+ * certificate and never the private key.** It binds no port, so an identity is material it has no
+ * use for, and the least it can be given is the trust it dials with. (`ecs.Secret` grants read on
+ * a whole secret; a JSON key selects a field, it does not scope access — which is why one secret
+ * with three keys would make this a convention rather than a boundary.) It costs ~$1.20/month, and
+ * only in this mode.
  */
 export type TlsMode = 'none' | 'fleet';
 
