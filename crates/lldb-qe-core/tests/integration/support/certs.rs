@@ -1,5 +1,5 @@
-//! One throwaway certificate authority for the whole test binary, and the two things the TLS
-//! tests do with it.
+//! One throwaway certificate authority for the whole test binary, one deliberately unrelated root
+//! beside it, and the things the TLS tests do with them.
 //!
 //! # Why the certificate is minted rather than committed
 //!
@@ -11,20 +11,30 @@
 //! duplicate crate version (see the workspace manifest, and `cargo tree -d`), so the suite mints its
 //! own CA on first use and nothing is ever written to the repository.
 //!
-//! # Why it is *one* CA, in a `OnceLock`
+//! # Why exactly one CA is *installed*, in a `OnceLock`
 //!
 //! Everything under `tests/integration` is one binary, therefore one process, therefore one
 //! [`lldb_qe_core::tls::install_client_trust`] — see `main.rs`'s list of process-global state.
-//! Two TLS tests that minted two CAs would race to install two different trusts and whichever lost
-//! would fail intermittently. Sharing one makes every install idempotent *in value*, so the race
-//! stops existing rather than being managed.
+//! Two TLS tests that minted two CAs and installed both would race to set two different trusts and
+//! whichever lost would fail intermittently. [`shared`] is the one every install names, which makes
+//! every install idempotent *in value*, so the race stops existing rather than being managed.
 //!
-//! Generation is not free (two key pairs), which is the other reason to do it once.
+//! [`unrelated_root`] is a second root and does **not** break that rule, because nothing installs
+//! it: it is only ever handed to [`bundle_trust`], which returns a [`ClientTrust`] the caller dials
+//! with directly. A trust that is never ambient is a trust no other test can observe. Building one
+//! per dial rather than installing it is the whole reason a suite about *what a client trusts* can
+//! live in the shared binary at all.
+//!
+//! Generation is not free (a key pair apiece), which is the other reason each is minted once.
 
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use lldb_qe_core::tls::{ClientTrust, ServerTls, TlsArgs, TlsClientArgs, install_client_trust};
+use rcgen::{
+    BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer, KeyPair,
+    KeyUsagePurpose,
+};
 
 /// The name the leaf certificate is issued for, and the name a client verifies against.
 ///
@@ -50,24 +60,46 @@ pub fn shared() -> &'static TestCerts {
     CERTS.get_or_init(|| generate().expect("minting a test CA cannot fail"))
 }
 
-fn generate() -> Result<TestCerts> {
-    use rcgen::{
-        BasicConstraints, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
-        KeyPair, KeyUsagePurpose,
-    };
+/// The PEM of a second root, **independent of [`shared`]'s and signing nothing this suite serves**.
+///
+/// It exists so a test can build a real trust *bundle* — two roots, one of which is irrelevant to
+/// the certificate on the wire — and assert both halves of what `--tls-ca` / `--tls-ca-pem` being a
+/// bundle means: the signing root still anchors the chain when it is not alone, and a root that
+/// signed nothing anchors nothing. That property is what `infra/README.md`'s *Rotating* runbook
+/// spends three restarts on, and it is inherited from rustls by way of tonic rather than
+/// implemented here — so nothing but a test holds it (issue #137).
+///
+/// Never installed as this process's trust: it is not value-identical to [`install_test_trust`]'s,
+/// and the module docs above say why that matters. Use [`bundle_trust`].
+pub fn unrelated_root() -> &'static str {
+    static ROOT: OnceLock<String> = OnceLock::new();
+    ROOT.get_or_init(|| {
+        mint_ca("lldb integration-test UNRELATED CA")
+            .expect("minting a second root cannot fail")
+            .1
+    })
+}
 
-    // A real CA, not a self-signed leaf. rustls builds a `RootCertStore` from `--tls-ca` and
-    // webpki will refuse a trust anchor that is not marked as a certificate authority, so
-    // "generate one self-signed cert and trust it" fails with an opaque `UnknownIssuer`.
-    let ca_key = KeyPair::generate().context("generating the CA key")?;
-    let mut ca_params = CertificateParams::new(Vec::<String>::new())?;
-    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-    ca_params
+/// A self-signed certificate authority: the issuer that can sign a leaf, and the PEM a client
+/// trusts.
+///
+/// A real CA, not a self-signed leaf. rustls builds a `RootCertStore` from `--tls-ca` and webpki
+/// will refuse a trust anchor that is not marked as a certificate authority, so "generate one
+/// self-signed cert and trust it" fails with an opaque `UnknownIssuer`.
+fn mint_ca(common_name: &str) -> Result<(Issuer<'static, KeyPair>, String)> {
+    let key = KeyPair::generate().context("generating a CA key")?;
+    let mut params = CertificateParams::new(Vec::<String>::new())?;
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    params
         .distinguished_name
-        .push(DnType::CommonName, "lldb integration-test CA");
-    let ca_cert = ca_params.self_signed(&ca_key)?;
-    let issuer = Issuer::new(ca_params, ca_key);
+        .push(DnType::CommonName, common_name);
+    let pem = params.self_signed(&key)?.pem();
+    Ok((Issuer::new(params, key), pem))
+}
+
+fn generate() -> Result<TestCerts> {
+    let (issuer, ca_pem) = mint_ca("lldb integration-test CA")?;
 
     let leaf_key = KeyPair::generate().context("generating the server key")?;
     let mut leaf_params = CertificateParams::new(vec![TEST_DOMAIN.to_string()])?;
@@ -78,7 +110,7 @@ fn generate() -> Result<TestCerts> {
     let leaf_cert = leaf_params.signed_by(&leaf_key, &issuer)?;
 
     Ok(TestCerts {
-        ca_pem: ca_cert.pem(),
+        ca_pem,
         cert_pem: leaf_cert.pem(),
         key_pem: leaf_key.serialize_pem(),
     })
@@ -184,4 +216,16 @@ pub fn inline_trust() -> Result<ClientTrust> {
         tls_domain: Some(TEST_DOMAIN.to_string()),
     }
     .to_trust()
+}
+
+/// A dialing trust over `roots` **concatenated**, verifying peers as [`TEST_DOMAIN`].
+///
+/// Plain concatenation and not a join, because that is literally what the runbook does:
+/// `cat ./fleet-tls-ca/ca.crt ./fleet-tls-ca-new/ca.crt > ./both-roots.pem`. Every block rcgen emits
+/// already ends in a newline, so this is byte-for-byte the file an operator produces.
+///
+/// Returned, never installed — see the module docs. That is what lets a test dial with a trust of
+/// its own without any other test in this binary being able to observe it.
+pub fn bundle_trust(roots: &[&str]) -> ClientTrust {
+    ClientTrust::from_pem(roots.concat().into_bytes(), Some(TEST_DOMAIN.to_string()))
 }

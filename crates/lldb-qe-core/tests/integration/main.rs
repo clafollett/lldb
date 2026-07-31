@@ -84,9 +84,12 @@
 //!   separate target — except that it is consulted **only for `https://` URLs**. Every other test in
 //!   this binary dials `http://`, so installing a CA is genuinely inert for them, and
 //!   `flight_tls::with_no_certificates_at_all_the_plaintext_path_is_unchanged` asserts that rather
-//!   than assuming it. All TLS tests share one CA (`support::certs::shared`), so concurrent installs
-//!   agree on a value and the race has no losing side. A test that installed a *different* trust
-//!   would reintroduce one.
+//!   than assuming it. Every test that *installs* one installs `support::certs::shared`'s CA, so
+//!   concurrent installs agree on a value and the race has no losing side. A test that installed a
+//!   *different* trust would reintroduce one. Issue #137 needed exactly such a trust — a bundle of
+//!   two roots, and a bundle missing the one that signed the peer — and so does not install either:
+//!   `ClientTrust::dial` is a method on an instance, so a trust built per dial is a trust no other
+//!   test can observe. That is the shape to copy, rather than adding a second installed value.
 //!
 //! Issue #112 added the sixth, and it is the one whose whole purpose is to be process-wide:
 //!
