@@ -47,7 +47,8 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::net::SocketAddr;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
+use url::{ParseError, Url};
 
 /// The token a warehouse endpoint template must contain, replaced with the warehouse's name.
 pub const WAREHOUSE_PLACEHOLDER: &str = "{warehouse}";
@@ -94,6 +95,10 @@ pub fn render_warehouse_endpoint(template: &str, warehouse: &str) -> Result<Stri
 /// Results are deduped preserving first-seen order (so two endpoints that overlap, or a name that
 /// happens to include a literal you also passed, do not double-schedule a worker), and the scheme
 /// and port from the endpoint are preserved on every expanded URL.
+///
+/// Endpoints are parsed with `url::Url` (see `Endpoint`, and #111 for why that is not a hand-rolled
+/// split), so the host is normalized — lower-cased, IDN punycoded, percent-decoded — before it is
+/// resolved, and an endpoint with no host is refused rather than resolved.
 ///
 /// Resolution runs on every call, so the returned fleet reflects the service's *current* task set:
 /// scaling the fleet changes the number of URLs returned here, and thus the plan's fan-out, without
@@ -156,76 +161,116 @@ where
 }
 
 /// A parsed `scheme://host:port` worker endpoint.
+///
+/// # One parser, because this module is where the fleet list comes from
+///
+/// This used to be hand-rolled `split("://")` work, under a comment claiming "no `url` crate — a
+/// dependency the pins do not want". That reason was never true: `url` is a direct dependency of
+/// this crate already ([`crate::services`] composes connection URLs with it), it is one version
+/// tree-wide, and the pin rule is about `arrow`/`datafusion`/`object_store` duplication rather than
+/// about crate count. What the second parser *did* cost is that
+/// `crates/lldb-qe-core/src/remote.rs` keys a worker's identity — the thing that decides whether
+/// two fleet entries are one node — off `Url::parse` of the very strings this module emits. Two
+/// parsers for one concept disagree eventually, and by the time a disagreement reaches that dedup
+/// the spellings are already distinct strings, so it cannot repair them.
+///
+/// Sharing one *type* between the two sites is the tempting fix and it is not available here:
+/// `lldb-qe-core` depends on `lldb-qe-control`, never the reverse, so the shared thing would have
+/// to move down into this crate — a code move, not this change. They also answer different
+/// questions: `WorkerIdentity` asks "same node?" (and so folds a default port in), while this asks
+/// "is this a usable endpoint?" (and so demands the port be written). What they must agree on is
+/// **what an origin is**, and they now do, because both get it from `Url`.
 struct Endpoint {
-    /// `http` or `https`.
+    /// `http` or `https`, lower-cased by `Url` — so `HTTP://…` is the same endpoint as `http://…`.
     scheme: String,
-    /// The host to resolve — a DNS name or a literal IP (possibly IPv6).
+    /// The host to resolve, as `Url` normalizes it: lower-cased, IDN punycoded, percent-decoded,
+    /// and an IPv6 literal left **bracketed** (`[::1]`) so it concatenates straight onto `:port`.
     host: String,
     /// The Flight port, preserved onto every expanded URL.
     port: u16,
 }
 
 impl Endpoint {
-    /// Parse `scheme://host:port` by hand (no `url` crate — a dependency the pins do not want, and
-    /// this shape is small enough to read at a glance). IPv6 literal hosts are accepted in the
-    /// bracketed form `scheme://[::1]:port`.
+    /// Parse `scheme://host:port` with [`Url`], then apply the two rules Flight adds on top of it:
+    /// the scheme must be one we dial, and the port must be written out.
+    ///
+    /// Do **not** drop the host check on the grounds that `Url` already guarantees a host for a
+    /// special scheme — it does, an empty host is a parse error for `http`/`https`, and the scheme
+    /// check below would refuse the rest anyway. What it buys is the *message*: an endpoint written
+    /// without its scheme parses as a scheme with the rest as a path and no host at all
+    /// (`w1:50051` is scheme `w1`, path `50051`), and reporting that as "unsupported scheme `w1`"
+    /// sends an operator looking for the wrong bug. The refusal being over-determined is the point
+    /// — every URL this module emits has an origin, so `WorkerIdentity` can key all of them, and
+    /// never has to fall back to comparing whole strings.
     fn parse(raw: &str) -> Result<Self> {
-        let (scheme, rest) = raw
-            .split_once("://")
-            .with_context(|| format!("worker endpoint `{raw}` is missing a `scheme://`"))?;
-        if scheme != "http" && scheme != "https" {
+        let url = Url::parse(raw).map_err(|err| match err {
+            // `url`'s own words for a string with no scheme are "relative URL without a base",
+            // which tells an operator staring at `--workers` nothing.
+            ParseError::RelativeUrlWithoutBase => {
+                anyhow!("worker endpoint `{raw}` is missing a `scheme://` (expected http or https)")
+            }
+            other => anyhow!("worker endpoint `{raw}` is not a URL: {other}"),
+        })?;
+
+        let host = url.host_str().with_context(|| {
+            format!(
+                "worker endpoint `{raw}` has no host — it parses as scheme `{}` with the rest as a \
+                 path, which is what a `scheme://` left off does",
+                url.scheme()
+            )
+        })?;
+        if url.scheme() != "http" && url.scheme() != "https" {
             bail!(
-                "worker endpoint `{raw}` has unsupported scheme `{scheme}` (expected http or https)"
+                "worker endpoint `{raw}` has unsupported scheme `{}` (expected http or https)",
+                url.scheme()
             );
         }
 
-        // Drop any trailing path — endpoints are bare authorities, but be forgiving of a stray `/`.
-        let authority = rest.split('/').next().unwrap_or(rest);
-
-        let (host, port_str) = if let Some(after_bracket) = authority.strip_prefix('[') {
-            // Bracketed IPv6 literal: `[::1]:port`.
-            let (host, tail) = after_bracket.split_once(']').with_context(|| {
-                format!("worker endpoint `{raw}` has an unterminated IPv6 literal (missing `]`)")
-            })?;
-            let port_str = tail.strip_prefix(':').with_context(|| {
+        let port = match url.port() {
+            Some(port) => port,
+            None => Self::written_default_port(raw, &url).with_context(|| {
                 format!(
                     "worker endpoint `{raw}` is missing a `:port` (Flight needs an explicit port)"
                 )
-            })?;
-            (host.to_string(), port_str)
-        } else {
-            // `host:port`; `rsplit_once` so a bare (unbracketed) IPv6 would still take the last
-            // colon, though callers should bracket those.
-            let (host, port_str) = authority.rsplit_once(':').with_context(|| {
-                format!(
-                    "worker endpoint `{raw}` is missing a `:port` (Flight needs an explicit port)"
-                )
-            })?;
-            (host.to_string(), port_str)
+            })?,
         };
 
-        if host.is_empty() {
-            bail!("worker endpoint `{raw}` has an empty host");
-        }
-        let port: u16 = port_str
-            .parse()
-            .with_context(|| format!("worker endpoint `{raw}` has an invalid port `{port_str}`"))?;
-
         Ok(Self {
-            scheme: scheme.to_string(),
-            host,
+            scheme: url.scheme().to_string(),
+            host: host.to_string(),
             port,
         })
     }
 
-    /// The `"host:port"` string to hand a resolver. IPv6 literal hosts are re-bracketed so
-    /// `lookup_host` parses them.
+    /// The scheme's default port, but only when `raw` actually wrote it.
+    ///
+    /// `Url` *erases* a port equal to its scheme's default, so `https://w:443` and `https://w` both
+    /// report `port() == None`. Those two must not collapse: one is a fleet behind a TLS load
+    /// balancer and the other is the commonest `--workers` typo, so folding them together with
+    /// `port_or_known_default()` would silently dial `:80` for `http://w` and lose the startup
+    /// error that names the mistake, while refusing both would stop resolving a deployment that
+    /// works today. The distinction survives only in the text — `Url` has already validated that
+    /// text, so all that is left is to ask whether the authority ends in the default port.
+    fn written_default_port(raw: &str, url: &Url) -> Option<u16> {
+        let default = url.port_or_known_default()?;
+        // `Url` trims leading/trailing C0 controls and spaces, and accepts any number of `/` or `\`
+        // after a special scheme's `:` — read the text the same way, or ` http://w:443` would parse
+        // above and be rejected here.
+        let text = raw.trim_matches(|c: char| c <= ' ');
+        let after_scheme = text.split_once(':')?.1.trim_start_matches(['/', '\\']);
+        let authority = after_scheme.split(['/', '?', '#']).next()?;
+        let (_, written) = authority.rsplit_once(':')?;
+        (written.parse::<u16>().ok()? == default).then_some(default)
+    }
+
+    /// The `"host:port"` string to hand a resolver.
+    ///
+    /// Nothing re-brackets an IPv6 literal here because [`Self::host`] is already bracketed. The
+    /// hand-rolled parser this replaced instead tested `host.contains(':')`, which fired on any
+    /// host holding a colon for another reason: `http://user:pass@w:50051` became the authority
+    /// `[user:pass@w]:50051`, a fabricated IPv6 literal that resolves to nothing.
     fn authority(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
-        }
+        format!("{}:{}", self.host, self.port)
     }
 }
 
@@ -401,5 +446,148 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(fleet, vec!["http://[::1]:50051"]);
+    }
+
+    /// Every shape the hand-rolled `split("://")` parser and `url::Url` read differently — the
+    /// list that made two parsers for one concept worth removing (#111).
+    ///
+    /// The comment beside each entry is what the *old* parser did with it. Only the first group is
+    /// a loosening; the second is the set of spellings that stop being accepted, and every one of
+    /// them was already unresolvable — the old parser handed the resolver a host it could not have
+    /// looked up — so nothing that worked stops working.
+    #[test]
+    fn the_shapes_where_a_hand_rolled_parser_and_url_disagree() {
+        let accepted = [
+            // Rejected: scheme `HTTP` matched neither literal.
+            ("HTTP://w.local:50051", "w.local:50051"),
+            // Rejected: scheme ` http`. This is what `LLDB_WORKERS="a, b"` yields once clap has
+            // split on the comma, so it is a real operator spelling and not a curiosity.
+            (" http://w.local:50051 ", "w.local:50051"),
+            // Accepted, but resolved under the case it was written in. DNS does not care; the fleet
+            // list does, because a worker's identity is keyed on the *normalized* host.
+            ("http://W.LOCAL:50051", "w.local:50051"),
+            // Rejected: the port parse was handed `50051?q=1` / `50051#frag`.
+            ("http://w.local:50051?q=1", "w.local:50051"),
+            ("http://w.local:50051#frag", "w.local:50051"),
+            // Rejected: `://` was matched literally, and a special scheme tolerates any number of
+            // slashes.
+            ("http:/w.local:50051", "w.local:50051"),
+            // Accepted as host `user:pass@w.local`, which `authority()` then re-bracketed into the
+            // fabricated IPv6 literal `[user:pass@w.local]:50051`.
+            ("http://user:pass@w.local:50051", "w.local:50051"),
+            // Handed to the resolver as raw UTF-8 / still percent-encoded; getaddrinfo speaks
+            // neither, so both were guaranteed NXDOMAIN.
+            ("http://wörker.local:50051", "xn--wrker-jua.local:50051"),
+            ("http://w%2Elocal:50051", "w.local:50051"),
+            // Unchanged, and the reason `written_default_port` exists: `Url::port()` erases a port
+            // equal to the scheme's default, and these must keep resolving.
+            ("https://w.local:443", "w.local:443"),
+            ("http://w.local:80", "w.local:80"),
+            (" https://w.local:443 ", "w.local:443"),
+            ("http://[::1]:80", "[::1]:80"),
+        ];
+        for (raw, authority) in accepted {
+            let endpoint = Endpoint::parse(raw).unwrap_or_else(|err| panic!("`{raw}`: {err:#}"));
+            assert_eq!(endpoint.authority(), authority, "`{raw}`");
+        }
+
+        let refused = [
+            // Accepted with a host holding a character no resolver accepts.
+            "http://w local:50051",
+            "http://x|y:50051",
+            "http://ho%zzst:50051",
+            // Accepted as host `w.local:50051`, port 2 — the same re-bracketing bug.
+            "http://w.local:50051:2",
+            // Accepted, and expanded to `http://[fe80::1%<scope>]:50051`, a URL `Url` cannot parse
+            // at all — so the fleet list held an entry the other parser could only key verbatim.
+            "http://[fe80::1%eth0]:50051",
+            // Unchanged: a port `Url` erased is only a port if it was written.
+            "https://w.local",
+            "http://w.local",
+        ];
+        for raw in refused {
+            assert!(
+                Endpoint::parse(raw).is_err(),
+                "`{raw}` must not be accepted as an endpoint"
+            );
+        }
+    }
+
+    /// The property that replaces "two parsers that happen to agree": every endpoint this module
+    /// accepts, and every URL it emits, is an **origin** — a `url::Url` with a host — whose scheme,
+    /// host and port are exactly what `Url` says they are.
+    ///
+    /// That is the pin. `WorkerIdentity` in `crates/lldb-qe-core/src/remote.rs` keys a worker on
+    /// `Url::parse(url).host_str()` plus `port_or_known_default()`, so a fleet list assembled here
+    /// can only be read one way. It cannot import that type — `lldb-qe-core` depends on this crate,
+    /// not the reverse — so it asserts against the two calls that type makes.
+    #[tokio::test]
+    async fn everything_accepted_and_emitted_is_an_origin_url_can_key() {
+        let endpoints = eps(&[
+            "http://worker.lldb.local:50051",
+            "HTTPS://Secure.Local:8443",
+            "http://[::1]:50051",
+            "http://10.0.0.4:50051",
+            "https://balanced.local:443",
+        ]);
+
+        for raw in &endpoints {
+            let endpoint = Endpoint::parse(raw).unwrap_or_else(|err| panic!("`{raw}`: {err:#}"));
+            let keyed = Url::parse(raw).unwrap_or_else(|err| panic!("`{raw}`: {err}"));
+            assert_eq!(keyed.scheme(), endpoint.scheme, "`{raw}` scheme");
+            assert_eq!(
+                keyed.host_str(),
+                Some(endpoint.host.as_str()),
+                "`{raw}` host"
+            );
+            assert_eq!(
+                keyed.port_or_known_default(),
+                Some(endpoint.port),
+                "`{raw}` port"
+            );
+        }
+
+        let resolve = resolver(vec![
+            ("worker.lldb.local:50051", vec!["10.0.0.1:50051"]),
+            ("secure.local:8443", vec!["10.0.0.2:8443"]),
+            ("[::1]:50051", vec!["[::1]:50051"]),
+            ("10.0.0.4:50051", vec!["10.0.0.4:50051"]),
+            ("balanced.local:443", vec!["10.0.0.5:443"]),
+        ]);
+        let fleet = discover_workers_with(&endpoints, resolve).await.unwrap();
+        assert_eq!(fleet.len(), 5);
+        for url in &fleet {
+            let keyed = Url::parse(url).unwrap_or_else(|err| panic!("emitted `{url}`: {err}"));
+            assert!(
+                keyed.host_str().is_some(),
+                "emitted `{url}` has no origin, so a worker would be keyed on the whole string"
+            );
+            // `port_or_known_default`, not `port`: an emitted `https://10.0.0.5:443` writes its
+            // port out and `Url` erases it again on the way back in — the same erasure
+            // [`Endpoint::written_default_port`] exists for, seen from the other end.
+            assert!(
+                keyed.port_or_known_default().is_some(),
+                "emitted `{url}` must carry a port"
+            );
+        }
+    }
+
+    /// The converse property, on the shape #109's review caught: an endpoint written without its
+    /// scheme parses into a scheme with a path and *no host*. Which of `parse`'s checks refuses it
+    /// is an implementation detail; that discovery refuses it here — rather than resolving it into
+    /// the fleet list, where nothing downstream can key it — is not.
+    #[test]
+    fn an_endpoint_with_no_origin_is_refused_here() {
+        for raw in ["w1:50051", "worker.local:50051", "mailto:ops@example.com"] {
+            assert_eq!(
+                Url::parse(raw).unwrap().host_str(),
+                None,
+                "`{raw}` is expected to parse without a host"
+            );
+            assert!(
+                Endpoint::parse(raw).is_err(),
+                "`{raw}` has no origin, so discovery must refuse it rather than resolve it"
+            );
+        }
     }
 }
