@@ -703,7 +703,7 @@ fn refuse_before_encoding(plan: &Arc<dyn ExecutionPlan>) -> DFResult<()> {
 
 /// Serialize a plan with this codec, so nested [`FlightReaderExec`] nodes survive.
 ///
-/// A plan holding a node we can explain is refused *here*, by [`refuse_before_encoding`], rather
+/// A plan holding a node we can explain is refused *here*, by `refuse_before_encoding`, rather
 /// than by the codec — read that function for what `datafusion-proto` does to an error the codec
 /// returns, and why nothing an operator must act on may be raised from inside it.
 pub fn serialize_plan(plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {

@@ -422,7 +422,7 @@ impl Admission {
     ///    permit. Giving it back to poll again would send it to the back of the local queue and turn
     ///    fleet contention into local unfairness.
     /// 3. **The queue cap is exact under a burst**, via the compare-and-swap in
-    ///    [`Admission::reserve_queue_slot`] — and a query held up by the *fleet* takes a place in
+    ///    `Admission::reserve_queue_slot` — and a query held up by the *fleet* takes a place in
     ///    that same line, because from a client's point of view it is queued for the same reason.
     /// 4. **`place` is dropped between the wait and `occupy`**, so no snapshot ever counts one query
     ///    as both queued and running.
@@ -533,7 +533,7 @@ impl Admission {
     ///
     /// **A peak is never reported below its current value**, and that clamp is load-bearing rather
     /// than cosmetic. A place is taken in two steps — `queued` is raised by the compare-and-swap in
-    /// [`Self::reserve_queue_slot`], then `peak_queued` is raised to match — and `running` is the
+    /// `Admission::reserve_queue_slot`, then `peak_queued` is raised to match — and `running` is the
     /// same shape. Two atomics cannot be advanced as one without a lock, so between those steps an
     /// observer could read `queued: 1, peak_queued: 0`: a snapshot asserting a peak *lower* than
     /// something it can see happening right now. Taking the max here closes that window for every

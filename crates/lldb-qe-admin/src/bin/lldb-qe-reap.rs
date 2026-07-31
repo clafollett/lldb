@@ -14,11 +14,10 @@
 //! - **It is idempotent.** A second run immediately after a first reaps nothing, because the rows
 //!   the first one resolved are terminal and terminal rows are not eligible. Running it on a
 //!   perfectly healthy fleet is a no-op that reports zero.
-//! - **It is bounded.** One run resolves at most `--limit` rows (default
-//!   [`DEFAULT_REAP_BATCH`](lldb_qe_control::reaper::DEFAULT_REAP_BATCH)) and says so when it
-//!   fills the batch. That is `lldb-qe-core`'s `result_cache` rule for sweeps, for the same
-//!   reason: a maintenance task whose cost is proportional to a deployment's entire accumulated
-//!   backlog is the one that turns a bad week into an incident.
+//! - **It is bounded.** One run resolves at most `--limit` rows (default [`DEFAULT_REAP_BATCH`])
+//!   and says so when it fills the batch. That is `lldb-qe-core`'s `result_cache` rule for sweeps,
+//!   for the same reason: a maintenance task whose cost is proportional to a deployment's entire
+//!   accumulated backlog is the one that turns a bad week into an incident.
 //!
 //! # Why a separate binary, and not a coordinator doing this at startup
 //!
@@ -74,6 +73,8 @@ struct Cli {
     /// would make `--limit 0` reap a row while `report_batch` compared `0 >= 0` and announced the
     /// batch was full. An operator's number should mean what it says or be refused; it should not
     /// quietly become a different number.
+    ///
+    /// [`ServicesDb::reap_stranded_queries`]: lldb_qe_control::ServicesDb::reap_stranded_queries
     #[arg(
         long,
         env = "LLDB_REAP_LIMIT",
@@ -217,6 +218,8 @@ async fn run(db: &lldb_qe_control::ServicesDb, cli: &Cli, account_id: Option<i64
 /// [`report_batch`] compared `0 >= 0` and announced the batch was full, so the run would both do
 /// something the operator did not ask for and describe it wrongly. A number should mean what it
 /// says or be refused.
+///
+/// [`ServicesDb::reap_stranded_queries`]: lldb_qe_control::ServicesDb::reap_stranded_queries
 fn positive_limit(raw: &str) -> Result<usize, String> {
     match raw.parse::<usize>() {
         Ok(0) => Err("must be at least 1; a sweep of zero rows resolves nothing".to_string()),

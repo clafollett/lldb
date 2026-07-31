@@ -10,29 +10,27 @@
 //! # The policy, in one sentence
 //!
 //! **Distribute what can be distributed and reduce locally; offload a boundary-less plan whole to
-//! one worker.** [`plan_distributed`](crate::plan_distributed) cuts every distribution boundary it
-//! recognizes into a DAG of stages fanned across the fleet, and returns the plan *unchanged* when
-//! there is nothing to cut (a constant query, a bare scan). So "did it actually distribute" is
-//! answered by looking for the [`FlightReaderExec`] leaves the rewrite inserts — if they are
-//! there, the coordinator runs the reduce side locally and those leaves pull each stage over
-//! Flight; if they are not, the whole plan is shipped to one worker, which keeps even a trivial
-//! query exercising a real worker (what the cross-container smoke test relies on).
+//! one worker.** [`plan_distributed`] cuts every distribution boundary it recognizes into a DAG of
+//! stages fanned across the fleet, and returns the plan *unchanged* when there is nothing to cut (a
+//! constant query, a bare scan). So "did it actually distribute" is answered by looking for the
+//! [`FlightReaderExec`] leaves the rewrite inserts — if they are there, the coordinator runs the
+//! reduce side locally and those leaves pull each stage over Flight; if they are not, the whole
+//! plan is shipped to one worker, which keeps even a trivial query exercising a real worker (what
+//! the cross-container smoke test relies on).
 //!
 //! Both paths tolerate losing a worker: the distributed one reassigns each stage through the
-//! fallbacks its leaves carry, and the offload path walks the fleet with
-//! [`fetch_with_failover`](crate::fetch_with_failover).
+//! fallbacks its leaves carry, and the offload path walks the fleet with [`fetch_with_failover`].
 //!
 //! # One step comes before the policy: Iceberg scans are resolved to files
 //!
 //! An `iceberg-datafusion` `IcebergTableScan` holds a live catalog handle and resolves its own
 //! files at execute time, which makes it both unserializable and unsliceable — so before this
-//! module's policy runs at all, [`resolve_iceberg_scans`](crate::iceberg_scan::resolve_iceberg_scans)
-//! rewrites every such node into a plain parquet scan over the concrete data files of the snapshot
-//! it was planned against. That is what lets an Iceberg query be distributed *and* what pins the
-//! snapshot: the file list travels inside the plan bytes, so a worker never resolves "current"
-//! itself and needs no catalog access. It runs here, in the shared funnel, for the same reason
-//! everything else here does — a coordinator that resolved and a server that did not would be two
-//! engines with two answers.
+//! module's policy runs at all, [`resolve_iceberg_scans`] rewrites every such node into a plain
+//! parquet scan over the concrete data files of the snapshot it was planned against. That is what
+//! lets an Iceberg query be distributed *and* what pins the snapshot: the file list travels inside
+//! the plan bytes, so a worker never resolves "current" itself and needs no catalog access. It runs
+//! here, in the shared funnel, for the same reason everything else here does — a coordinator that
+//! resolved and a server that did not would be two engines with two answers.
 //!
 //! # Writes are the exception: they never leave this process
 //!
@@ -257,7 +255,7 @@ enum SessionSource {
 type PendingSession = Arc<OnceCell<Arc<TenantSession>>>;
 
 impl TenantSessions {
-    /// One session, used for every account. See [`SessionSource::Fixed`] for when that is right.
+    /// One session, used for every account. See `SessionSource::Fixed` for when that is right.
     pub fn fixed(session: TenantSession) -> Self {
         Self {
             source: SessionSource::Fixed(Arc::new(session)),
@@ -538,9 +536,9 @@ async fn run_on_fleet(
     }
 }
 
-/// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e.
-/// [`plan_distributed`](crate::plan_distributed) actually cut a distribution boundary and inserted
-/// remote reads, rather than returning the plan unchanged.
+/// True if `plan` contains at least one [`FlightReaderExec`] leaf — i.e. [`plan_distributed`]
+/// actually cut a distribution boundary and inserted remote reads, rather than returning the plan
+/// unchanged.
 pub fn contains_flight_reader(plan: &Arc<dyn ExecutionPlan>) -> bool {
     let mut found = false;
     // `apply` is infallible here (the closure never errors), so the expect cannot fire.

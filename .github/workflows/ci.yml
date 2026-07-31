@@ -181,6 +181,34 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings
 
+      # The gate `cargo clippy` structurally cannot be: **clippy never runs rustdoc**, so an
+      # intra-doc link to a private, renamed or deleted item is invisible to `-D warnings` above no
+      # matter how strict that line gets. It is the same shape as the `__eh_frame` gap in
+      # docs/build-performance.md — clippy not *linking* is why no lint can see a linker message —
+      # and it is why #77's warnings accumulated for the whole life of the repo unnoticed. A broken
+      # link does not render as a broken link, either: it renders as plain text that looks like it
+      # should be one, so the cross-references that carry this project's design rationale rot
+      # silently in the published docs.
+      #
+      # A step here rather than its own job, for the reason `Fleet posture` above is a step: this
+      # gate's only inputs are `.rs` sources, exactly what the `rust` filter selects, and no .md
+      # change can break an intra-doc link.
+      #
+      # Priced before it was placed, and the price is what decided step-vs-job. `--no-deps` reuses
+      # the dependency artifacts Clippy just built — cargo checks dependencies identically for both,
+      # and only workspace members get re-checked under rustdoc — so the marginal cost here is ~14 s
+      # cold and ~13 s warm, against ~66 s for the same command run against an empty target
+      # directory. That 66 s is what a separate job would pay *before* its own checkout, toolchain
+      # install and cache restore, to re-derive artifacts this job already has. Hence: AFTER Clippy,
+      # for the reuse, and BEFORE Test, so a doc break is not queued behind the longest step here.
+      #
+      # Do not "fix" a failure here with `#[allow(rustdoc::…)]`; that converts the signal into
+      # permanent silence. Export the item, or demote the link to backticks — per site.
+      - name: Doc links
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps
+
       - name: Test
         env:
           # Point the services-database tests at the service container above so they actually run

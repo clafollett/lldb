@@ -57,6 +57,8 @@
 //! same rows and differ entirely in what crosses the wire. Both are worker-side facts, so tests
 //! that want to assert on data movement hold an `Arc<StageCache>` shared with the worker and read
 //! them after driving a query.
+//!
+//! [`collect_partitioned`]: datafusion::physical_plan::collect_partitioned
 
 use std::collections::VecDeque;
 use std::collections::hash_map::DefaultHasher;

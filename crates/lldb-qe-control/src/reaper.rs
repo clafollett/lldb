@@ -332,7 +332,7 @@ impl ServicesDb {
     /// query finish, between the two calls.
     ///
     /// `account_id` narrows the sweep to one tenant; `None` is every account, which is the ordinary
-    /// case (see [`account_filter`]).
+    /// case (see `account_filter`).
     pub async fn list_stranded_queries(
         &self,
         account_id: Option<i64>,

@@ -43,7 +43,7 @@
 //! because the answer already exists: `coordinators` is a renewed lease over the *process*, and a
 //! query slot is held by a process. A row records its holder as the `(slot, incarnation)` pair, and
 //! a slot is claimable exactly when no **live** `coordinators` row matches that pair —
-//! [`crate::liveness::LIVE_PREDICATE`], spliced in verbatim rather than re-spelled, the same way
+//! [`crate::liveness`]'s `LIVE_PREDICATE`, spliced in verbatim rather than re-spelled, the same way
 //! `reaper.rs` splices it. Two definitions of "alive" would eventually disagree and nothing in the
 //! build would notice, so there is exactly one.
 //!

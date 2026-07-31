@@ -29,6 +29,8 @@
 //! # Not a fleet member
 //!
 //! fleet-posture-allow: a DDL one-shot; binds no port, never handed LLDB_FLEET_TOKEN.
+//!
+//! [`ServicesDb::ensure_account`]: lldb_qe_control::ServicesDb::ensure_account
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

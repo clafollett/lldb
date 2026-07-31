@@ -798,7 +798,7 @@ pub async fn fetch_partition_with_failover(
 ///
 /// The lowest layer of the pull: one connection, one `do_get`, no policy. Everything that decides
 /// *which* worker to ask and *whether* to ask another one is built on top of it
-/// ([`fetch_partition`], [`fetch_partition_with_failover`]).
+/// (`fetch_partition`, [`fetch_partition_with_failover`]).
 ///
 /// It used to be handed straight to [`FlightReaderExec`], which streamed batches downstream as they
 /// arrived. That is no longer safe once a lost stage can be reassigned — a half-delivered partition
