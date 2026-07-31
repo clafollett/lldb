@@ -13,21 +13,12 @@
 //! here that is **also compiled into `distributed_cluster`** (by `#[path]`), because that target
 //! skips silently for want of Docker in exactly the same way.
 //!
-//! Most database-gated integration tests resolve their database through this module — `services_db`
-//! (migrations, accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its
-//! transitions), `query_scheduler`, `auth_rbac`, `tenant_catalogs`, `coordinator_liveness` and
-//! `query_reaper` — and they must agree exactly on *which* server and on how to skip when there is
-//! none. The order is first-one-that-works:
-//!
-//! Be aware that they are **not** the only database-gated tests: `dml_snapshots`, `result_cache_db`
-//! and `shared_sql_catalog` each carry their own private copy of this resolution — their own
-//! `Target`, `Drop` guard and container bootstrap. That is an accident of history rather than a
-//! decision. Each was once its own binary, where taking a dependency on this module was opt-in and
-//! copying looked cheap; now that they are all modules of one binary (see `main.rs`) the copies sit
-//! side by side in a single compilation unit. They behave identically and name their containers
-//! distinctly, so nothing is broken — but four implementations of "find me a Postgres" is three too
-//! many, and the next person to touch any of them should migrate it here rather than fix a bug in
-//! one copy.
+//! **Every** database-gated integration test resolves its database through this module —
+//! `services_db` (migrations, accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API
+//! and its transitions), `query_scheduler`, `auth_rbac`, `tenant_catalogs`, `coordinator_liveness`,
+//! `query_reaper`, `dml_snapshots`, `result_cache_db` and `shared_sql_catalog` — and they must
+//! agree exactly on *which* server and on how to skip when there is none. The order is
+//! first-one-that-works:
 //!
 //! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is. CI's path (the `check` job runs a
 //!    `postgres:18.4-alpine` service container) and the path for anyone with a local server.
@@ -37,6 +28,20 @@
 //!    a laptop with no Postgres and no Docker must stay green, the same bargain
 //!    `distributed_cluster.rs` strikes — unless [`gates::REQUIRE_GATED_ENV`] is set, which is the
 //!    opt-in that turns that skip into a failure.
+//!
+//! The last three joined that list late (issue #121), and the reason they were ever outside it is
+//! worth one line: each was once its own test *binary*, where depending on this module was opt-in
+//! and copying the resolution looked cheap, so each carried a private `Target`, `Drop` guard and
+//! container bootstrap. Collapsing the binaries into one (see `main.rs`) put four implementations of
+//! "find me a Postgres" side by side in a single compilation unit, and then
+//! [`gates::REQUIRE_GATED_ENV`] raised the stakes: a missed detection is a *failed job* now rather
+//! than a quiet skip, so a copy drifting from this one could fail the build for the wrong reason.
+//!
+//! What the fold dropped was their distinct container-name prefixes, and that turned out to be load
+//! bearing in a way worth recording: the prefixes were partitioning a name space that
+//! [`CONTAINER_SEQ`] documents as too small, so folding them into one exposed a latent tie. Names
+//! carry that counter now, which is strictly stronger than any prefix scheme — what is genuinely
+//! lost is only that `docker ps` no longer says which suite owns which container.
 //!
 //! Every test using this must be safe to run repeatedly against the same database *and*
 //! concurrently with another copy of itself — the URL it is handed may well be someone's dev
@@ -55,6 +60,7 @@ pub mod gates;
 
 use std::future::Future;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
@@ -65,6 +71,22 @@ use sqlx::Connection;
 pub const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// What tells two containers apart when the clock cannot.
+///
+/// [`nanos`] carries `SystemTime`'s resolution, and on macOS that is **microseconds** — the last
+/// three digits are always zero. Fourteen libtest threads reaching [`start_container`] at once
+/// therefore tie on it, and `docker run --name` refuses the loser with a name conflict rather than
+/// starting a second Postgres. While the three private copies of this resolution existed (#121)
+/// each had its own name prefix, which partitioned the space and hid the tie for those suites; one
+/// prefix shared by every suite exposes it, reproducibly, at six concurrent containers.
+///
+/// A counter removes the tie rather than making it rarer: two names minted by one process differ
+/// here even inside one microsecond, and the pid still separates processes. It is process-global
+/// mutable state, which `main.rs` is deliberately suspicious of — safe because it is append-only,
+/// read by nothing but the name it builds, and asserted on by no test, so ordering permutes which
+/// container gets which integer and nothing else.
+static CONTAINER_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// How the test got its database — and, for the container case, what to tear down.
 pub enum Target {
@@ -109,7 +131,12 @@ pub fn resolve_target() -> Result<Target> {
 /// Start a throwaway Postgres and wait until it answers.
 fn start_container() -> Result<Target> {
     let port = free_port()?;
-    let name = format!("lldb-services-test-{}-{}", std::process::id(), nanos());
+    let name = format!(
+        "lldb-services-test-{}-{}-{}",
+        std::process::id(),
+        nanos(),
+        CONTAINER_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
 
     // `--rm` is not enough on its own (a killed test leaves the container running), hence the
     // Drop guard as well; belt and braces so a rerun never collides with a stale container.

@@ -5,13 +5,11 @@
 //! Both halves need a real database. The commit is a conditional `UPDATE iceberg_tables ... WHERE
 //! metadata_location = <what I read>`, and what is under test is precisely that Postgres
 //! serializes two of those on one row — a claim no in-process fake can make. So this test finds a
-//! database the same three ways `services_db.rs` and `shared_sql_catalog.rs` do:
-//!
-//! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is (CI's service container, or a local server).
-//! 2. **`LLDB_DOCKER=1`** — start a throwaway `postgres:18.4-alpine`, remove it afterwards.
-//! 3. **Neither** — report the skip (`support::gates`) and pass. `cargo test --workspace` with no
-//!    Postgres and no Docker stays green; the parse/rewrite/snapshot-assembly logic is unit-tested
-//!    in `dml.rs` without one.
+//! database through [`crate::support::resolve_target`], the one resolution every database-gated
+//! suite here shares — an explicit `LLDB_TEST_POSTGRES_URL`, else a throwaway container under
+//! `LLDB_DOCKER=1`, else a reported skip and a pass. `cargo test --workspace` with no Postgres and
+//! no Docker stays green; the parse/rewrite/snapshot-assembly logic is unit-tested in `dml.rs`
+//! without one.
 //!
 //! The concurrency test is the load-bearing one, and it is written so that the *absence of an
 //! error* cannot pass it. Four writers each run `UPDATE ... SET qty = qty + 1` against the same
@@ -30,11 +28,9 @@
 //!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration dml_snapshots -- --nocapture
 
 use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use datafusion::arrow::array::{Array, Int64Array, StringArray};
 use datafusion::prelude::SessionContext;
 use lldb_qe_core::dml;
@@ -47,124 +43,14 @@ use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 use tokio::sync::Barrier;
 
 use crate::support::gates;
-use crate::support::{Cleanup, DbCleanup};
+use crate::support::{Cleanup, DbCleanup, nanos, resolve_target};
 
 /// How this suite names itself in the skip report.
 const SUITE: &str = "dml_snapshots";
-/// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
-const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
-/// How long to wait for a fresh container to accept connections before giving up.
-const READY_TIMEOUT: Duration = Duration::from_secs(60);
 /// The namespace the manifest declares.
 const NS: &str = "sales";
 /// The table every case operates on.
 const TABLE: &str = "orders";
-
-/// How the test got its database — and, for the container case, what to tear down.
-enum Target {
-    Skipped,
-    Provided(String),
-    Container { url: String, name: String },
-}
-
-impl Drop for Target {
-    fn drop(&mut self) {
-        if let Target::Container { name, .. } = self {
-            let _ = Command::new("docker").args(["rm", "-f", name]).output();
-        }
-    }
-}
-
-impl Target {
-    fn url(&self) -> Option<&str> {
-        match self {
-            Target::Skipped => None,
-            Target::Provided(url) | Target::Container { url, .. } => Some(url),
-        }
-    }
-}
-
-fn resolve_target() -> Result<Target> {
-    if let Ok(url) = std::env::var("LLDB_TEST_POSTGRES_URL")
-        && !url.trim().is_empty()
-    {
-        return Ok(Target::Provided(url));
-    }
-    if std::env::var("LLDB_DOCKER").ok().as_deref() != Some("1") {
-        return Ok(Target::Skipped);
-    }
-    start_container()
-}
-
-fn start_container() -> Result<Target> {
-    let port = free_port()?;
-    let name = format!("lldb-dml-test-{}-{}", std::process::id(), nanos());
-
-    let out = Command::new("docker")
-        .args([
-            "run",
-            "-d",
-            "--rm",
-            "--name",
-            &name,
-            "-e",
-            "POSTGRES_USER=lldb",
-            "-e",
-            "POSTGRES_PASSWORD=lldb",
-            "-e",
-            "POSTGRES_DB=lldb",
-            "-p",
-            &format!("127.0.0.1:{port}:5432"),
-            POSTGRES_IMAGE,
-        ])
-        .output()
-        .context("spawning `docker run` — is Docker installed?")?;
-    if !out.status.success() {
-        bail!(
-            "failed to start {POSTGRES_IMAGE}:\n{}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-
-    let target = Target::Container {
-        url: format!("postgres://lldb:lldb@127.0.0.1:{port}/lldb?sslmode=disable"),
-        name: name.clone(),
-    };
-
-    let deadline = Instant::now() + READY_TIMEOUT;
-    loop {
-        let probe = Command::new("docker")
-            .args(["exec", &name, "pg_isready", "-U", "lldb", "-d", "lldb"])
-            .output()
-            .context("probing the container with pg_isready")?;
-        if probe.status.success() {
-            return Ok(target);
-        }
-        if Instant::now() >= deadline {
-            let logs = Command::new("docker").args(["logs", &name]).output();
-            bail!(
-                "{POSTGRES_IMAGE} did not become ready within {}s; container logs:\n{}",
-                READY_TIMEOUT.as_secs(),
-                logs.map(|l| String::from_utf8_lossy(&l.stdout).into_owned())
-                    .unwrap_or_default()
-            );
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn free_port() -> Result<u16> {
-    let listener =
-        std::net::TcpListener::bind("127.0.0.1:0").context("finding a free host port")?;
-    Ok(listener.local_addr()?.port())
-}
-
-fn nanos() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is after the epoch")
-        .as_nanos()
-}
 
 /// One SQL catalog, one namespace, one table with a column of every kind the rewrite has to
 /// handle: a non-null key, a nullable string, and a nullable number to do arithmetic on.
