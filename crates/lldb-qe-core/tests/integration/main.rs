@@ -102,6 +102,17 @@
 //!   first bullet's rule rather than breaking it; the policy it feeds is a pure function precisely
 //!   so that testing it needs no `set_var` ([`support::gates::is_fatal`]).
 //!
+//! Issue #121 added the seventh, and it is the counter the bullet above says would not be safe —
+//! so the difference is the whole justification:
+//!
+//! - **`support::CONTAINER_SEQ`**, which distinguishes two throwaway Postgres containers started in
+//!   the same microsecond. `ABANDONED_CLOSED` is dangerous because `query_scheduler` *reads* it;
+//!   this one is consumed only to build a container name and is read by no test, no assertion and
+//!   no failure message. Test order therefore permutes which container gets which integer, which is
+//!   not a fact anything can observe. The state has to be process-global to do its job at all: the
+//!   collision it removes is between two threads of *this* process, which is exactly the scope one
+//!   binary made possible.
+//!
 //! Everything else these tests touch is per-instance: sessions, catalogs, stage caches and
 //! warehouses are constructed per test, every server binds `127.0.0.1:0`, and every file that
 //! writes to disk writes into its own `tempfile::tempdir()`. The database-gated files name their
