@@ -243,10 +243,29 @@ enum WorkerIdentity {
 impl WorkerIdentity {
     fn of(url: &str) -> Self {
         match Url::parse(url) {
-            Ok(parsed) => Self::Origin {
-                scheme: parsed.scheme().to_string(),
-                host: parsed.host_str().unwrap_or_default().to_string(),
-                port: parsed.port_or_known_default(),
+            // Parsing is not enough — the result has to *have* an origin. `w1:50051`, which is what
+            // an operator writes when they forget the scheme, parses happily as scheme `w1` with
+            // `50051` in its **path** and no host at all. Treating that as an origin would key every
+            // such spelling on `(scheme, "", None)`, so `w1:50051` and `w1:60000` would be one
+            // identity and the second worker would be silently dropped from the candidate list.
+            // Falling through to `Verbatim` is the same call made just below for the same reason:
+            // when we cannot say two strings are one node, trying both costs one bounded attempt
+            // and guessing wrong costs a worker.
+            // Parsing is not enough — the result has to *have* an origin. `w1:50051`, which is what
+            // an operator writes when they forget the scheme, parses happily as scheme `w1` with
+            // `50051` in its **path** and no host at all. Treating that as an origin would key every
+            // such spelling on `(scheme, "", None)`, so `w1:50051` and `w1:60000` would be one
+            // identity and the second worker would be silently dropped from the candidate list.
+            // Falling through to `Verbatim` is the same call made just below for the same reason:
+            // when we cannot say two strings are one node, trying both costs one bounded attempt
+            // and guessing wrong costs a worker.
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => Self::Origin {
+                    scheme: parsed.scheme().to_string(),
+                    host: host.to_string(),
+                    port: parsed.port_or_known_default(),
+                },
+                None => Self::Verbatim(url.to_string()),
             },
             Err(_) => Self::Verbatim(url.to_string()),
         }
@@ -1130,6 +1149,13 @@ mod tests {
             WorkerIdentity::of("://nonsense"),
             WorkerIdentity::of("also nonsense"),
             "two strings we cannot parse are not assumed to be one node"
+        );
+        // Parses, but into a scheme and a path with no host — the shape a forgotten `http://`
+        // produces. Keying these on their origin would make every one of them equal.
+        assert_ne!(
+            WorkerIdentity::of("w1:50051"),
+            WorkerIdentity::of("w1:60000"),
+            "a URL that parses without a host is not an origin, and two of them are not one node"
         );
     }
 
