@@ -84,12 +84,20 @@ if (tls && !['none', 'fleet'].includes(tls)) {
 }
 const tlsSecretPrefix = app.node.tryGetContext('tlsSecretPrefix') as string | undefined;
 
+// `-c tlsDomain=fleet.example.com` is the other half of `mint-fleet-tls.sh --domain`: the script
+// puts that name in the certificate's SAN, this puts it in every dialing role's `LLDB_TLS_DOMAIN`.
+// Pass the same value to both or every handshake in the fleet fails — which is why the stack
+// refuses this flag without `-c tls=fleet` rather than quietly ignoring it. Omitted, both sides
+// default to `fleet.lldb.local` and the deploy is exactly what it was before this flag existed.
+const tlsDomain = app.node.tryGetContext('tlsDomain') as string | undefined;
+
 new LldbStack(app, 'LldbStack', {
   imageTag,
   egress,
   servicesDb,
   tls,
   tlsSecretPrefix,
+  tlsDomain,
   workerCount: workerCountCtx ? Number(workerCountCtx) : undefined,
   warehouses,
   env: {

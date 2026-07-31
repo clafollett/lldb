@@ -227,8 +227,9 @@ door would encrypt one hop of a mesh. Certificates are **supplied, never minted*
    is an IP unless the certificate carries IP SANs or `--tls-domain` names the certificate's host.
    On ECS the first is unavailable — a Fargate task's IP is allocated at task start and changes on
    every replacement and scale event, which is the elasticity `discovery.rs` exists to deliver — so
-   `infra/` mints **one** fleet leaf carrying `DNS:fleet.lldb.local` and sets `--tls-domain` to it.
-   One name and not one per warehouse, because the dialing trust is process-global (5) while a
+   `infra/` mints **one** fleet leaf (`DNS:fleet.lldb.local` by default, `mint-fleet-tls.sh
+   --domain` + `cdk -c tlsDomain` to change it — both, always) and sets `--tls-domain` to it. One
+   name and not one per warehouse, because the dialing trust is process-global (5) while a
    coordinator dials several warehouses: there is exactly one name available to verify against.
 5. **Two process-globals, both argued rather than assumed.** rustls's crypto provider is *installed*
    (`ring`, once, idempotently) rather than inferred from crate features — inference panics if a

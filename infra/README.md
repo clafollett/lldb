@@ -50,7 +50,8 @@ aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> 
 Knobs: `-c workerCount=4` sizes the default fleet, `-c warehouses=analytics:4,etl:1` deploys named
 warehouses instead (see below), `-c egress=nat-instance` moves it into private subnets (see below),
 `-c servicesDb=none` drops the control plane (see below), `-c tls=fleet` encrypts **and
-authenticates** Flight inside the VPC (see below); `cpu`/`memoryLimitMiB` are stack props. The
+authenticates** Flight inside the VPC (with `-c tlsDomain=…` when the certificate was minted for a
+name other than `fleet.lldb.local` — see below); `cpu`/`memoryLimitMiB` are stack props. The
 `TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task` network config for
 whichever mode you deployed.
 
@@ -172,7 +173,20 @@ credentials come from the `ServicesDbSecretArn` output.
 ```bash
 ./scripts/mint-fleet-tls.sh                                  # writes lldb/fleet-tls-{ca,cert,key}
 cd infra && npx cdk deploy -c imageTag=0.1.0+<sha> -c tls=fleet
+
+# …or for a deployment with its own DNS zone. The two names are ONE setting: the script puts it in
+# the certificate's SAN, the stack puts it in every client's LLDB_TLS_DOMAIN.
+./scripts/mint-fleet-tls.sh --domain fleet.example.com
+cd infra && npx cdk deploy -c imageTag=0.1.0+<sha> -c tls=fleet -c tlsDomain=fleet.example.com
 ```
+
+`-c tlsDomain` defaults to `fleet.lldb.local`, which is exactly what `mint-fleet-tls.sh` mints when
+*it* is not told otherwise — so an existing `-c tls=fleet` deploy is unchanged and needs the flag on
+neither side. Give both sides the same value or give neither: a certificate whose SAN and a client's
+`LLDB_TLS_DOMAIN` disagree fails **every** handshake in the fleet, at handshake time, on a deployed
+fleet. Passing `-c tlsDomain` **without** `-c tls=fleet` is a synth error rather than a setting
+quietly dropped — in plaintext mode nothing verifies a name, and a certificate name that silently
+does not reach the fleet is the failure the flag exists to prevent.
 
 The stack **imports** those secrets rather than creating them, and both halves of that are
 deliberate. A private key CDK holds is a key that can reach `cdk.out`, which is an artifact that
@@ -328,11 +342,16 @@ validate against that. IP SANs are not available as a fix: a Fargate task's IP i
 start and changes on every replacement and every scale event, which is the elasticity `discovery.rs`
 exists to deliver, so nothing minted in advance can name them.
 
-So the fleet shares **one** certificate carrying `DNS:fleet.lldb.local`, and both roles get
-`LLDB_TLS_DOMAIN=fleet.lldb.local`. The URL's IP connects; that SAN verifies. It is one fleet-wide
-name rather than one per warehouse because the engine's dialing trust is process-global — a
-`FlightReaderExec` is serialized into a plan and can carry nothing per-call — while one coordinator
-dials several warehouses, so there is exactly one name available to verify against.
+So the fleet shares **one** certificate carrying `DNS:<the fleet name>`, and every role gets that
+same name as `LLDB_TLS_DOMAIN`. The URL's IP connects; that SAN verifies. The name defaults to
+`fleet.lldb.local` on both sides and `--domain` / `-c tlsDomain` change it on both sides together.
+
+It is one fleet-wide name rather than one per warehouse because the engine's dialing trust is
+process-global — a `FlightReaderExec` is serialized into a plan and can carry nothing per-call —
+while one coordinator dials several warehouses, so there is exactly one name available to verify
+against. That is why `tlsDomain` is a single stack-wide value and not a per-warehouse map: a map
+would synthesize perfectly and then fail every cross-warehouse query. Per-warehouse certificates
+become representable only if that trust stops being process-global.
 
 Be clear about the claim: a shared leaf authenticates **the fleet, not the member**. A client learns
 that its peer holds the fleet's key, not which worker it is. That is already the documented scope of
@@ -347,10 +366,15 @@ The engine reads its certificate once, at startup. So rotation is: re-run the mi
 the CA in `./fleet-tls-ca` unless you delete it), then force a new deployment.
 
 ```bash
-./scripts/mint-fleet-tls.sh
+./scripts/mint-fleet-tls.sh                    # …and --domain again, if the fleet uses one
 aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> \
   --force-new-deployment
 ```
+
+**Re-pass `--domain` when rotating a fleet that uses one.** The script defaults to
+`fleet.lldb.local` on every run, so a rotation that forgets it replaces a working certificate with
+one the deployed `LLDB_TLS_DOMAIN` does not match — and the fleet fails every handshake as the
+forced deployment rolls, without the stack having changed at all.
 
 Replacing the **CA** rather than the leaf is not rolling — every role has to restart together, since
 half a fleet trusting a root the other half does not sign under fails every handshake between them.
@@ -372,8 +396,11 @@ synth), and — in *every* mode — no security group admits `0.0.0.0/0`.
 
 For TLS specifically: no PEM material of any kind appears in the synthesized template, the private
 key is unreadable by the coordinator's execution role in IAM, turning TLS on rewrites *every*
-worker URL to `https://` with the `{warehouse}` placeholder intact, both roles verify under the one
-fleet name, and `LLDB_ALLOW_PLAINTEXT` is absent in **both** modes.
+worker URL to `https://` with the `{warehouse}` placeholder intact, every role verifies under the
+one fleet name — default *or* `-c tlsDomain`, since the flag must change the value and never the
+arity — the default is still the literal `fleet.lldb.local` that `mint-fleet-tls.sh` mints,
+a `tlsDomain` that could not be a DNS name (a space, a comma, a wildcard, a port) and a `tlsDomain`
+without `-c tls=fleet` both fail synth, and `LLDB_ALLOW_PLAINTEXT` is absent in **both** modes.
 
 For the fleet secret: `-c tls=fleet` puts `LLDB_FLEET_TOKEN` on *every* task definition as a secret
 reference and in no `Environment` block anywhere, all of them resolve the same secret, no literal
