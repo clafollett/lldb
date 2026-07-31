@@ -49,9 +49,10 @@ aws ecs run-task --cluster <ClusterName> --task-definition <CoordinatorTaskArn> 
 
 Knobs: `-c workerCount=4` sizes the default fleet, `-c warehouses=analytics:4,etl:1` deploys named
 warehouses instead (see below), `-c egress=nat-instance` moves it into private subnets (see below),
-`-c servicesDb=none` drops the control plane (see below), `-c tls=fleet` encrypts Flight inside the
-VPC (see below); `cpu`/`memoryLimitMiB` are stack props. The `TaskSubnets` and `AssignPublicIp`
-outputs give you the right `run-task` network config for whichever mode you deployed.
+`-c servicesDb=none` drops the control plane (see below), `-c tls=fleet` encrypts **and
+authenticates** Flight inside the VPC (see below); `cpu`/`memoryLimitMiB` are stack props. The
+`TaskSubnets` and `AssignPublicIp` outputs give you the right `run-task` network config for
+whichever mode you deployed.
 
 ## Virtual warehouses (`-c warehouses=…`)
 
@@ -155,12 +156,12 @@ have N tasks racing the same DDL). Run the `lldb-qe-migrate` binary from the sam
 one-shot ECS task before rolling the services, the way compose's `db-migrate` does. Its
 credentials come from the `ServicesDbSecretArn` output.
 
-## Transport security (`-c tls=…`)
+## Transport security and fleet authentication (`-c tls=…`)
 
 | Mode | What you get |
 | - | - |
-| `none` *(default)* | Every Flight port is plaintext. Legal, and not a hole: the engine refuses a plaintext port only when a credential is actually checked on it, and nothing here checks one yet. Traffic is confined to the VPC by the security groups. |
-| `fleet` | Workers serve TLS, every role dials `https://`, and the PEM arrives as `LLDB_TLS_*_PEM` from three Secrets Manager secrets. **~$1.20/mo.** |
+| `none` *(default)* | Every Flight port is plaintext **and unauthenticated**. Legal, and not a hole in the engine's terms: it refuses a plaintext port only when a credential is actually checked on it, and in this mode nothing checks one. Traffic is confined to the VPC by the security groups — that, plus the warning every worker logs at startup, is the whole mitigation. |
+| `fleet` | Workers serve TLS, every role dials `https://`, and the PEM arrives as `LLDB_TLS_*_PEM` from three Secrets Manager secrets — **and** both roles get a generated `LLDB_FLEET_TOKEN`, so a worker rejects a Flight call that does not present it. **~$1.60/mo.** |
 
 **Mint before you deploy.** This is a prerequisite step, like `cdk bootstrap`:
 
@@ -175,6 +176,43 @@ gets copied around; importing means CDK never sees the bytes at all. And creatin
 deadlock a first deploy — CloudFormation would make three empty secrets, the ECS service would fail
 to stabilise on the empty PEM, the deployment circuit breaker would fail the stack, and the
 rollback would delete the secrets you were about to fill.
+
+### The fleet secret rides the same switch, and that is the safety argument
+
+`-c tls=fleet` also generates `LLDB_FLEET_TOKEN` into Secrets Manager and injects it into **both**
+task definitions. That is the credential a worker's Flight port actually checks
+(`lldb_qe_control::auth::FleetAuth`) and the key the coordinator signs each request's plan assertion
+with (`lldb_qe_core::plan_assertion`) — without it, anything that can resolve
+`<warehouse>.lldb.local` can have an arbitrary physical plan executed against the warehouse bucket
+with the worker task role's credentials.
+
+**There is no `-c fleetToken=…`, on purpose.** A worker that checks a credential refuses to bind a
+plaintext port, so "fleet secret without certificates" is a deploy that dies at task start — or one
+an operator rescues with `LLDB_ALLOW_PLAINTEXT` and thereby ships the secret in the clear. Refusing
+that pairing at synth was the obvious fix; making it unrepresentable is the better one. So there is
+one switch: `none` is today's plaintext, unauthenticated fleet, unchanged; `fleet` is encrypted and
+authenticated. Nothing in between.
+
+**Generated here, where the PEM above is imported.** The asymmetry is deliberate, and it is the
+deadlock argument read backwards: an *empty* fleet token is not a fleet that cannot start, it is a
+fleet that starts open (`FleetAuth::from_env` reads a blank value as unset) — and in practice not
+even that, since CloudFormation mints the value as part of creating the resource that the task
+definitions reference. With nothing to break, generating it buys the property that matters for a
+symmetric secret: it exists in Secrets Manager and nowhere else — not in source, not in CDK context,
+not in a `cdk.out` artifact, not in anyone's shell history. It is injected with `ecs.Secret`, never
+`environment`, because a plain environment entry is stored verbatim in the task definition and
+served to anyone who can call `describe-task-definition`.
+
+Only the two **execution** roles are granted it — they are what resolve the value at container
+start; the process then reads its own environment. The engine carries no AWS SDK and makes no
+Secrets Manager call, so a *task* role grant would be a permission nothing uses, on a value the
+container already holds, that would additionally outlive a rotation. There is a test asserting the
+task roles do not have it.
+
+Rotating is `aws secretsmanager put-secret-value` against the `FleetTokenSecretArn` output, then a
+forced new deployment of every warehouse service. Same caveat as the certificates and for the same
+reason — the value is read once per process — plus one more: during the rollout the halves of the
+fleet disagree, and a coordinator run in that window fails against whichever half has not restarted.
 
 ### Why the PEM is an environment variable and not a file
 
@@ -246,6 +284,12 @@ key is unreadable by the coordinator's execution role in IAM, turning TLS on rew
 worker URL to `https://` with the `{warehouse}` placeholder intact, both roles verify under the one
 fleet name, and `LLDB_ALLOW_PLAINTEXT` is absent in **both** modes.
 
+For the fleet secret: `-c tls=fleet` puts `LLDB_FLEET_TOKEN` on *every* task definition as a secret
+reference and in no `Environment` block anywhere, all of them resolve the same secret, no literal
+secret value can reach the template (there is no `SecretString` property — only the
+`GenerateSecretString` recipe), the task roles are not granted it, and `-c tls=none` creates and
+injects nothing at all.
+
 ## Egress: how tasks reach ECR (`-c egress=…`)
 
 Warehouse traffic never enters into this — it rides a free S3 *gateway* endpoint in every mode.
@@ -279,9 +323,11 @@ egress with it. Raise `natGateways` to `maxAzs` when that matters more than the 
 
 ## Other scope notes
 
-- **`removalPolicy: DESTROY`** on the bucket, ECR repo and services database (plus
-  `deletionProtection: false` on the latter) keeps teardown clean for a POC. Change all of them
-  before anything real lands in the warehouse or the control plane.
+- **`removalPolicy: DESTROY`** on the bucket, ECR repo, services database and fleet secret (plus
+  `deletionProtection: false` on the database) keeps teardown clean for a POC. Change all of them
+  before anything real lands in the warehouse or the control plane. The fleet secret is the one
+  that is genuinely safe to destroy: it is regenerable, and both roles read whatever the resource
+  holds, so a fresh value is a fresh fleet rather than a broken one.
 - **`cdk synth` warns `W9008` — "RDS instance should have StorageEncrypted set to true"** — on
   the Aurora *writer*. It is a false positive: for Aurora, storage encryption is a cluster-level
   property, and `AWS::RDS::DBCluster.StorageEncrypted` is `true` in the synthesized template.
