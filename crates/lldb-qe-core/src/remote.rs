@@ -59,7 +59,7 @@
 use std::any::Any;
 use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
@@ -481,8 +481,137 @@ const FORMAT_VERSION: u8 = 1;
 /// The output schema is *not* encoded — it is recovered by deserializing the inner plan and
 /// asking it, which keeps the two from ever disagreeing. Encoding the inner plan recurses
 /// through this same codec, so nested remote stages work.
-#[derive(Debug, Default, Clone)]
-pub struct LldbCodec;
+///
+/// # The one field: where an encode error goes so it can survive `datafusion-proto`
+///
+/// `datafusion-proto` mangles every error [`Self::try_encode`] returns — it nests the message
+/// inside "Unsupported plan and extension codec failed with […]", makes it a
+/// [`DataFusionError::Internal`] whose `Display` appends *"file a bug report"*, and staples a
+/// `Debug` dump of the whole plan behind it. `refuse_before_encoding` hoists the refusals we have
+/// *written guidance for* out of the codec entirely, but a node we have nothing particular to say
+/// about — `WITH RECURSIVE`'s `RecursiveQueryExec`, in DataFusion 53.1 — can only be refused from
+/// inside the codec, which is the one place a message could not be delivered from.
+///
+/// So the codec keeps the error it raised where [`serialize_plan`] can pick it up on the way out,
+/// and [`serialize_plan`] returns *that* instead of the wrapper it was handed. Four decisions:
+///
+/// 1. **The cell lives on the codec, not on a wrapper around it.** A `Recording<LldbCodec>`
+///    delegating `try_encode` looks tidier and is wrong: [`Self::try_encode`] re-enters
+///    `physical_plan_to_bytes_with_extension_codec` for a remote stage's sub-plan, so a nested
+///    failure is *already wrapped once* by the time it reaches an outer delegate. Only the codec
+///    that performs that nested encode can hand the same cell to it.
+/// 2. **First write wins**, which [`OnceLock`] gives by construction rather than by discipline.
+///    The encode walk short-circuits on the first error, so there is exactly one *originating*
+///    failure per [`serialize_plan`]; every later sight of it at an enclosing frame is that same
+///    failure wearing one more wrapper. Last-write-wins would therefore end up storing the wrapper
+///    — precisely the string this exists to escape — and a stack would hold *n* copies of one
+///    failure at increasing wrap depth. It is also what makes the blanket
+///    `map_err(|e| self.record(e))` in [`Self::try_encode`] safe: an error merely passing through
+///    from a nested encode finds the cell already taken.
+/// 3. **One cell per [`serialize_plan`] call, never a shared codec.** [`serialize_plan`] builds
+///    its own and drops it, so nothing can leak a stale error into a later query. The type is
+///    deliberately **not** [`Clone`]: a clone is a *second* cell, and an error recorded through one
+///    copy would be invisible to the other, which is exactly the bug a stateful codec invites.
+/// 4. **The decode path never writes to it.** `datafusion-proto` propagates decode-side codec
+///    errors verbatim, so [`Self::try_decode`] needs no side channel and has none.
+///
+/// The tempting alternative is to skip the state entirely and enumerate every node
+/// `datafusion-proto` *can* encode, refusing anything else in `refuse_before_encoding`. That is a
+/// verbatim copy of an upstream `match` with no compile-time link to it, and the version wall
+/// (`CLAUDE.md`, issue #40) means the bump to DataFusion 54 is a matter of when: the copy then
+/// drifts silently in either direction — refusing a node upstream started supporting, or passing
+/// through one it dropped. Recording the real error needs no list at all and covers nodes nobody
+/// has heard of.
+#[derive(Debug, Default)]
+pub struct LldbCodec {
+    /// The error [`Self::try_encode`] actually raised, for [`serialize_plan`] to return in place of
+    /// `datafusion-proto`'s wrapper. `Arc` because [`DataFusionError`] is not [`Clone`] and the
+    /// error has to be both kept and returned; [`DataFusionError::Shared`] renders exactly as its
+    /// inner error, so nothing about the message changes on the way through.
+    raised: OnceLock<Arc<DataFusionError>>,
+}
+
+impl LldbCodec {
+    /// Encode with *this* codec, so a nested stage records into the same cell.
+    ///
+    /// This is the recursion [`serialize_plan`]'s guidance walk is deliberately not part of: the
+    /// walk already descended through this node's `inner`, so re-running it here would re-walk the
+    /// same sub-tree once per level of nesting to find what the top-level walk already proved
+    /// absent.
+    fn encode(&self, plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {
+        let bytes =
+            datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(plan, self)?;
+        Ok(bytes.to_vec())
+    }
+
+    /// Keep `raised` as the codec's real error and hand it back to `datafusion-proto` unchanged.
+    ///
+    /// [`OnceLock::set`] *is* the first-write-wins rule, so an error passing through from a nested
+    /// encode — already wrapped once — cannot displace the one that originated it.
+    fn record(&self, raised: DataFusionError) -> DataFusionError {
+        let raised = Arc::new(raised);
+        let _ = self.raised.set(Arc::clone(&raised));
+        DataFusionError::Shared(raised)
+    }
+
+    /// Take the recorded error, consuming the codec so no second reader can see a stale one.
+    fn into_raised(self) -> Option<DataFusionError> {
+        self.raised.into_inner().map(DataFusionError::Shared)
+    }
+
+    /// [`Self::try_encode`]'s body, split out so every way it can fail passes through one
+    /// [`Self::record`] rather than each error site remembering to call it.
+    fn encode_flight_reader(
+        &self,
+        node: Arc<dyn ExecutionPlan>,
+        buf: &mut Vec<u8>,
+    ) -> DFResult<()> {
+        let reader = node
+            .as_any()
+            .downcast_ref::<FlightReaderExec>()
+            .ok_or_else(|| encode_failure(&node))?;
+
+        // `Execution`, not `Internal`, and that is not cosmetic now that this error reaches the
+        // operator unwrapped: `DataFusionError::Internal`'s own `Display` staples *"a bug in
+        // DataFusion's code … file a bug report"* onto whatever it carries. This is an lldb
+        // wire-format bound, so that sentence would send an operator to the wrong issue tracker —
+        // the same misdirection this whole path exists to stop, arriving by the other door.
+        if reader.fallbacks.len() > MAX_ENCODED_FALLBACKS as usize {
+            return Err(DataFusionError::Execution(format!(
+                "FlightReaderExec has {} fallbacks, more than the {MAX_ENCODED_FALLBACKS} the wire \
+                 format carries",
+                reader.fallbacks.len()
+            )));
+        }
+
+        // Built into a scratch buffer and appended once, at the end, because everything below this
+        // line can fail and `buf` belongs to the caller. `datafusion-proto` happens to discard it on
+        // error today — every caller does — but that is a caller invariant nobody wrote down and
+        // nothing enforces, and the failures are not theoretical: `put_str` refuses a string the
+        // length prefix cannot carry, and the nested encode refuses an un-encodable sub-plan, both
+        // after the header is already written. Appending on success alone means a failed encode is a
+        // no-op on `buf` whatever the caller does with it next.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(WIRE_MAGIC);
+        encoded.push(FORMAT_VERSION);
+        put_str(&mut encoded, &reader.worker_url)?;
+        encoded.extend_from_slice(&reader.remote_partition.to_le_bytes());
+        // `as u32` is sound here and only here: the bound checked above is 1024.
+        encoded.extend_from_slice(&(reader.fallbacks.len() as u32).to_le_bytes());
+        for fallback in &reader.fallbacks {
+            put_str(&mut encoded, fallback)?;
+        }
+        // `self.encode`, not `serialize_plan`: the guidance walk in `serialize_plan` already
+        // descended through this node's `inner` — that is precisely why it is hand-written — so
+        // re-running it here would re-walk the same sub-tree once per level of nesting to find
+        // what the top-level walk already proved absent. Passing `self` is the other half: the
+        // sub-plan's codec errors are recorded into this call's cell rather than a fresh one.
+        encoded.extend_from_slice(&self.encode(Arc::clone(&reader.inner))?);
+
+        buf.append(&mut encoded);
+        Ok(())
+    }
+}
 
 impl PhysicalExtensionCodec for LldbCodec {
     fn try_decode(
@@ -538,45 +667,13 @@ impl PhysicalExtensionCodec for LldbCodec {
         )?))
     }
 
+    /// Encode a [`FlightReaderExec`], recording whatever goes wrong on the way out.
+    ///
+    /// Every error leaving here is recorded, including one merely passing through from the nested
+    /// encode below — see [`LldbCodec`]'s field docs for why that is safe and why it is the point.
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DFResult<()> {
-        let reader = node
-            .as_any()
-            .downcast_ref::<FlightReaderExec>()
-            .ok_or_else(|| encode_failure(&node))?;
-
-        if reader.fallbacks.len() > MAX_ENCODED_FALLBACKS as usize {
-            return Err(DataFusionError::Internal(format!(
-                "FlightReaderExec has {} fallbacks, more than the {MAX_ENCODED_FALLBACKS} the wire \
-                 format carries",
-                reader.fallbacks.len()
-            )));
-        }
-
-        // Built into a scratch buffer and appended once, at the end, because everything below this
-        // line can fail and `buf` belongs to the caller. `datafusion-proto` happens to discard it on
-        // error today — every caller does — but that is a caller invariant nobody wrote down and
-        // nothing enforces, and the failures are not theoretical: `put_str` refuses a string the
-        // length prefix cannot carry, and `encode_plan` refuses an un-encodable sub-plan, both after
-        // the header is already written. Appending on success alone means a failed encode is a
-        // no-op on `buf` whatever the caller does with it next.
-        let mut encoded = Vec::new();
-        encoded.extend_from_slice(WIRE_MAGIC);
-        encoded.push(FORMAT_VERSION);
-        put_str(&mut encoded, &reader.worker_url)?;
-        encoded.extend_from_slice(&reader.remote_partition.to_le_bytes());
-        // `as u32` is sound here and only here: the bound checked above is 1024.
-        encoded.extend_from_slice(&(reader.fallbacks.len() as u32).to_le_bytes());
-        for fallback in &reader.fallbacks {
-            put_str(&mut encoded, fallback)?;
-        }
-        // `encode_plan`, not `serialize_plan`: the guidance walk in `serialize_plan` already
-        // descended through this node's `inner` — that is precisely why it is hand-written — so
-        // re-running it here would re-walk the same sub-tree once per level of nesting to find
-        // what the top-level walk already proved absent.
-        encoded.extend_from_slice(&encode_plan(Arc::clone(&reader.inner))?);
-
-        buf.append(&mut encoded);
-        Ok(())
+        self.encode_flight_reader(node, buf)
+            .map_err(|e| self.record(e))
     }
 }
 
@@ -628,11 +725,24 @@ fn guided_refusal(node: &Arc<dyn ExecutionPlan>) -> Option<DataFusionError> {
 /// [`refuse_before_encoding`], reached only when `datafusion-proto` hands us a node the walk did
 /// not know to refuse.
 ///
-/// Anything this returns is delivered *mangled*: see [`refuse_before_encoding`] for what the encode
-/// path does to a codec error and why the guided refusals are hoisted out of here.
+/// Reaching here at all says more than "we cannot encode it": the codec is the **fall-through** of
+/// `datafusion-proto`'s own encoder dispatch, so a node arriving here has already failed every
+/// downcast upstream makes. The generic message can therefore say that neither side can ship it
+/// without asserting anything it does not know, and it says so because the queries that land here
+/// are valid SQL — `WITH RECURSIVE` is one — and "cannot encode `<node>`" alone reads like a defect
+/// in the query.
+///
+/// It arrives intact, which it did not before issue #89: see [`LldbCodec`]'s field docs for the
+/// cell that carries it past the wrapper.
 fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
     guided_refusal(node).unwrap_or_else(|| {
-        DataFusionError::NotImplemented(format!("LldbCodec cannot encode {}", node.name()))
+        DataFusionError::NotImplemented(format!(
+            "LldbCodec cannot encode {}, and neither can datafusion-proto — so a plan containing \
+             it cannot be shipped to a worker. The SQL is valid; this build has no wire format for \
+             that plan shape, and there is no single-node fallback to run it on instead, so the \
+             query has to be rewritten into one the planner expresses differently.",
+            node.name()
+        ))
     })
 }
 
@@ -676,16 +786,20 @@ fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
 /// allocates a buffer for the result. Measured on a resolved 10-node aggregate plan: **1.1 µs for
 /// the walk against 168 µs for the encode behind it**, so it is 0.6% of the work it guards and
 /// scales with it. And it is paid once rather than once per level of nesting, because
-/// [`LldbCodec::try_encode`] recurses through [`encode_plan`] rather than back through
+/// [`LldbCodec::try_encode`] recurses through [`LldbCodec::encode`] rather than back through
 /// [`serialize_plan`].
 ///
-/// # What it does not cover
+/// # What it deliberately still does not cover, and what covers it instead
 ///
 /// A node with no guidance to lose — one neither this codec nor `datafusion-proto` can encode and
-/// that we have never written advice for — still reaches [`encode_failure`] and still comes back
-/// wrapped. Covering it would mean duplicating `datafusion-proto`'s own "can I encode this" dispatch
-/// over every built-in node, which is a copy that silently rots at every version bump. The class
-/// worth protecting is the class we have something to say about.
+/// that we have never written advice for — is **not** caught here, and must not be: catching it
+/// would mean enumerating every node `datafusion-proto` can encode, which is a copy of an upstream
+/// `match` that rots at every version bump (issue #89 rejects it for that reason, and the version
+/// wall in `CLAUDE.md` makes the bump a matter of when). Such a node reaches [`encode_failure`]
+/// inside the codec, which is legal because the codec is no longer unable to deliver a message:
+/// [`LldbCodec`] records what it raised and [`serialize_plan`] returns that instead of the wrapper.
+/// This function stays the mechanism for refusals worth *explaining*, where saying it early — on
+/// the coordinator, naming the call that was skipped — is better than saying it accurately.
 ///
 /// [`TreeNode::apply`]: datafusion::common::tree_node::TreeNode::apply
 fn refuse_before_encoding(plan: &Arc<dyn ExecutionPlan>) -> DFResult<()> {
@@ -703,28 +817,40 @@ fn refuse_before_encoding(plan: &Arc<dyn ExecutionPlan>) -> DFResult<()> {
 
 /// Serialize a plan with this codec, so nested [`FlightReaderExec`] nodes survive.
 ///
-/// A plan holding a node we can explain is refused *here*, by `refuse_before_encoding`, rather
-/// than by the codec — read that function for what `datafusion-proto` does to an error the codec
-/// returns, and why nothing an operator must act on may be raised from inside it.
+/// Two mechanisms keep `datafusion-proto`'s encode-side wrapper off the message an operator reads,
+/// and they cover different halves of the problem:
+///
+/// | Refusal | Delivered by |
+/// | - | - |
+/// | one `guided_refusal` names | `refuse_before_encoding`, which raises it before a byte is encoded |
+/// | anything else the codec raised | the `into_raised` swap below — see [`LldbCodec`] |
+///
+/// The swap is `unwrap_or` and not a match on the wrapper's text: a failure that is genuinely
+/// `datafusion-proto`'s own — an expression it cannot encode, say — never touches the cell, so
+/// there is nothing recorded to prefer and its error is returned exactly as it arrived. A
+/// *successful* encode leaves the cell empty and this is one `Option` check.
 pub fn serialize_plan(plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {
     refuse_before_encoding(&plan)?;
-    encode_plan(plan)
-}
-
-/// The encode itself, with no guidance walk ahead of it.
-///
-/// Split out for [`LldbCodec::try_encode`], which is already *inside* a walk that covered its
-/// `inner` sub-plan. Nothing else should call it: [`serialize_plan`] is the entry point that runs
-/// the walk.
-fn encode_plan(plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {
-    let bytes =
-        datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(plan, &LldbCodec)?;
-    Ok(bytes.to_vec())
+    // Fresh per call, dropped at the end of it: a codec shared between queries could hand one
+    // query the refusal from another.
+    let codec = LldbCodec::default();
+    match codec.encode(plan) {
+        Ok(bytes) => Ok(bytes),
+        Err(wrapped) => Err(codec.into_raised().unwrap_or(wrapped)),
+    }
 }
 
 /// Deserialize a plan produced by [`serialize_plan`].
+///
+/// The codec is built here and thrown away because the decode path has no use for its cell:
+/// `datafusion-proto` propagates decode-side codec errors verbatim, which is why the wire marker's
+/// and the version check's refusals have always arrived intact.
 pub fn deserialize_plan(bytes: &[u8], ctx: &TaskContext) -> DFResult<Arc<dyn ExecutionPlan>> {
-    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(bytes, ctx, &LldbCodec)
+    datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(
+        bytes,
+        ctx,
+        &LldbCodec::default(),
+    )
 }
 
 /// Append a length-prefixed string.
@@ -747,7 +873,10 @@ fn put_str(buf: &mut Vec<u8>, s: &str) -> DFResult<()> {
 /// needs a 4 GiB string, proving this needs an integer.
 fn len_prefix(len: usize) -> DFResult<u32> {
     u32::try_from(len).map_err(|_| {
-        DataFusionError::Internal(format!(
+        // `Execution` for the reason `encode_flight_reader`'s fallback bound is: this now reaches
+        // the operator unwrapped, and `Internal`'s `Display` would attach DataFusion's bug-report
+        // boilerplate to a bound that is entirely ours.
+        DataFusionError::Execution(format!(
             "FlightReaderExec string field is {len} bytes, more than the {} its u32 length prefix \
              can carry; encoding it would truncate the round trip instead of failing",
             u32::MAX
@@ -1144,7 +1273,7 @@ mod tests {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         // Hand-built, because a well-formed encoder cannot produce this payload any more.
         let mut buf = header();
@@ -1328,7 +1457,7 @@ mod tests {
     async fn a_truncated_or_absurd_fallback_list_errors_rather_than_panics() {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         // url "u", partition 0, promises 2 fallbacks, then runs out after one.
         let mut truncated = header();
@@ -1358,7 +1487,7 @@ mod tests {
         let ctx = SessionContext::new();
         let inner = sample_plan_with_partitions(&ctx, 4).await;
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         let node: Arc<dyn ExecutionPlan> = Arc::new(
             FlightReaderExec::with_fallbacks(
@@ -1401,7 +1530,7 @@ mod tests {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         let node: Arc<dyn ExecutionPlan> =
             Arc::new(FlightReaderExec::new("http://w:50051", 0, inner).unwrap());
@@ -1483,7 +1612,7 @@ mod tests {
     async fn a_payload_truncated_in_the_header_errors_rather_than_panics() {
         let ctx = SessionContext::new();
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         assert!(take_u8(&[]).is_err(), "an empty buffer has no version byte");
         assert!(
@@ -1511,7 +1640,7 @@ mod tests {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         let node: Arc<dyn ExecutionPlan> =
             Arc::new(FlightReaderExec::new("http://w:50051", 0, inner).unwrap());
@@ -1548,7 +1677,7 @@ mod tests {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
         let task_ctx = ctx.task_ctx();
-        let codec = LldbCodec;
+        let codec = LldbCodec::default();
 
         // Exactly the pre-version encoding: no magic, no version, straight into `u32 LE url_len`.
         // A one-character url is what makes the low byte collide.
@@ -1636,7 +1765,7 @@ mod tests {
     fn a_foreign_node_of_the_same_name_is_reported_as_two_builds_not_as_unencodable() {
         let plan = imposter();
         let mut buf = Vec::new();
-        let err = LldbCodec
+        let err = LldbCodec::default()
             .try_encode(plan, &mut buf)
             .expect_err("a FlightReaderExec from another build cannot be encoded");
         let msg = err.to_string();
@@ -1659,7 +1788,7 @@ mod tests {
         let ctx = SessionContext::new();
         let plan = sample_plan(&ctx).await;
         let mut buf = Vec::new();
-        assert!(LldbCodec.try_encode(plan, &mut buf).is_err());
+        assert!(LldbCodec::default().try_encode(plan, &mut buf).is_err());
     }
 
     /// `buf` belongs to the caller, and a failed encode must be a no-op on it. Every current caller
@@ -1667,8 +1796,8 @@ mod tests {
     /// enforced, and this is what replaces it.
     ///
     /// The failure is provoked where it really lives: the header, url, partition and fallbacks are
-    /// all written before `encode_plan` is asked for the sub-plan, so an un-encodable `inner` is
-    /// exactly a mid-write error.
+    /// all written before [`LldbCodec::encode`] is asked for the sub-plan, so an un-encodable
+    /// `inner` is exactly a mid-write error.
     #[test]
     fn a_failed_encode_leaves_the_callers_buffer_untouched() {
         let staged: Arc<dyn ExecutionPlan> =
@@ -1678,7 +1807,7 @@ mod tests {
         // "truncated to empty".
         let prior = b"bytes the caller already had".to_vec();
         let mut buf = prior.clone();
-        LldbCodec
+        LldbCodec::default()
             .try_encode(staged, &mut buf)
             .expect_err("the sub-plan is un-encodable, so the encode must fail");
         assert_eq!(
@@ -1712,6 +1841,32 @@ mod tests {
             msg.contains(&too_long.to_string()) && msg.contains("truncate"),
             "the refusal must name the length and what it would otherwise do; got: {msg}"
         );
+        // Since #89 this arrives unwrapped, so the variant is now part of what the operator reads:
+        // `Internal` would staple DataFusion's bug-report boilerplate onto an lldb bound.
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// The other bound the encode path enforces itself, held to the same rule: it is ours, so it
+    /// must not arrive wearing DataFusion's bug-report boilerplate. Driven through
+    /// [`serialize_plan`], because the variant only matters for what an operator actually reads.
+    #[tokio::test]
+    async fn the_fallback_bound_is_refused_without_datafusion_boilerplate() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let too_many: Vec<String> = (0..=MAX_ENCODED_FALLBACKS)
+            .map(|i| format!("http://w{i}:50051"))
+            .collect();
+        let reader = FlightReaderExec::with_fallbacks("http://w:50051", too_many, 0, inner)
+            .expect("the constructor does not bound the fallback list; the encoder does");
+
+        let msg = serialize_plan(Arc::new(reader))
+            .expect_err("more fallbacks than the wire format carries must be refused")
+            .to_string();
+        assert!(
+            msg.contains("fallbacks") && msg.contains(&MAX_ENCODED_FALLBACKS.to_string()),
+            "the refusal must name the bound it broke; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
     }
 
     /// The mechanism this file exists to guarantee: a refusal with guidance is raised *before*
@@ -1755,14 +1910,146 @@ mod tests {
         assert_no_datafusion_wrapper(&msg);
     }
 
+    /// The gap #79 left open and #89 closed: a node with **no** guidance to hoist out of the codec.
+    ///
+    /// Driven through `WITH RECURSIVE` rather than a hand-built node deliberately — this is the
+    /// shape an operator reaches by writing ordinary, valid SQL. DataFusion 53.1 plans it as a
+    /// `RecursiveQueryExec` over a `WorkTableExec`, and `datafusion-proto` 53.1's encoder dispatch
+    /// (`physical_plan/mod.rs:337-569`) names neither, so both fall through to
+    /// [`LldbCodec::try_encode`] — the one place a message used to be unrecoverable.
+    #[tokio::test]
+    async fn an_unguided_node_reached_from_valid_sql_is_refused_by_name() {
+        let plan = recursive_plan().await;
+        assert_eq!(
+            plan.name(),
+            "RecursiveQueryExec",
+            "test setup: the planner must actually produce the node this test is about"
+        );
+
+        let err = serialize_plan(plan).expect_err("datafusion-proto 53.1 cannot encode it");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RecursiveQueryExec"),
+            "the refusal must name what cannot be shipped; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// The same node one level down, which is what makes first-write-wins load-bearing rather than
+    /// arbitrary: the sub-plan's failure is wrapped by `datafusion-proto` *before* the enclosing
+    /// [`LldbCodec::try_encode`] ever sees it, so a last-write-wins cell would record the wrapper
+    /// and hand back exactly the string this whole mechanism exists to escape.
+    #[tokio::test]
+    async fn an_unguided_node_inside_a_remote_stage_is_refused_the_same_way() {
+        let staged: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, recursive_plan().await).unwrap());
+        assert!(
+            staged.children().is_empty(),
+            "test setup: the sub-plan must be invisible to a children-only walk"
+        );
+
+        let err = serialize_plan(staged).expect_err("the nested node is still un-encodable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("RecursiveQueryExec"),
+            "a refusal from inside a remote stage must name the same node; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// And the property that separates this from enumerating `datafusion-proto`'s dispatch: the
+    /// message is right for a node nobody has ever heard of, because it is whatever
+    /// [`encode_failure`] produced rather than something looked up.
+    #[test]
+    fn an_unguided_node_this_build_has_never_heard_of_is_refused_by_name() {
+        let err = serialize_plan(opaque()).expect_err("nothing can encode a private test node");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(OPAQUE_EXEC_NAME),
+            "the refusal must name the node; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// A physical plan for a recursive CTE — small, terminating, and needing no table.
+    async fn recursive_plan() -> Arc<dyn ExecutionPlan> {
+        SessionContext::new()
+            .sql(
+                "WITH RECURSIVE walk(n) AS (\
+                   SELECT 1 AS n UNION ALL SELECT n + 1 FROM walk WHERE n < 5\
+                 ) SELECT n FROM walk",
+            )
+            .await
+            .expect("a recursive CTE is valid SQL")
+            .create_physical_plan()
+            .await
+            .expect("and it plans")
+    }
+
     /// An [`ImposterFlightReader`] as a plan, with the properties a leaf needs.
     fn imposter() -> Arc<dyn ExecutionPlan> {
+        Arc::new(ImposterFlightReader(leaf_properties()))
+    }
+
+    const OPAQUE_EXEC_NAME: &str = "OpaqueExec";
+
+    /// A node neither this codec nor `datafusion-proto` has ever seen — the third-party case
+    /// [`refuse_before_encoding`] cannot enumerate and does not try to.
+    #[derive(Debug)]
+    struct OpaqueExec(Arc<PlanProperties>);
+
+    impl DisplayAs for OpaqueExec {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{OPAQUE_EXEC_NAME}")
+        }
+    }
+
+    impl ExecutionPlan for OpaqueExec {
+        fn name(&self) -> &str {
+            OPAQUE_EXEC_NAME
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.0
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DFResult<SendableRecordBatchStream> {
+            unimplemented!("exists only to be refused by the codec, never executed")
+        }
+    }
+
+    /// An [`OpaqueExec`] as a plan.
+    fn opaque() -> Arc<dyn ExecutionPlan> {
+        Arc::new(OpaqueExec(leaf_properties()))
+    }
+
+    /// The properties a single-partition test leaf needs, shared by the two of them.
+    fn leaf_properties() -> Arc<PlanProperties> {
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        Arc::new(ImposterFlightReader(Arc::new(PlanProperties::new(
+        Arc::new(PlanProperties::new(
             EquivalenceProperties::new(schema),
             Partitioning::UnknownPartitioning(1),
             EmissionType::Final,
             Boundedness::Bounded,
-        ))))
+        ))
     }
 }
