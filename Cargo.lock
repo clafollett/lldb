@@ -3180,6 +3180,7 @@ dependencies = [
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",
+ "lldb-qe-types",
  "object_store",
  "rand 0.9.5",
  "rcgen",
@@ -3197,6 +3198,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "url",
+]
+
+[[package]]
+name = "lldb-qe-types"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "thiserror",
 ]
 
 [[package]]

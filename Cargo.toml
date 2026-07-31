@@ -11,6 +11,7 @@ resolver = "3"
 members = [
     "crates/lldb-qe-core",
     "crates/lldb-qe-coordinator",
+    "crates/lldb-qe-types",
     "crates/lldb-qe-worker",
 ]
 

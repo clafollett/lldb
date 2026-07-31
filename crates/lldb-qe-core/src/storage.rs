@@ -8,6 +8,12 @@
 //! registered for that URL scheme+authority in its `RuntimeEnv`. We lean on that: [`Storage`]
 //! knows how to (a) build the right `ObjectStore` and (b) register it on a session so table
 //! paths just resolve.
+//!
+//! [`StorageConfig`] — the *declaration* of which backend, which is four scalars and no
+//! `object_store` type at all — lives in [`lldb_qe_types::storage`] and is re-exported here.
+//! [`Storage::from_config`] is the arrow between them, and it is a constructor on [`Storage`]
+//! rather than a method on [`StorageConfig`] because the config type is foreign to this crate now
+//! and Rust forbids an inherent `impl` on a foreign type.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,37 +23,7 @@ use datafusion::prelude::SessionContext;
 use object_store::{ObjectStore, aws::AmazonS3Builder, local::LocalFileSystem, memory::InMemory};
 use url::Url;
 
-/// Where table data physically lives.
-///
-/// The engine speaks `object_store::ObjectStore`, so adding a backend is adding an arm here —
-/// nothing else in the engine changes. Local + InMemory cover dev and tests; S3 covers real
-/// object-storage warehouses (and any S3-compatible service like MinIO via `endpoint`).
-#[derive(Debug, Clone)]
-pub enum StorageConfig {
-    /// Local filesystem rooted at a directory. The default for development.
-    Local(PathBuf),
-    /// Ephemeral in-memory store. Fast and isolated — ideal for tests.
-    InMemory,
-    /// S3 (or S3-compatible) bucket. Credentials come from the environment
-    /// (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`, or an instance
-    /// role) — never from config, so warehouse definitions carry no secrets.
-    S3 {
-        /// Bucket name; addresses resolve as `s3://{bucket}/...`.
-        bucket: String,
-        /// Region, e.g. `us-east-1`. `None` lets the SDK resolve it from the environment.
-        region: Option<String>,
-        /// Custom endpoint URL for S3-compatible stores (e.g. MinIO `http://minio:9000`).
-        endpoint: Option<String>,
-        /// Allow plaintext HTTP — needed for a local MinIO endpoint, off for real S3.
-        allow_http: bool,
-    },
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        StorageConfig::Local(PathBuf::from("data"))
-    }
-}
+pub use lldb_qe_types::storage::StorageConfig;
 
 /// A live object store plus the knowledge of how DataFusion should address it.
 pub struct Storage {
@@ -65,10 +41,10 @@ enum Kind {
     S3 { bucket: String },
 }
 
-impl StorageConfig {
-    /// Construct the backing [`ObjectStore`] for this configuration.
-    pub fn build(&self) -> Result<Storage> {
-        match self {
+impl Storage {
+    /// Construct the backing [`ObjectStore`] for `config`.
+    pub fn from_config(config: &StorageConfig) -> Result<Storage> {
+        match config {
             StorageConfig::Local(root) => {
                 let root = std::fs::canonicalize(root).with_context(|| {
                     format!("local storage root does not exist: {}", root.display())
@@ -120,9 +96,7 @@ impl StorageConfig {
             }
         }
     }
-}
 
-impl Storage {
     /// The raw object store, e.g. to seed the in-memory backend in a test.
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
@@ -177,18 +151,10 @@ mod tests {
     use object_store::{ObjectStoreExt, PutPayload};
 
     #[test]
-    fn default_config_is_local_data_dir() {
-        match StorageConfig::default() {
-            StorageConfig::Local(p) => assert_eq!(p, PathBuf::from("data")),
-            other => panic!("expected Local, got {other:?}"),
-        }
-    }
-
-    #[test]
     fn local_build_errors_on_missing_root() {
         let cfg = StorageConfig::Local(PathBuf::from("/definitely/not/real/xyzzy-lldb"));
         assert!(
-            cfg.build().is_err(),
+            Storage::from_config(&cfg).is_err(),
             "a missing root must fail to canonicalize"
         );
     }
@@ -197,7 +163,7 @@ mod tests {
     fn local_table_path_is_absolute_join() -> Result<()> {
         // CARGO_MANIFEST_DIR is guaranteed to exist while tests run.
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let storage = StorageConfig::Local(root).build()?;
+        let storage = Storage::from_config(&StorageConfig::Local(root))?;
         let path = storage.table_path("sf1/lineitem.parquet")?;
         assert!(path.ends_with("sf1/lineitem.parquet"), "got {path}");
         assert!(
@@ -209,7 +175,7 @@ mod tests {
 
     #[test]
     fn memory_table_path_uses_memory_scheme() -> Result<()> {
-        let storage = StorageConfig::InMemory.build()?;
+        let storage = Storage::from_config(&StorageConfig::InMemory)?;
         assert_eq!(
             storage.table_path("lineitem.parquet")?,
             "memory:///lineitem.parquet"
@@ -228,7 +194,7 @@ mod tests {
             endpoint: Some("http://127.0.0.1:9000".to_string()),
             allow_http: true,
         };
-        let storage = cfg.build()?;
+        let storage = Storage::from_config(&cfg)?;
         assert!(matches!(storage.kind, Kind::S3 { .. }));
         Ok(())
     }
@@ -241,7 +207,7 @@ mod tests {
             endpoint: None,
             allow_http: false,
         };
-        let storage = cfg.build()?;
+        let storage = Storage::from_config(&cfg)?;
         assert_eq!(
             storage.table_path("sf1/lineitem.parquet")?,
             "s3://lldb-warehouse/sf1/lineitem.parquet"
@@ -252,7 +218,7 @@ mod tests {
     #[tokio::test]
     async fn memory_store_roundtrips_bytes() -> Result<()> {
         // Proves the abstraction is a real object store, not a stub: write then read back.
-        let storage = StorageConfig::InMemory.build()?;
+        let storage = Storage::from_config(&StorageConfig::InMemory)?;
         let store = storage.object_store();
         let path = ObjPath::from("greeting.txt");
         store

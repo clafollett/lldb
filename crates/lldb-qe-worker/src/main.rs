@@ -39,7 +39,8 @@ use datafusion::prelude::SessionContext;
 use lldb_qe_core::flight::{ambient_fleet_auth, serve_worker_with};
 use lldb_qe_core::stage_cache::StageCache;
 use lldb_qe_core::{
-    CredentialCheck, StorageArgs, StorageConfig, TlsArgs, init_tracing, install_client_trust,
+    CredentialCheck, Storage, StorageArgs, StorageConfig, TlsArgs, init_tracing,
+    install_client_trust,
 };
 use std::sync::Arc;
 use tokio::net::TcpListener;
@@ -89,8 +90,7 @@ async fn main() -> Result<()> {
     // Local rides the built-in `file://` store and needs no data dir to exist to serve.
     let storage_cfg = cli.storage.to_config()?;
     if !matches!(storage_cfg, StorageConfig::Local(_)) {
-        storage_cfg
-            .build()
+        Storage::from_config(&storage_cfg)
             .context("building worker storage")?
             .register_on(&ctx)?;
     }

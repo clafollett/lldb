@@ -930,7 +930,8 @@ where
     // Before the cache, before physical planning, before a single byte leaves this process.
     if let Some(authorization) = authorization {
         let options = state.config_options();
-        authorization.check_plan(
+        crate::rbac::check_plan(
+            authorization,
             &plan,
             &options.catalog.default_catalog,
             &options.catalog.default_schema,

@@ -1,0 +1,17 @@
+[package]
+name = "lldb-qe-types"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Dependency-free vocabulary shared across lldb: access-control types and storage configuration."
+
+# Every dependency here is a deliberate decision, because this crate's whole reason to exist is
+# what it does NOT depend on: no datafusion, no arrow, no iceberg, no parquet, no object_store, no
+# sqlx. `cargo tree -p lldb-qe-types` is the acceptance test — see the crate docs.
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+thiserror.workspace = true

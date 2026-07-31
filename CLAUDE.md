@@ -45,6 +45,10 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
 
 ## Layout
 
+- `crates/lldb-qe-types` — the vocabulary, and the crate the version wall does not apply to: RBAC
+  (`rbac.rs`) and the storage *declaration* (`storage.rs`). Depends on **none** of
+  datafusion / arrow / iceberg / parquet / object_store / sqlx, and
+  `cargo tree -p lldb-qe-types` piped through that pattern must stay empty
 - `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
   (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, the coordinator-side
   Iceberg-scan resolver that makes an Iceberg plan shippable and sliceable (`iceberg_scan.rs`),

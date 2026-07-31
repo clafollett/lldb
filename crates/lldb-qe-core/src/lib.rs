@@ -38,6 +38,11 @@
 //! for S3 is a one-line change in [`StorageConfig`], not a rewrite — the same trick that
 //! lets stateless workers read the same data from anywhere.
 //!
+//! Some of what this crate exposes is *vocabulary* rather than machinery — an access-control
+//! privilege, the name of a storage backend — and needs none of DataFusion, Arrow, Iceberg or
+//! `object_store` to be defined. That lives in [`lldb_qe_types`] and is re-exported from
+//! [`rbac`] and [`storage`] here, so every path that already worked still does.
+//!
 //! Its counterpart above the storage layer, and the reason a worker can be as thin as it is:
 //! **a plan is self-contained.** Everything a worker needs to answer its stage travels inside the
 //! plan bytes — file paths, byte ranges, and, since [`iceberg_scan`], the data files of the exact
