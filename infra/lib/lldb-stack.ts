@@ -247,6 +247,13 @@ export interface LldbStackProps extends cdk.StackProps {
    * Prefix of the three secrets `tls: 'fleet'` reads — `<prefix>-ca`, `<prefix>-cert`,
    * `<prefix>-key`. Defaults to {@link DEFAULT_TLS_SECRET_PREFIX}. Give two stacks in one account
    * different prefixes unless they are meant to be one trust domain.
+   *
+   * Only meaningful under `tls: 'fleet'` — supplying it in any other mode is a **synth error**
+   * rather than a silently discarded setting (#134). Plaintext mode imports no secrets at all, so
+   * the value would go nowhere, and the operator who reaches that state has just run
+   * `mint-fleet-tls.sh --prefix …` and then mistyped or forgotten `-c tls=fleet`: the silent
+   * outcome is a plaintext fleet deployed while they believe they configured where its certificate
+   * material comes from.
    */
   readonly tlsSecretPrefix?: string;
   /**
@@ -528,17 +535,31 @@ export class LldbStack extends cdk.Stack {
     // modes).
     const tlsMode: TlsMode = props.tls ?? 'none';
     const scheme = tlsMode === 'fleet' ? 'https' : 'http';
-    const tlsSecretPrefix = validateSecretPrefix(props.tlsSecretPrefix ?? DEFAULT_TLS_SECRET_PREFIX);
-    // A certificate name with no certificate to name is not a harmless no-op — it is an operator who
-    // minted for their own domain, mistyped or forgot `-c tls=fleet`, and got a plaintext fleet with
-    // no complaint. `tls: 'none'` sets no `LLDB_TLS_DOMAIN` at all (see the block below), so the
-    // value would be dropped on the floor; say so at synth instead.
-    if (props.tlsDomain !== undefined && tlsMode !== 'fleet') {
-      throw new Error(
-        `tlsDomain is only meaningful with tls='fleet' (got tls=${JSON.stringify(tlsMode)}). ` +
-          'Pass `-c tls=fleet` alongside it, or drop it — in plaintext mode nothing verifies a name.',
-      );
+    // Both TLS props are refused outright outside `fleet` mode rather than quietly ignored, and the
+    // reason is the same for each: `tls: 'none'` imports no secrets and sets no `LLDB_TLS_DOMAIN`
+    // (see the block below), so either value would be dropped on the floor. The operator who hits
+    // this has just minted certificate material and then mistyped or forgotten `-c tls=fleet`, and
+    // the alternative is a **plaintext fleet deployed with no complaint** while they believe they
+    // configured TLS. A synth error naming the missing flag costs nothing: there is no legitimate
+    // reason to name a certificate, or where its material lives, in a fleet that serves none.
+    //
+    // The general rule, and the one to keep: a prop a mode cannot consume is a synth error in that
+    // mode, never a no-op. `tlsDomain` got this in #86; `tlsSecretPrefix` was the same defect one
+    // prop away (#134), and worse, because its silence ends in an insecure deployment rather than a
+    // failed handshake.
+    for (const [name, value] of [
+      ['tlsDomain', props.tlsDomain],
+      ['tlsSecretPrefix', props.tlsSecretPrefix],
+    ] as const) {
+      if (value !== undefined && tlsMode !== 'fleet') {
+        throw new Error(
+          `${name} is only meaningful with tls='fleet' (got tls=${JSON.stringify(tlsMode)}). ` +
+            'Pass `-c tls=fleet` alongside it, or drop it — in plaintext mode the fleet serves no ' +
+            'certificate, so nothing reads it.',
+        );
+      }
     }
+    const tlsSecretPrefix = validateSecretPrefix(props.tlsSecretPrefix ?? DEFAULT_TLS_SECRET_PREFIX);
     const tlsDomain = validateTlsDomain(props.tlsDomain ?? DEFAULT_FLEET_TLS_DOMAIN);
 
     const tlsEnv: Record<string, string> = {};
