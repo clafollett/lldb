@@ -17,6 +17,11 @@
 //! See [`lldb_qe_core::auth::FleetAuth`] for the scope of the claim a shared secret makes (it
 //! proves membership of a deployment, not the identity of a user).
 //!
+//! A deployment that means to be closed can say so, and then that warning becomes a refusal:
+//! setting `LLDB_REQUIRE_FLEET_TOKEN` — to *anything*, its presence is the assertion — makes a
+//! blank or missing `LLDB_FLEET_TOKEN` stop this process before it binds, rather than opening the
+//! port. See [`lldb_qe_core::auth::REQUIRE_FLEET_TOKEN_ENV`].
+//!
 //! # …and over what
 //!
 //! `--tls-cert` / `--tls-key` make this port TLS. The fleet secret above used to cross it in the
@@ -36,6 +41,7 @@ use std::net::SocketAddr;
 use anyhow::{Context, Result};
 use clap::Parser;
 use datafusion::prelude::SessionContext;
+use lldb_qe_core::auth::check_fleet_posture_from_env;
 use lldb_qe_core::flight::{ambient_fleet_auth, serve_worker_with};
 use lldb_qe_core::stage_cache::StageCache;
 use lldb_qe_core::{
@@ -71,6 +77,13 @@ async fn main() -> Result<()> {
         version = lldb_qe_core::BUILD_VERSION,
         "starting lldb-qe-worker"
     );
+
+    // If the deployment asserted that this fleet is closed, hold it to that — here, before the bind
+    // below, because the failure this closes is a worker coming up *open* and saying so in a
+    // warning nobody reads. Presence of the variable is the assertion and its value is never
+    // parsed; `lldb_qe_core::auth::REQUIRE_FLEET_TOKEN_ENV` argues why, and why `FleetAuth::from_env`
+    // is not the seam. Nothing happens here without it, so `cargo run -p lldb-qe-worker` is untouched.
+    check_fleet_posture_from_env()?;
 
     // Resolve the transport posture *before* anything else that can fail slowly, and certainly
     // before the port is bound: a worker that is about to check a fleet secret over an unencrypted

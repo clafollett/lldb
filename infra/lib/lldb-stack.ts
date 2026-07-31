@@ -71,6 +71,34 @@ export const DEFAULT_TLS_SECRET_PREFIX = 'lldb/fleet-tls';
 export const FLEET_TOKEN_ENV = 'LLDB_FLEET_TOKEN';
 
 /**
+ * The variable by which this stack asserts, in the task definition itself, that the fleet it is
+ * deploying is **closed** (`lldb_qe_control::auth::REQUIRE_FLEET_TOKEN_ENV`).
+ *
+ * Set under `tls: 'fleet'` and nowhere else, beside {@link FLEET_TOKEN_ENV}. Its **presence** is the
+ * assertion and the engine never reads its value: with it set, a blank or missing fleet secret is a
+ * process that refuses to start rather than one that comes up open and logs a warning.
+ *
+ * That is what closes the gap the token alone left. `FleetAuth::from_env` reads a blank value as
+ * *unset*, and ECS injects `FOO=` for an emptied secret — so emptying the fleet secret in the
+ * console opened the whole fleet at the next task replacement, with only a `warn` to show for it.
+ *
+ * **Presence rather than `=1`, and that is the entire design.** A value-triggered guard is defeated
+ * by the same edit it exists to catch: empty this variable, then empty the token, and the fleet is
+ * open again — two console edits instead of one. Because presence is what counts, blanking *either*
+ * variable leaves the strict posture in force, and weakening it requires deleting this entry from
+ * the task definition: a structural diff that the next `cdk deploy` reverts and that the
+ * task-definition revision history records.
+ *
+ * **A plain `environment` entry, never an `ecs.Secret` — the exact inverse of the rule for
+ * {@link FLEET_TOKEN_ENV}, and for the same underlying reason.** That one is a secret, so being
+ * legible to anyone who can call `describe-task-definition` is a leak. This one carries no secret at
+ * all: it is a *claim about* the other, and its legibility in the task definition is precisely the
+ * mechanism — the whole point is that an operator, an auditor and a diff can all see that this
+ * deployment expects to be closed.
+ */
+export const REQUIRE_FLEET_TOKEN_ENV = 'LLDB_REQUIRE_FLEET_TOKEN';
+
+/**
  * Length of the generated fleet secret, in characters.
  *
  * 64 alphanumerics is ~380 bits — far past anything guessable, and past the 256-bit input the
@@ -538,6 +566,11 @@ export class LldbStack extends cdk.Stack {
     // on a secret the container already holds, that would additionally survive a rotation. There is
     // a test asserting the task roles do not get it, so its absence reads as a decision.
     const fleetSecrets: Record<string, ecs.Secret> = {};
+    // …and beside it, in plain `environment`, the deployment's assertion that the secret above must
+    // actually be there. Two entries and two injection mechanisms, chosen for opposite reasons: the
+    // token must not be readable from the task definition, and this must. See
+    // {@link REQUIRE_FLEET_TOKEN_ENV}.
+    const fleetEnv: Record<string, string> = {};
 
     if (tlsMode === 'fleet') {
       const fleetToken = new secretsmanager.Secret(this, 'FleetToken', {
@@ -561,6 +594,12 @@ export class LldbStack extends cdk.Stack {
       // One entry, spread into BOTH task definitions below. Same argument as the single image tag:
       // a fleet whose halves hold different secrets is a fleet that cannot talk to itself.
       fleetSecrets[FLEET_TOKEN_ENV] = ecs.Secret.fromSecretsManager(fleetToken);
+      // The value is arbitrary and is never parsed — `1` reads as intent to a human scanning a task
+      // definition, and that is the only criterion it has to meet. Do NOT make this conditional on
+      // anything, and do not offer a prop that omits it: an opt-out is a value edit by another name,
+      // and the whole property being bought here is that weakening the posture has to be a
+      // structural change to the deployment.
+      fleetEnv[REQUIRE_FLEET_TOKEN_ENV] = '1';
     }
 
     // ---- Warehouses: one worker fleet each ----------------------------------------------
@@ -582,7 +621,7 @@ export class LldbStack extends cdk.Stack {
       task.addContainer('worker', {
         image,
         command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
-        environment: { ...storageEnv, ...metadataEnv, ...tlsEnv },
+        environment: { ...storageEnv, ...metadataEnv, ...tlsEnv, ...fleetEnv },
         secrets: { ...metadataSecrets, ...workerTlsSecrets, ...fleetSecrets },
         portMappings: [{ containerPort: WORKER_PORT }],
         logging: ecs.LogDrivers.awsLogs({ streamPrefix: `worker-${definition.name}`, logGroup }),
@@ -639,6 +678,11 @@ export class LldbStack extends cdk.Stack {
         ...storageEnv,
         ...metadataEnv,
         ...tlsEnv,
+        // The coordinator gets the assertion too, and not merely for symmetry: it binds no port,
+        // but with a blank token it presents no credential and signs no plan assertion, so a fleet
+        // blanked on both sides runs open *and answers queries*. Both roles refusing is what makes
+        // the posture tamper-evident rather than half of it.
+        ...fleetEnv,
         // Two routing paths, and the coordinator picks by whether `--warehouse` is set.
         // `LLDB_WORKERS` is the pre-warehouse behaviour (the first warehouse's fleet, verbatim),
         // so a `run-task` with no extra arguments works exactly as it always did.

@@ -161,7 +161,11 @@ credentials come from the `ServicesDbSecretArn` output.
 | Mode | What you get |
 | - | - |
 | `none` *(default)* | Every Flight port is plaintext **and unauthenticated**. Legal, and not a hole in the engine's terms: it refuses a plaintext port only when a credential is actually checked on it, and in this mode nothing checks one. Traffic is confined to the VPC by the security groups — that, plus the warning every worker logs at startup, is the whole mitigation. |
-| `fleet` | Workers serve TLS, every role dials `https://`, and the PEM arrives as `LLDB_TLS_*_PEM` from three Secrets Manager secrets — **and** both roles get a generated `LLDB_FLEET_TOKEN`, so a worker rejects a Flight call that does not present it. **~$1.60/mo.** |
+| `fleet` | Workers serve TLS, every role dials `https://`, and the PEM arrives as `LLDB_TLS_*_PEM` from three Secrets Manager secrets — **and** both roles get a generated `LLDB_FLEET_TOKEN`, so a worker rejects a Flight call that does not present it, plus `LLDB_REQUIRE_FLEET_TOKEN`, which makes an emptied secret a refusal to start rather than an open fleet. **~$1.60/mo.** |
+
+> **Changing this setting on a live stack is an expected query outage** of several minutes, in
+> either direction. Read *"Flipping `-c tls=none` → `-c tls=fleet` is an expected query outage"*
+> below before you run it.
 
 **Mint before you deploy.** This is a prerequisite step, like `cdk bootstrap`:
 
@@ -213,6 +217,91 @@ Rotating is `aws secretsmanager put-secret-value` against the `FleetTokenSecretA
 forced new deployment of every warehouse service. Same caveat as the certificates and for the same
 reason — the value is read once per process — plus one more: during the rollout the halves of the
 fleet disagree, and a coordinator run in that window fails against whichever half has not restarted.
+
+### `LLDB_REQUIRE_FLEET_TOKEN` — the deployment asserts that the fleet is closed
+
+`-c tls=fleet` also sets `LLDB_REQUIRE_FLEET_TOKEN` on every task definition, as a **plain
+environment entry** beside the secret. Its presence makes a blank or missing `LLDB_FLEET_TOKEN` a
+**refusal to start** instead of a warning: no worker binds its port, no coordinator dials one.
+
+| `LLDB_REQUIRE_FLEET_TOKEN` | Behaviour |
+| - | - |
+| absent (`tls=none`, compose, `cargo run`) | unchanged — an unset fleet secret means an open port and a loud startup warning |
+| **present with any value, including empty** | `LLDB_FLEET_TOKEN` must be present and non-blank, or the process exits before binding |
+
+**Why it exists.** `FleetAuth::from_env` reads a blank value as unset, and ECS injects `FOO=` for an
+emptied secret. So an operator who emptied the fleet secret in the console got an **open fleet** at
+the next task replacement, and the only signal was a `warn` line — which is the line nobody is
+watching at the moment it matters. The closed posture was tamper-*logged*, not tamper-*evident*.
+
+**Why presence and not `=1`.** A value-triggered guard is defeated by exactly the edit it exists to
+catch: empty this variable, then empty the token, and the fleet is open again — two console edits
+instead of one, and the guard has reproduced the defect it was added to close. Because presence is
+what counts, blanking *either* variable leaves the strict posture in force. Weakening it means
+**deleting the entry from the task definition** — a structural change that the next `cdk deploy`
+reverts and that the task-definition revision history records. Do not add a prop that omits it; an
+opt-out is a value edit by another name.
+
+It is in `environment` and not `ecs.Secret` deliberately, which is the inverse of the rule the token
+lives under. The token must not be readable from the task definition. This one must: it carries no
+secret, it is a *claim about* the secret, and its legibility to `describe-task-definition` — and to
+an auditor, and to a diff — is the entire mechanism.
+
+Startup with it set and no usable token looks like this, from every role:
+
+```
+Error: LLDB_REQUIRE_FLEET_TOKEN is set, so this deployment asserts that its worker fleet is
+closed — but LLDB_FLEET_TOKEN is present but blank, ... Refusing to start.
+```
+
+That is the guard working. The fix is to restore the secret, not to delete the assertion.
+
+### Flipping `-c tls=none` → `-c tls=fleet` is an expected query outage
+
+**Plan for it. It is not a rolling change**, it is a change with a window in which queries fail, and
+the failures are loud and confusing rather than silent — which is the guard working, but is also
+exactly what gets rolled back at 3am by someone who was not told to expect it.
+
+**Why there is a window at all.** The mode changes both task definitions at once, but ECS replaces
+tasks over time, so for the length of the rollout the fleet is *half-converted* — and a coordinator
+discovers workers by `discovery.rs` expanding one Cloud Map name into one URL **per task IP**, so
+it dials every task the record still returns, converted or not. Two failure shapes live in that
+window, and it is worth being able to recognize both:
+
+| Who is talking | What happens |
+| - | - |
+| a **new** coordinator (`https://`, holds the token) → a worker still on the old plaintext task | the TLS handshake fails against a plaintext port. That classifies as a transport fault (`retry.rs`), so the stage is reassigned to another worker — the query may still answer, slowly, while enough converted workers remain, and fails once the candidates are exhausted |
+| a **old** coordinator (`http://`, no token) → a worker already converted | the TLS server refuses the plaintext client outright, and since #99 a converted worker also answers `UNAUTHENTICATED`. That is **fatal** rather than retriable, on purpose: an identical fleet would refuse identically, so it fails immediately instead of walking every worker |
+
+Neither is silent and neither produces a wrong answer. Both mean: **no reliable query service until
+every task in every warehouse is on the new definition.**
+
+**How long.** Dominated by task replacement, not by CloudFormation: each warehouse service rolls at
+`minHealthyPercent: 50`, so at least two waves, and each new task pays an image pull plus the
+health check's 30 s start period before it counts. On a small stack that is roughly **5–15
+minutes**; it grows with warehouse count, warehouse size and a cold image, and the Cloud Map record
+carries a 10 s TTL on top. Measure your own rather than trusting this range — the point is that it
+is minutes, not seconds.
+
+**Drain first — recommended.** Suspend the warehouses (`-c warehouses=…:suspended`, or
+`aws ecs update-service --desired-count 0`), deploy the mode change, then scale back up. It does not
+make the outage shorter — it makes it *unambiguous*. A drained fleet fails with "no workers", which
+is one legible state, instead of a mixture of handshake failures and `UNAUTHENTICATED` that an
+operator cannot tell apart from a genuinely broken certificate or a bad secret. For a single-warehouse
+POC that nobody is querying, rolling in place and accepting the window is fine; say so out loud
+beforehand either way. Stop submitting queries for the duration — the coordinator here is a one-shot
+`run-task`, so "draining" the client side is simply not starting new ones.
+
+The same applies **in reverse**: `fleet` → `none` has an identical window, with the roles swapped.
+
+**Why a genuinely rolling transition is not on offer.** It would need a mixed-mode window the engine
+cannot express: a worker that served both plaintext and TLS on one port, or a coordinator that fell
+back per peer. Neither exists, and the second is a *downgrade attack* wearing a convenience hat —
+`tls.rs` states that the scheme is the switch and that a TLS server refuses a plaintext client
+rather than obliging it. #83 is the related constraint: the engine builds its TLS acceptor once at
+startup and never re-reads its material, so there is no certificate-reload path a task could use to
+change posture without being replaced. Until that changes, the flip costs a window, and the honest
+thing to do is schedule it.
 
 ### Why the PEM is an environment variable and not a file
 
@@ -288,7 +377,10 @@ For the fleet secret: `-c tls=fleet` puts `LLDB_FLEET_TOKEN` on *every* task def
 reference and in no `Environment` block anywhere, all of them resolve the same secret, no literal
 secret value can reach the template (there is no `SecretString` property — only the
 `GenerateSecretString` recipe), the task roles are not granted it, and `-c tls=none` creates and
-injects nothing at all.
+injects nothing at all. `LLDB_REQUIRE_FLEET_TOKEN` is asserted the opposite way round — present on
+every role under `-c tls=fleet` and in `Environment` rather than `Secrets`, because its legibility
+is the mechanism — and absent from every role under `-c tls=none` and under the default, which is
+what keeps the plaintext mode deployable with no configuration.
 
 ## Egress: how tasks reach ECR (`-c egress=…`)
 
