@@ -571,8 +571,13 @@ impl LldbCodec {
             .downcast_ref::<FlightReaderExec>()
             .ok_or_else(|| encode_failure(&node))?;
 
+        // `Execution`, not `Internal`, and that is not cosmetic now that this error reaches the
+        // operator unwrapped: `DataFusionError::Internal`'s own `Display` staples *"a bug in
+        // DataFusion's code … file a bug report"* onto whatever it carries. This is an lldb
+        // wire-format bound, so that sentence would send an operator to the wrong issue tracker —
+        // the same misdirection this whole path exists to stop, arriving by the other door.
         if reader.fallbacks.len() > MAX_ENCODED_FALLBACKS as usize {
-            return Err(DataFusionError::Internal(format!(
+            return Err(DataFusionError::Execution(format!(
                 "FlightReaderExec has {} fallbacks, more than the {MAX_ENCODED_FALLBACKS} the wire \
                  format carries",
                 reader.fallbacks.len()
@@ -868,7 +873,10 @@ fn put_str(buf: &mut Vec<u8>, s: &str) -> DFResult<()> {
 /// needs a 4 GiB string, proving this needs an integer.
 fn len_prefix(len: usize) -> DFResult<u32> {
     u32::try_from(len).map_err(|_| {
-        DataFusionError::Internal(format!(
+        // `Execution` for the reason `encode_flight_reader`'s fallback bound is: this now reaches
+        // the operator unwrapped, and `Internal`'s `Display` would attach DataFusion's bug-report
+        // boilerplate to a bound that is entirely ours.
+        DataFusionError::Execution(format!(
             "FlightReaderExec string field is {len} bytes, more than the {} its u32 length prefix \
              can carry; encoding it would truncate the round trip instead of failing",
             u32::MAX
@@ -1833,6 +1841,32 @@ mod tests {
             msg.contains(&too_long.to_string()) && msg.contains("truncate"),
             "the refusal must name the length and what it would otherwise do; got: {msg}"
         );
+        // Since #89 this arrives unwrapped, so the variant is now part of what the operator reads:
+        // `Internal` would staple DataFusion's bug-report boilerplate onto an lldb bound.
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// The other bound the encode path enforces itself, held to the same rule: it is ours, so it
+    /// must not arrive wearing DataFusion's bug-report boilerplate. Driven through
+    /// [`serialize_plan`], because the variant only matters for what an operator actually reads.
+    #[tokio::test]
+    async fn the_fallback_bound_is_refused_without_datafusion_boilerplate() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let too_many: Vec<String> = (0..=MAX_ENCODED_FALLBACKS)
+            .map(|i| format!("http://w{i}:50051"))
+            .collect();
+        let reader = FlightReaderExec::with_fallbacks("http://w:50051", too_many, 0, inner)
+            .expect("the constructor does not bound the fallback list; the encoder does");
+
+        let msg = serialize_plan(Arc::new(reader))
+            .expect_err("more fallbacks than the wire format carries must be refused")
+            .to_string();
+        assert!(
+            msg.contains("fallbacks") && msg.contains(&MAX_ENCODED_FALLBACKS.to_string()),
+            "the refusal must name the bound it broke; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
     }
 
     /// The mechanism this file exists to guarantee: a refusal with guidance is raised *before*
