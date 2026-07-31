@@ -38,6 +38,10 @@
 //!
 //!   lldb-qe-reap --metadata-url postgres://lldb@localhost/lldb --dry-run
 //!   lldb-qe-reap --metadata-url postgres://lldb@localhost/lldb
+//!
+//! # Not a fleet member
+//!
+//! fleet-posture-allow: an out-of-process sweep; binds no port, never handed LLDB_FLEET_TOKEN.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;

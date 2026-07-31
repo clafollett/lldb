@@ -25,6 +25,10 @@
 //! "run this before the rollout" step stays honest.
 //!
 //!   lldb-qe-migrate --metadata-url postgres://lldb@localhost/lldb --seed-account default
+//!
+//! # Not a fleet member
+//!
+//! fleet-posture-allow: a DDL one-shot; binds no port, never handed LLDB_FLEET_TOKEN.
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
