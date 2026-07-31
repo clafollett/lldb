@@ -14,6 +14,10 @@ mean a suite ran. The integration binary takes roughly 20s with a database versu
 tpchgen-cli -s 1 --format=parquet --output-dir data/sf1   # test data
 cargo test                                                # unit + integration (data-absent tests skip)
 cargo fmt --all && cargo clippy --all-targets
+# The benches are behind `required-features = ["benches"]`. Without the flag `cargo bench` spends a
+# full release build, selects no bench target, prints nothing and exits 0. CI's clippy carries
+# `--features lldb-qe-core/benches`; use it locally when a bench changes.
+cargo bench -p lldb-qe-core --features benches            # TPC-H + distributed scorecards
 docker compose up --build                                 # full cluster (MinIO + Postgres 18.4 + fleet)
 LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smoke test (needs a daemon)
 

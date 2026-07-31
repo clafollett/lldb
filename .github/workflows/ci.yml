@@ -141,8 +141,15 @@ jobs:
       - name: Format
         run: cargo fmt --all --check
 
+      # `--features lldb-qe-core/benches` is NOT optional and must not be dropped to save time.
+      # The two criterion benches are behind `required-features = ["benches"]` so a default build
+      # stops producing their 629 MB of binaries (issue #97), and the only thing keeping them from
+      # rotting is this step compiling them on every run. Without the flag a bench that no longer
+      # builds is invisible until someone runs `cargo bench`. Package-qualified deliberately: the
+      # bare name would silently start meaning something else the day another member declares a
+      # feature called `benches`.
       - name: Clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings
 
       - name: Test
         env:

@@ -58,10 +58,25 @@ chrono.workspace = true
 # why that is a dev-dependency rather than a committed PEM.
 rcgen.workspace = true
 
+# Each criterion bench statically links the whole dependency graph again: 629 MB of the target
+# directory (`distributed` 323 MB + `tpch` 306 MB), 27% of its executable bytes, for targets that
+# are run deliberately and rarely. `cargo test` never built them; only `--all-targets` did, so
+# gating them costs the edit-test loop nothing and takes 629 MB off every default build.
+#
+# CI compiles them anyway: the clippy step in `.github/workflows/ci.yml` passes
+# `--features lldb-qe-core/benches`, so a bench that stops compiling still fails the build. That
+# pairing is the point — without it the benches would rot, which is exactly why issue #44 rejected
+# this gate. #44 priced it on *time* and was right about time (~0.5 s on a 37 s gate); the axis
+# that moved is disk. See docs/build-performance.md.
+[features]
+benches = []
+
 [[bench]]
 name = "tpch"
 harness = false
+required-features = ["benches"]
 
 [[bench]]
 name = "distributed"
 harness = false
+required-features = ["benches"]

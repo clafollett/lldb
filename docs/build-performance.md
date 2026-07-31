@@ -232,6 +232,12 @@ remember, a target that stops being compiled by the default gate and therefore s
 one more conditional in a workspace that already carries a version wall's worth of them. Not worth
 0.5 s. The benches stay in `--all-targets`, where a compile error in them still fails CI.
 
+**Reversed later on a different axis — see "Gating the two benches behind a feature (#97)" at the
+end of this file.** Nothing in this section was found to be wrong, and its numbers reproduce. What
+changed is that #72 established **disk**, not time, as the binding constraint, and this section
+never argued disk. The rot objection above is answered rather than accepted: CI's clippy step now
+carries the feature, so a bench that stops compiling still fails the build.
+
 ## What is left now
 
 The remaining warm-cycle cost is concentrated where it cannot be structured away: the
@@ -356,3 +362,176 @@ stale — every no-op build recompiled everything downstream (18.65 s → 0.21 s
 **Any build measurement taken in a git worktree before that fix was contaminated**, and parallel
 work happens in worktrees. Take measurements in a normal clone, or confirm the fingerprint resolves
 before trusting a number.
+
+# Gating the two benches behind a feature (#97)
+
+`crates/lldb-qe-core/Cargo.toml` declares a `benches` feature and both `[[bench]]` targets carry
+`required-features = ["benches"]`. **CI's clippy step passes `--features lldb-qe-core/benches`**, so
+every CI run still compiles them and a bench that stops building still fails the build.
+
+**This reverses the decision recorded above, and not by finding that decision wrong.** #44 priced
+the change in *time*, and its answer — ~0.5 s on a 37 s gate, a quarter of the gate's own spread —
+was right about time and reproduces here. What #72 established afterwards is that the constraint
+that started the whole line of work, a 4-core / 30 GB VM, was never bound by time: it was bound by
+**disk**, the crate split moved disk not at all (5.4 GB before, 5.4 GB after, three measurements),
+and disk is the axis #44 never argued. Read the two sections together. The time argument stands; it
+is simply not the argument that decides this.
+
+## Read this before comparing to anything above
+
+**Measured on a 14-core box (10 performance cores), 36 GB, macOS, toolchain 1.97.1** — the same
+shape of machine as the #72 section immediately above, and **not** the 4-core box every figure
+before that came from. Nothing here may be compared with a number in the baseline or consolidation
+tables.
+
+Protocol unchanged: `cargo clean`, then the build; cargo run plainly, no profile environment
+variables. Each warm clippy run is preceded by `touch crates/lldb-qe-core/src/lib.rs`.
+
+The worktree fingerprint check the top of this file demands was run, and passes: two consecutive
+no-op `cargo build --workspace --all-targets` cost 28.91 s (genuinely stale — a touched `lib.rs`
+preceded it) and then **0.26 s**; clippy the same, 20.65 s then **0.28 s**. The #87 fix holds here,
+so the warm rows below are real work and not a permanently-stale rebuild.
+
+## Disk, which is the point
+
+| Cold `cargo build --workspace --all-targets` | benches built (`--features lldb-qe-core/benches`) | benches gated out (the new default) |
+| - | - | - |
+| `du -sk target`, two samples each | 5,710,536 / 5,683,276 KB | **4,963,508 / 5,007,284 KB** |
+| `du -sh target` | 5.4 GB | **4.7–4.8 GB** |
+| `distributed` in `target/debug/deps` | 339,142,736 B (323 MiB) | **absent** |
+| `tpch` in `target/debug/deps` | 320,911,040 B (306 MiB) | **absent** |
+| executables over 100 MB | 7 | **5** |
+
+**Between −676,000 and −747,000 KB: 660–730 MiB, 11.9–13.0% of the target directory**, from a change
+that removes no code. Two samples per column, because `du` on two cold builds of the *same*
+configuration is not identical — 0.5% apart with the benches, 0.9% without — so a single-sample
+delta would have overstated its own precision.
+
+The two bench binaries are 660,053,776 bytes (629 MiB), which is the whole of it once that spread is
+allowed for. In particular **cargo does not stop compiling `criterion`**: it is a dev-dependency of
+the package, so every test target links it and it stays in the unit graph in all three
+configurations — 7 criterion/plotters artifacts under `--all-targets`, under `--all-targets
+--features lldb-qe-core/benches`, and under `cargo test --no-run` alike. Nor could it be avoided:
+cargo **rejects** an `optional` dev-dependency, so criterion is declared unconditionally and the
+saving is entirely the two linked binaries.
+
+The two bench binaries are present again, at the same sizes, under
+`cargo build --workspace --all-targets --features lldb-qe-core/benches` — which is what CI runs, so
+CI keeps paying the 629 MiB and the runner is not the machine with the disk ceiling.
+
+## Time: unchanged, exactly as #44 predicted
+
+| Warm clippy gate, after `touch crates/lldb-qe-core/src/lib.rs` | Runs |
+| - | - |
+| `--workspace --all-targets` (benches now excluded) | 23.24, 20.80, 20.71 s |
+| `--workspace --all-targets --features lldb-qe-core/benches` (what CI runs) | 20.80, 20.71, 20.71 s |
+
+Medians 20.80 s and 20.71 s. The first run of the first row is a warm-up artifact; discount it and
+the two configurations are indistinguishable. #44's 0.5 s does not so much *still hold* as shrink
+further, for the reason #44 already gave: the two bench units check **in parallel** with the
+`lldb-qe-core` lib unit-test unit, which is the critical path and finishes after them either way —
+and a 14-core box has even more room to hide two units in than the 4-core box that measured 0.5 s.
+
+The useful corollary is about CI rather than about laptops: **adding `--features
+lldb-qe-core/benches` to the clippy step costs CI nothing measurable**, which is what makes the
+anti-rot pairing free rather than a trade.
+
+Cold build is likewise unmoved — 101.3, 114.4, 99.7 s with the benches; 122.0, 99.3, 104.0 s
+without. Cold-build run-to-run spread was measured at ~11% earlier in this file and these ranges
+overlap completely; the *slowest* of all six runs is a build that omits the benches. Do not read the
+disk win as a build-time win. It is not one.
+
+## `cargo test` never paid for the benches — verified, not assumed
+
+`cargo test --workspace --no-run --message-format=json`, filtered to the workspace's own packages
+and diffed before against after, is **identical**: the same 16 `compiler-artifact` records, not one
+of kind `bench`, and the same twelve linked executables. The everyday edit-test loop is untouched by
+this change in both directions — it never built the benches, and it still does not.
+
+## The rot objection, answered rather than accepted — and proven
+
+#44's strongest argument was that a target the default gate stops compiling starts to rot. The
+answer is the CI flag, and it was verified by breaking a bench on purpose (a function returning
+`&str` where it declares `u32`, appended to `benches/tpch.rs`) and running both gates against it:
+
+| Gate, against a bench that does not compile | Exit |
+| - | - |
+| `cargo clippy --workspace --all-targets -- -D warnings` (local default) | **0** — the bench is not in the target set |
+| `cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings` (CI) | **101**, `error[E0308]` in `benches/tpch.rs` |
+
+That is the whole trade in two rows: a contributor who edits a bench and runs only the local default
+gate will not hear about a break, and CI will, before the branch merges.
+
+## The residual cost, stated rather than buried
+
+- One more flag in `.github/workflows/ci.yml` that must not be dropped. It is commented there.
+- **`cargo bench` on its own is now a quiet no-op.** It still spends a full *release* build of the
+  crate (3m 36s cold, here), then selects neither bench target, prints no measurement, and **exits
+  0**. That is cargo's documented `required-features` behaviour and it is the sharpest edge of this
+  change: the failure mode is silence, not an error. The incantation is
+  `cargo bench -p lldb-qe-core --features benches`, and it is now in `BENCHMARKS.md`,
+  `CONTRIBUTING.md`, `CLAUDE.md`, the `lldb-commands` skill, and both bench file headers.
+
+# Also priced, and rejected: `strip` on the test profile
+
+`[profile.dev]` sets `debug = 0` and `incremental = false`, and `[profile.test]` inherits both.
+#97 asked whether `strip` would reclaim meaningful space on top of that. **`strip = "debuginfo"`
+reclaims nothing, `strip = "symbols"` reclaims 433 MiB and costs the entire panic backtrace, and
+neither is implemented.** Three findings, in the order they were measured.
+
+**1. `[profile.test]` does not affect `cargo build --all-targets` at all.** With
+`strip = "symbols"` set there, a cold `--all-targets` build produced artifacts with byte-identical
+names *and* sizes (`integration-ee0867e14dbf06dc`, 373 MB, both times). `cargo build` uses the
+**dev** profile for every target it builds, test targets included; the `test` profile is what
+`cargo test` selects. Every "du after `--all-targets`" number in this file is therefore a
+dev-profile number, and no `[profile.test]` key can move it. Anyone re-running this experiment must
+measure `cargo test --no-run`, not `cargo build --all-targets`, or they will measure nothing.
+
+**2. `strip = "debuginfo"` is a no-op here by construction.** `debug = 0` already means there is no
+debug info to remove: `otool -l target/debug/deps/integration-… | grep -c __DWARF` returns **0**.
+
+**3. `strip = "symbols"` is a real 16% — and it is still the wrong trade.**
+
+| Cold `cargo test --workspace --no-run` | no override | `[profile.test] strip = "symbols"` |
+| - | - | - |
+| `du -sk target` | 2,738,456 KB (2.6 GB) | **2,294,648 KB (2.2 GB)** |
+| `integration` | 373 MB | **205 MB** |
+| `lldb_qe_core` unit tests | 353 MB | **195 MB** |
+| `lldb_qe_control` unit tests | 24 MB | 15 MB |
+| symbols in `integration` (`nm \| wc -l`) | 710,820 | 236 |
+
+443,808 KB — 433 MiB, 16.2%. Not a small number. It loses on two measured counts anyway.
+
+**The backtrace cost is total, not partial.** Not "line numbers get worse" — the trace is *empty*.
+A minimal crate with `debug = 0` in both columns and one panicking test:
+
+```
+# [profile.test] unset                        # [profile.test] strip = "symbols"
+stack backtrace:                              stack backtrace:
+  0: __rustc::rust_begin_unwind               note: Some details are omitted, run with
+  1: core::panicking::panic_fmt                     `RUST_BACKTRACE=full` for a verbose backtrace.
+  2: striptest::inner_frame_that_should…      (that is the whole output — zero frames)
+  3: striptest::outer_frame_that_should…
+  4: striptest::tests::it_panics
+```
+
+`debug = 0` costs line numbers and keeps function names, which is a deliberate and survivable
+trade. `strip = "symbols"` takes the function names too, and on an engine whose failures surface as
+panics inside async tasks on a worker that is the difference between a legible failure and an
+unreadable one. (`strip = "debuginfo"` leaves the trace intact — it simply has nothing to remove.)
+
+**And it makes disk *worse* for anyone who runs both commands.** With no overrides, `[profile.test]`
+is byte-identical to `[profile.dev]`, so cargo builds each test binary **once** and `cargo build
+--all-targets` and `cargo test` share it. Measured: `cargo test --workspace --no-run`
+(2,738,456 KB) followed by `cargo build --workspace --all-targets` costs 3.35 s — only the bins are
+missing — and lands at 5,025,468 KB, inside the 4,963,508 / 5,007,284 KB spread the build reaches on
+its own. Add *any* `[profile.test]` key and the two profiles fork into separate units with separate
+hashes. With `strip = "symbols"` set, `cargo build --workspace --all-targets` (5,008,532 KB) followed
+by `cargo test --workspace --no-run` landed at **7,303,172 KB**, holding two copies of every test
+binary — `integration` at 373 MB *and* 205 MB, `lldb_qe_core` at 353 MB *and* 195 MB. A 433 MiB
+saving that costs 2.2 GB the moment someone also builds `--all-targets` is not a saving on the
+machine #97 exists for.
+
+Measured, recorded, not implemented. The lever that works on this workspace is the **number of
+artifacts that statically link the whole dependency graph** — which is what #44's consolidation did,
+what the crate split could not do, and what gating the benches does.
