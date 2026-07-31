@@ -140,6 +140,7 @@ mod manifest_examples;
 mod query_cancel;
 mod query_reaper;
 mod query_scheduler;
+mod remote_eq_properties;
 mod result_cache_db;
 mod scan_slicing;
 mod services_db;
