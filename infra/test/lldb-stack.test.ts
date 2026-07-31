@@ -631,6 +631,23 @@ describe('transport security', () => {
     expect(() => synth({ tls: 'none' })).not.toThrow();
   });
 
+  test('tlsSecretPrefix without tls=fleet fails synth rather than being silently discarded', () => {
+    // #134: the same defect one prop away, and worse. `tls: 'none'` imports no secrets at all, so
+    // the prefix goes nowhere — and the operator who lands here has just run
+    // `mint-fleet-tls.sh --prefix …` and mistyped or forgotten `-c tls=fleet`, so the silent outcome
+    // is not a failed handshake but a **plaintext fleet deployed** while they believe they told the
+    // stack where its certificate material lives.
+    for (const props of [
+      { tlsSecretPrefix: 'team/lldb-prod' },
+      { tls: 'none' as const, tlsSecretPrefix: 'team/lldb-prod' },
+    ]) {
+      expect(() => synth(props)).toThrow(/tlsSecretPrefix is only meaningful with tls='fleet'/);
+    }
+    // Still accepted where it means something, and plaintext with neither prop still deploys.
+    expect(() => synth({ tls: 'fleet', tlsSecretPrefix: 'team/lldb-prod' })).not.toThrow();
+    expect(() => synth({ tls: 'none' })).not.toThrow();
+  });
+
   // A SAN list is comma-separated and a DNS name has no spaces, so either would corrupt the
   // certificate's name rather than fail — the same check the mint script runs on `--domain`, on this
   // side of the same setting. A wildcard is rejected because rustls matches a wildcard that is in
