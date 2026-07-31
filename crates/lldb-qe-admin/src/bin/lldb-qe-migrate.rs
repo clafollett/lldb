@@ -34,6 +34,10 @@ use lldb_qe_control::{ServicesArgs, init_tracing, redact_url};
 #[command(
     name = "lldb-qe-migrate",
     about = "Apply lldb services-database migrations and seed accounts",
+    long_about = "Applies the migrations embedded in this binary at compile time, so no migration directory has \
+to be shipped alongside it.\n\n\
+Run this as an explicit one-shot on every deploy — it is idempotent. Coordinators and workers \
+never migrate on startup: a rolling fleet racing the same DDL is a production footgun.",
     version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {

@@ -115,6 +115,8 @@ use lldb_qe_core::{
 #[command(
     name = "lldb-qe-coordinator",
     about = "SQL entry point for lldb",
+    long_about = "Runs ONE query and exits. For the long-running, authenticating front end use lldb-qe-server.\n\n\
+Builds a plan, cuts it into stages, and ships them to the worker fleet over Arrow Flight.",
     version = lldb_qe_core::BUILD_VERSION
 )]
 struct Cli {
