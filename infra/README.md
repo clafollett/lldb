@@ -337,7 +337,9 @@ dials several warehouses, so there is exactly one name available to verify again
 Be clear about the claim: a shared leaf authenticates **the fleet, not the member**. A client learns
 that its peer holds the fleet's key, not which worker it is. That is already the documented scope of
 this engine's TLS — it is server-authenticated, and per-member identity is `LLDB_FLEET_TOKEN`'s
-claim with mTLS still an open decision (#106).
+claim. **#106 decided not to change that**: a shared client certificate would authenticate the fleet
+exactly as the secret already does, and per-member certificates buy revocation granularity that the
+absence of a reload path (#83) cannot deliver. Revisit after #83 and #127.
 
 ### Rotating
 

@@ -92,11 +92,16 @@
 //! Not closed, and deliberately out of scope:
 //!
 //! - **Which fleet member you are.** This is *server-authenticated* TLS: a client verifies the
-//!   server's certificate; the server does not verify the client's. mTLS at the worker boundary —
-//!   whether a client certificate should *replace* [`crate::auth::FleetAuth`]'s shared secret — is
-//!   its own decision and is still open (issue #106). Nothing here makes `LLDB_FLEET_TOKEN`
-//!   redundant: it is unchanged, still required when set, and still the only thing proving a caller
-//!   belongs to this deployment.
+//!   server's certificate; the server does not verify the client's. Whether a client certificate
+//!   should *replace* [`crate::auth::FleetAuth`]'s shared secret was **decided in #106: no, and not
+//!   before #83 and #127.** `infra/` mints one *shared* fleet leaf — it has to, because a Fargate
+//!   task's IP is allocated at task start — and a shared client certificate authenticates the fleet
+//!   rather than the member, which is precisely what the secret already does. Per-member
+//!   certificates would say more, but not the thing that matters: what authorizes a request is
+//!   `lldb_qe_core::plan_assertion`, whose key is symmetric, so a compromised worker can mint one
+//!   whatever the transport proved. Request signing (#127) closes that; transport identity does
+//!   not. Nothing here makes `LLDB_FLEET_TOKEN` redundant: it is unchanged, still required when
+//!   set, and still the only thing proving a caller belongs to this deployment.
 //! - **Per-request identity at the worker boundary.** Closed by `lldb_qe_core::plan_assertion`, not by
 //!   anything here: TLS stops observation, an assertion stops a valid-but-unauthorized plan, and the
 //!   two are complementary. What TLS contributes is that the assertion — which is authorization-
