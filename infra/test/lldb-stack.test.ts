@@ -61,7 +61,14 @@ function envOf(container: any): Record<string, string> {
   return Object.fromEntries(((container.Environment ?? []) as any[]).map((e) => [e.Name, e.Value]));
 }
 
-/** A container's `Secrets` as name → the ARN it resolves from. */
+/**
+ * A container's `Secrets` as name → its `ValueFrom`, JSON-stringified.
+ *
+ * NOT an ARN. At synth time `ValueFrom` is an unresolved CloudFormation expression — `{"Ref":
+ * "FleetToken…"}` — and the ARN only exists after deployment. Stringifying is deliberate: it makes
+ * two roles' entries comparable with `toBe`, which is what "every role resolves the *same* secret"
+ * needs to assert. Comparing the objects directly would compare references, not contents.
+ */
 function secretsOf(container: any): Record<string, string> {
   return Object.fromEntries(((container.Secrets ?? []) as any[]).map((s) => [s.Name, JSON.stringify(s.ValueFrom)]));
 }
