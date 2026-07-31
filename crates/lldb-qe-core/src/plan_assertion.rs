@@ -30,11 +30,11 @@
 //!
 //! # How a worker forwards it: the `TaskContext`, for the same reason
 //!
-//! A worker that decodes a [`FlightReaderExec`](crate::remote::FlightReaderExec) leaf dials another
-//! worker itself, and that outbound call needs the assertion too — otherwise stage reassignment and
-//! every worker-to-worker shuffle break the moment the boundary is closed. The plan cannot carry it
-//! (above), and a `tokio::task_local!` cannot either: DataFusion's `collect_partitioned` drives each
-//! partition in a `JoinSet::spawn`, and a task-local does not cross a spawn.
+//! A worker that decodes a [`FlightReaderExec`] leaf dials another worker itself, and that outbound
+//! call needs the assertion too — otherwise stage reassignment and every worker-to-worker shuffle
+//! break the moment the boundary is closed. The plan cannot carry it (above), and a
+//! `tokio::task_local!` cannot either: DataFusion's `collect_partitioned` drives each partition in
+//! a `JoinSet::spawn`, and a task-local does not cross a spawn.
 //!
 //! What *does* reach every operator by construction is the [`TaskContext`] — every `execute` call
 //! passes it to its children. So [`task_ctx_with`] hangs the verified header value on the context as

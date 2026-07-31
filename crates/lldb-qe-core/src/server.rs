@@ -753,11 +753,10 @@ impl Coordinator {
     ///    distinguishable "permission denied" would let any authenticated caller walk the id space
     ///    and learn precisely which ids belong to other tenants and when they were running. The
     ///    account is taken from the credential and never from the request, like everywhere else.
-    /// 2. **Check the grant.** Within the account, cancelling is
-    ///    [`Privilege::Cancel`](crate::rbac::Privilege::Cancel) on the warehouse whose slot the
-    ///    cancellation frees. This one *is* reported as `PERMISSION_DENIED`, because a caller who
-    ///    got here has already proven they are in the tenant, so naming the missing grant leaks
-    ///    nothing and saves a support ticket.
+    /// 2. **Check the grant.** Within the account, cancelling is [`Privilege::Cancel`] on the
+    ///    warehouse whose slot the cancellation frees. This one *is* reported as
+    ///    `PERMISSION_DENIED`, because a caller who got here has already proven they are in the
+    ///    tenant, so naming the missing grant leaks nothing and saves a support ticket.
     ///
     /// Only then is anything signalled — the check and the signal are two calls, so there is no
     /// interleaving in which a refusal still stops a query.
@@ -1460,12 +1459,11 @@ where
 
 /// [`serve_coordinator`], also choosing what the port is served *over*.
 ///
-/// The entry point `lldb-qe-server` calls. Whether `tls` may be
-/// [`ServerTls::Plaintext`](crate::tls::ServerTls::Plaintext) at all is decided before we get here,
-/// by [`crate::tls::TlsArgs::resolve_server`] — a coordinator with a services database is checking
-/// bearer tokens, and a plaintext port under that condition has to be asked for. The posture is
-/// logged from in here, next to the credential posture, so every process that serves this port
-/// reports both the same way.
+/// The entry point `lldb-qe-server` calls. Whether `tls` may be [`ServerTls::Plaintext`] at all is
+/// decided before we get here, by [`crate::tls::TlsArgs::resolve_server`] — a coordinator with a
+/// services database is checking bearer tokens, and a plaintext port under that condition has to be
+/// asked for. The posture is logged from in here, next to the credential posture, so every process
+/// that serves this port reports both the same way.
 pub async fn serve_coordinator_with_tls<F>(
     listener: TcpListener,
     coordinator: Arc<Coordinator>,

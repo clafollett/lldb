@@ -66,7 +66,7 @@
 //! # Concurrency: compare-and-swap on the metadata pointer, then retry
 //!
 //! The correctness requirement is that two writers racing one table never lose an update and
-//! never apply one twice. That is bought by [`crate::lakehouse::CatalogCommitPoint`]: a commit
+//! never apply one twice. That is bought by [`crate::lakehouse`]'s `CatalogCommitPoint`: a commit
 //! is a conditional `UPDATE iceberg_tables SET metadata_location = <new> WHERE
 //! metadata_location = <the one I read>`. Postgres serializes the two updates on the row, so
 //! exactly one writer sees `rows_affected == 1` and the other sees `0`. This is byte-for-byte

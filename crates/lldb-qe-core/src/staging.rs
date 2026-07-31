@@ -124,9 +124,9 @@
 //!
 //! Every leaf this planner builds names one **primary** worker — the assignment rules above are
 //! unchanged — and carries the rest of the fleet as ordered **failover targets** (see
-//! [`failover_targets`]). Placement decides where work goes; failover decides where it goes *again*
+//! `failover_targets`). Placement decides where work goes; failover decides where it goes *again*
 //! if that node is lost. Keeping them separate is what lets fault tolerance apply to every rule
-//! here without any of them reasoning about it: they all build leaves through [`remote`], so a rule
+//! here without any of them reasoning about it: they all build leaves through `remote`, so a rule
 //! added tomorrow inherits reassignment for free.
 //!
 //! [`RepartitionExec`]: datafusion::physical_plan::repartition::RepartitionExec

@@ -32,6 +32,7 @@ verbatim what CI runs, and all of them must pass:
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 cargo test --workspace
 ./scripts/check-path-refs.sh
 ./scripts/check-dep-dupes.sh
@@ -68,6 +69,17 @@ It needs `jq` — `cargo metadata` is JSON, and hand-parsing it is how a check s
 under the `rust` path filter rather than unconditionally like `check-path-refs.sh`, because its
 inputs are only manifests and `.rs` sources: a docs-only PR cannot add a binary target or delete a
 call.
+
+The `cargo doc` line is the one gate `cargo clippy` structurally cannot cover: **clippy never runs
+rustdoc**, so an intra-doc link pointing at a private, renamed or deleted item is invisible to
+`-D warnings` above (the same shape as the `__eh_frame` gap below, where clippy not *linking* is why
+no lint sees a linker message). A broken link does not fail to render, either — it renders as plain
+text that looks like it should be a link, so the cross-references that carry this project's design
+rationale rot in the published docs with no signal anywhere (#77). Fixing one is a judgement per
+site: export the item if it is genuinely part of the explanation, or demote the link to backticks if
+the reader cannot and should not reach it. Do **not** reach for `#[allow(rustdoc::…)]` — that turns a
+real signal into permanent silence. Note the gate's edge: `cargo doc` documents libs and bins, so
+doc comments in `tests/` and `benches/` targets are not covered by it.
 
 Five things that surprise people:
 

@@ -137,6 +137,8 @@
 //!
 //! Two knobs, both on [`ResultCacheConfig`], both visible to a reviewer weighing disk against hit
 //! rate.
+//!
+//! [`SessionState::resolve_table_references`]: datafusion::execution::SessionState::resolve_table_references
 
 use std::collections::BTreeSet;
 use std::future::Future;
@@ -628,7 +630,7 @@ impl ResultCache {
     }
 
     /// Skips caused by a catalog with no [`Lakehouse`] handle behind it — see
-    /// [`Unversionable::MissingCatalog`].
+    /// `Unversionable::MissingCatalog`.
     ///
     /// **This must be zero.** It is not a tuning statistic; it counts the one way this cache can
     /// stop working without anything failing, which is that the session it is asked about and the

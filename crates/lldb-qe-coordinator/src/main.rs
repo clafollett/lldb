@@ -97,6 +97,9 @@
 //! unconfiguring anything else.
 //!
 //! Start a worker first: `cargo run -p lldb-qe-worker`.
+//!
+//! [`discover_workers`]: lldb_qe_core::discover_workers
+//! [`execute_cached`]: lldb_qe_core::result_cache::execute_cached
 
 use std::path::PathBuf;
 

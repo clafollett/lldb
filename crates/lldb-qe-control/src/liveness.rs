@@ -14,7 +14,7 @@
 //! and nothing in the build would notice. So the model is decided once, here, and the four
 //! decisions it turns on are written down below rather than only in the issue that asked for them.
 //! Both consumers now exist — [`crate::reaper`] and [`crate::fleet_admission`] — and both splice
-//! [`LIVE_PREDICATE`] in verbatim rather than re-spelling it, which is what that "once" means in
+//! `LIVE_PREDICATE` in verbatim rather than re-spelling it, which is what that "once" means in
 //! practice.
 //!
 //! # Decision 1 — what a coordinator registers, and what its identity *is*

@@ -96,6 +96,8 @@
 //! - **An object store this session cannot resolve.** Checked here so "the fleet cannot read this
 //!   bucket" is a coordinator-side error naming the scheme instead of a failure deep inside a
 //!   remote stage.
+//!
+//! [`FileScanConfig`]: datafusion::datasource::physical_plan::FileScanConfig
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
