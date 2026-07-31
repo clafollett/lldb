@@ -73,14 +73,22 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   control-plane module is re-exported from `lib.rs`, so `lldb_qe_core::auth`, `::services`,
   `::tls` and the rest still resolve exactly as before
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
-  The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
-  migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
-  `lldb-qe-auth` (users, API keys, roles, grants), `lldb-qe-reap` (resolve query-history rows
-  stranded by a coordinator that died) and `lldb-qe-server` (the long-running query
-  scheduler — the *only* binary here that authenticates)
+  The coordinator package also builds `lldb-qe-server` (`src/bin/`), the long-running query
+  scheduler and the *only* binary that authenticates. Both targets here run queries, and that is
+  the entry rule: cargo resolves dependencies **per package, not per binary**, so anything in this
+  package compiles the whole DataFusion graph whether it imports it or not
+- `crates/lldb-qe-admin` — the operator one-shots: `lldb-qe-migrate` (applies the services-DB
+  migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse), `lldb-qe-auth`
+  (users, API keys, roles, grants) and `lldb-qe-reap` (resolve query-history rows stranded by a
+  coordinator that died). The third crate the version wall does not apply to: it depends on
+  `lldb-qe-control` and `lldb-qe-types` and on **none** of datafusion / arrow / iceberg / parquet,
+  and `cargo tree -p lldb-qe-admin` piped through that pattern must stay empty. A binary that needs
+  the engine does not belong here; a binary that does not need it does not belong in
+  `lldb-qe-coordinator`
 - `manifests/` — example catalog manifests (config-as-data); TPC-H is just one of them
-- `Dockerfile` / `docker-compose.yml` — one image, all three binaries; a MinIO + Postgres 18.4 +
-  worker-fleet cluster
+- `Dockerfile` / `docker-compose.yml` — one image, every binary (it builds `-p lldb-qe-coordinator
+  -p lldb-qe-worker -p lldb-qe-admin`; drop a `-p` and the services that invoke those binaries lose
+  their entrypoint); a MinIO + Postgres 18.4 + worker-fleet cluster
 - `infra/` — AWS CDK (TypeScript): ECS Fargate worker fleet, S3 warehouse, ECR. **CDK, not
   Terraform.** Deploys one pinned `imageTag` to every role; synth fails on `latest`
 - `data/` — generated TPC-H + local Iceberg warehouse (gitignored)
@@ -112,8 +120,8 @@ every session that never touched the crate about 8.8k tokens.
 Read that file before changing any of those subsystems: most of its sections exist to name a
 tempting alternative and say why it is wrong, and the module docs alone will not tell you that.
 
-**If you are working in `crates/lldb-qe-control`, `crates/lldb-qe-coordinator`,
-`crates/lldb-qe-worker` or `infra/` and the
+**If you are working in `crates/lldb-qe-admin`, `crates/lldb-qe-control`,
+`crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` or `infra/` and the
 change touches one of those subsystems, read it explicitly** — it will not have loaded for you.
 
 ## Non-negotiables — these apply everywhere, including outside `lldb-qe-core`

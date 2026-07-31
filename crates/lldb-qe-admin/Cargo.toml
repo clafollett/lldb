@@ -1,0 +1,32 @@
+[package]
+name = "lldb-qe-admin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "lldb operator one-shots: migrate, warehouse, auth, reap — control-plane tools, free of the query engine."
+
+# This package exists for what it does NOT depend on. Cargo resolves dependencies **per package,
+# not per binary**: while these four lived in `src/bin/` of `lldb-qe-coordinator` — which declares
+# `lldb-qe-core` and `datafusion` — every one of them compiled the whole DataFusion/Arrow/Iceberg
+# graph, then discarded it at link time. Repointing their imports would not have changed that; only
+# a package boundary does. `lldb-qe-server` stays in `lldb-qe-coordinator`, because it really does
+# run queries.
+#
+#   cargo tree -p lldb-qe-admin | grep -E 'datafusion|arrow|iceberg|parquet'   # must stay empty
+#
+# `lldb-qe-types` is a second edge and not a leak: it is the vocabulary crate, DataFusion-free by
+# the same rule, and `lldb-qe-auth` needs `rbac::{ObjectRef, ObjectType, Privilege}` to parse a
+# grant. `lldb-qe-control` depends on it directly for exactly the same reason; going through a
+# re-export would have added a third path to one set of types.
+[dependencies]
+lldb-qe-control = { path = "../lldb-qe-control" }
+lldb-qe-types = { path = "../lldb-qe-types" }
+tokio.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+tracing.workspace = true
+# `lldb-qe-auth` turns `--expires-in-days` into a timestamp.
+chrono.workspace = true

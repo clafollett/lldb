@@ -1,11 +1,11 @@
 //! `lldb-qe-warehouse` — the control plane's hands: create, list, resize, suspend, resume and
-//! drop [virtual warehouses](lldb_qe_core::warehouse).
+//! drop [virtual warehouses](lldb_qe_control::warehouse).
 //!
 //! # What this binary does, precisely
 //!
 //! It **edits rows**. A warehouse row is the *desired state* of a pool of compute; this is the
 //! tool that states the desire. Nothing here talks to ECS, to Docker, or to any orchestrator —
-//! see the module docs on [`lldb_qe_core::warehouse`] for why the engine stays declarative (the
+//! see the module docs on [`lldb_qe_control::warehouse`] for why the engine stays declarative (the
 //! short version: the AWS SDK is a large dependency in a workspace whose whole build story is
 //! "one `arrow`/`object_store`/`datafusion` tree-wide", and baking one cloud's API into the
 //! control plane would make the abstraction less portable than the thing it abstracts).
@@ -31,14 +31,14 @@
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
-use lldb_qe_core::warehouse::{Warehouse, WarehouseState};
-use lldb_qe_core::{Account, ServicesArgs, ServicesDb, init_tracing, redact_url};
+use lldb_qe_control::warehouse::{Warehouse, WarehouseState};
+use lldb_qe_control::{Account, ServicesArgs, ServicesDb, init_tracing, redact_url};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "lldb-qe-warehouse",
     about = "Manage virtual warehouses: named, resizable, suspendable compute pools",
-    version = lldb_qe_core::BUILD_VERSION
+    version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {
     /// Tenant that owns the warehouse. Warehouse names are unique *within* an account, so two
@@ -102,7 +102,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     tracing::info!(
-        version = lldb_qe_core::BUILD_VERSION,
+        version = lldb_qe_control::BUILD_VERSION,
         "starting lldb-qe-warehouse"
     );
 

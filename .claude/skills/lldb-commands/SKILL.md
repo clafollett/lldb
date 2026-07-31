@@ -23,7 +23,7 @@ LLDB_DOCKER=1 cargo test --test distributed_cluster       # cross-container smok
 
 # Services DB (control plane). Migrations are an explicit one-shot step, NEVER startup magic —
 # a rolling fleet must not race to apply DDL. Compose runs it as the `db-migrate` service.
-cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-migrate -- \
   --metadata-url postgres://lldb@localhost/lldb --seed-account default
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration services_db  # or LLDB_DOCKER=1
 
@@ -33,7 +33,7 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # Virtual warehouses (elastic compute). The CLI writes DESIRED state; an actuator applies it —
 # `aws ecs update-service --desired-count`, a CDK deploy (-c warehouses=analytics:4,etl:1), or
 # `docker compose up -d --scale`. The engine carries no orchestrator SDK, on purpose.
-cargo run -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-warehouse -- \
   --metadata-url postgres://lldb@localhost/lldb create --name analytics --size 4
 cargo run -p lldb-qe-coordinator -- --warehouse analytics --sql "SELECT ..."   # route a query
 
@@ -78,27 +78,27 @@ LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integrat
 # Reaping stranded query rows (`reaper.rs`). A one-shot, like `lldb-qe-migrate`: schedule it
 # (cron / an ECS scheduled task) at whatever interval you want stranded rows resolved within.
 # Idempotent, bounded by --limit, and --dry-run shows what it would take without writing.
-cargo run -p lldb-qe-coordinator --bin lldb-qe-reap -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-reap -- \
   --metadata-url postgres://lldb@localhost/lldb --dry-run
 LLDB_TEST_POSTGRES_URL=postgres://… cargo test -p lldb-qe-core --test integration query_reaper
 
 # Accounts, API keys, roles, grants. Same operator-tool posture as `lldb-qe-warehouse`: its
 # credential IS the Postgres password, so treat that as the deployment's root credential. The token
 # `key create` prints is shown exactly once and stored nowhere.
-cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb user create --name alice
-cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb key create --user alice --name cli
-cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb \
   grant --role analyst --privilege SELECT --object-type namespace --object-name lldb.sales
 # Privileges: SELECT | INSERT | DELETE | UPDATE | USAGE | CANCEL | ALL. CANCEL is held on a
 # warehouse and permits stopping any query running on it; USAGE (which every submitter needs)
 # deliberately does not imply it, and ALL does.
-cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb \
   grant --role oncall --privilege CANCEL --object-type warehouse --object-name analytics
-cargo run -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb@localhost/lldb show
 
 # Authentication, RBAC and tenant isolation end-to-end: the issue's three "done when" bullets as

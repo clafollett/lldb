@@ -26,12 +26,15 @@ use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
 /// Every binary the compose cluster (and the CDK stack) invokes by name, and therefore every
-/// binary the runtime image must contain. Keep in step with `Dockerfile`'s `COPY` list and with
-/// `crates/lldb-qe-coordinator/src/bin/`.
+/// binary the runtime image must contain. Keep in step with `Dockerfile`'s `COPY` list and with the
+/// binary targets of the three packages it builds — `lldb-qe-coordinator` (`src/main.rs` +
+/// `src/bin/lldb-qe-server.rs`), `lldb-qe-worker`, and `lldb-qe-admin` (`src/bin/`).
 ///
 /// This is a list rather than a directory scan on purpose: the point is to state, in one place, the
 /// contract between two files that cannot see each other — the `Dockerfile` and
-/// `docker-compose.yml`. A scan would silently accept a binary nobody deploys.
+/// `docker-compose.yml`. A scan would silently accept a binary nobody deploys. It also catches the
+/// failure this list's newest hazard produces: the `Dockerfile` names packages with `-p`, so
+/// dropping `-p lldb-qe-admin` builds an image missing four of these seven.
 const IMAGE_BINARIES: &[&str] = &[
     "lldb-qe-coordinator",
     "lldb-qe-worker",

@@ -6,8 +6,8 @@
 //! coordinator **process** that the control plane no longer believes is alive, and marks them
 //! `failed` with a reason distinguishing "never started" from "died mid-flight". The rule it
 //! applies, the compare-and-swap that makes it safe next to a live coordinator, and the honest
-//! limits of both live in [`lldb_qe_core::reaper`]'s module docs; this binary is the operator's end
-//! of it.
+//! limits of both live in [`lldb_qe_control::reaper`]'s module docs; this binary is the operator's
+//! end of it.
 //!
 //! Two properties worth knowing before scheduling it:
 //!
@@ -15,14 +15,14 @@
 //!   the first one resolved are terminal and terminal rows are not eligible. Running it on a
 //!   perfectly healthy fleet is a no-op that reports zero.
 //! - **It is bounded.** One run resolves at most `--limit` rows (default
-//!   [`DEFAULT_REAP_BATCH`](lldb_qe_core::reaper::DEFAULT_REAP_BATCH)) and says so when it fills the
-//!   batch. That is [`lldb_qe_core::result_cache`]'s rule for sweeps, for the same reason: a
-//!   maintenance task whose cost is proportional to a deployment's entire accumulated backlog is
-//!   the one that turns a bad week into an incident.
+//!   [`DEFAULT_REAP_BATCH`](lldb_qe_control::reaper::DEFAULT_REAP_BATCH)) and says so when it
+//!   fills the batch. That is `lldb-qe-core`'s `result_cache` rule for sweeps, for the same
+//!   reason: a maintenance task whose cost is proportional to a deployment's entire accumulated
+//!   backlog is the one that turns a bad week into an incident.
 //!
 //! # Why a separate binary, and not a coordinator doing this at startup
 //!
-//! This is [`lldb_qe_core::liveness`]'s decision 4 and it was made there deliberately. A
+//! This is [`lldb_qe_control::liveness`]'s decision 4 and it was made there deliberately. A
 //! coordinator that swept for dead peers as it booted would be doing the most dangerous version of
 //! this: a fleet restarting together, every member judging the others through a lease that none of
 //! them have renewed yet, all of them concluding the others are dead and failing each other's live
@@ -41,15 +41,15 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use lldb_qe_core::query_log::QueryRecord;
-use lldb_qe_core::reaper::{DEFAULT_REAP_BATCH, ReapReason, ReapedQuery};
-use lldb_qe_core::{ServicesArgs, init_tracing, redact_url};
+use lldb_qe_control::query_log::QueryRecord;
+use lldb_qe_control::reaper::{DEFAULT_REAP_BATCH, ReapReason, ReapedQuery};
+use lldb_qe_control::{ServicesArgs, init_tracing, redact_url};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "lldb-qe-reap",
     about = "Resolve query-history rows stranded by a coordinator that is no longer live",
-    version = lldb_qe_core::BUILD_VERSION
+    version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {
     /// Restrict the sweep to one tenant. The default is every account, which is the ordinary case:
@@ -91,7 +91,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     tracing::info!(
-        version = lldb_qe_core::BUILD_VERSION,
+        version = lldb_qe_control::BUILD_VERSION,
         "starting lldb-qe-reap"
     );
 
@@ -149,7 +149,7 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn run(db: &lldb_qe_core::ServicesDb, cli: &Cli, account_id: Option<i64>) -> Result<()> {
+async fn run(db: &lldb_qe_control::ServicesDb, cli: &Cli, account_id: Option<i64>) -> Result<()> {
     if cli.dry_run {
         let stranded = db.list_stranded_queries(account_id, cli.limit).await?;
         if stranded.is_empty() {
@@ -261,8 +261,8 @@ fn print_reaped(row: &ReapedQuery) {
     );
 }
 
-/// `slot#incarnation`, the rendering [`lldb_qe_core::CoordinatorIdentity`] uses in logs — so a line
-/// printed here can be grepped for in the coordinator's own output.
+/// `slot#incarnation`, the rendering [`lldb_qe_control::CoordinatorIdentity`] uses in logs — so a
+/// line printed here can be grepped for in the coordinator's own output.
 fn coordinator_of(slot: Option<&str>, incarnation: Option<&str>) -> String {
     match (slot, incarnation) {
         (Some(slot), Some(incarnation)) => format!("{slot}#{incarnation}"),

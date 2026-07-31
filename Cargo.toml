@@ -9,6 +9,7 @@
 [workspace]
 resolver = "3"
 members = [
+    "crates/lldb-qe-admin",
     "crates/lldb-qe-control",
     "crates/lldb-qe-core",
     "crates/lldb-qe-coordinator",
