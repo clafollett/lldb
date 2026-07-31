@@ -586,3 +586,54 @@ Considered and not adopted: pointing agent worktrees at a shared `CARGO_TARGET_D
 collapse N copies into one, but it serialises builds behind a shared lock and re-links whenever two
 agents' flags differ — the contention worktree isolation exists to avoid. Worth measuring before
 adopting; a sweep is the cheaper answer and it is the one implemented.
+
+# Linker warnings are outside every gate, and that is not fixable by adding one (#105)
+
+Every fat binary here links on macOS with:
+
+```
+ld: warning: __eh_frame section too large (max 16MB) to encode dwarf unwind offsets in
+    compact unwind table, performance of exception handling might be affected
+```
+
+rustc surfaces it via `warn(linker_messages)`. Correctness is unaffected; debug-build unwinding takes
+the slower path.
+
+## Why no gate sees it
+
+**`cargo clippy` never links.** That is stated above as the reason the clippy gate is fast, and it is
+exactly why `-D warnings` there cannot catch this. Verified rather than assumed — same file touched
+both times, `cargo build -p lldb-qe-worker` emits the warning once, `cargo clippy -p lldb-qe-worker`
+emits it **zero** times.
+
+So this workspace has a class of warning that no check observes. "Clippy is green" does not mean "the
+build is warning-clean", and it never can.
+
+## Why adding a linking gate would make it worse, not better
+
+`cargo test --workspace` *does* link, and CI runs it — so a warning check there is technically
+available. It would not help, and would actively mislead:
+
+**CI runs on `ubuntu-latest`. This warning is macOS's linker.** A `-D linker_messages` on the test
+step would be green on every CI run and red on a contributor's Mac — the worst shape of build
+failure, because it looks like the contributor's machine is broken. It would also advertise coverage
+("linker warnings are gated now") that does not extend to the platform where the warning actually
+fires.
+
+**If `RUSTFLAGS=-Dwarnings` is ever added to any build step, resolve this first or macOS
+contributors are locked out.**
+
+## Why it is not silenced
+
+Silencing needs `RUSTFLAGS`, and the section above on `.cargo/config.toml` applies unchanged: any
+`rustflags` entry invalidates every contributor's target directory once, and then makes the build
+depend on a file that must agree everywhere. A crate-level `#![allow(linker_messages)]` avoids that
+but is far too broad — it would silence *every* future linker message, including ones worth reading.
+
+The better reason to leave it: **the warning is proportional to the problem this document is about.**
+`__eh_frame` is too large because the binaries are enormous, which is #97's and #72's subject. It is
+a free indicator that costs nothing and would disappear on its own if the binaries ever got small
+enough. Silencing it would remove a signal that tracks the thing being measured.
+
+**Decision: leave it, documented as expected on macOS.** Nothing to fix, and the honest statement is
+that linker warnings are unobserved rather than that they are clean.
