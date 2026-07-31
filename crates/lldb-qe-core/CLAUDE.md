@@ -198,9 +198,9 @@ worker.
 Both credentials above used to cross the wire in the clear. `tls.rs` puts
 `tonic::transport::{ServerTlsConfig, ClientTlsConfig}` on **both** Flight boundaries — in process,
 not behind a terminating proxy, because workers pull from each other directly and a single front
-door would encrypt one hop of a mesh. Certificates are **mounted files** (`--tls-cert`/`--tls-key`
-to serve, `--tls-ca`/`--tls-domain` to dial); the engine generates and issues nothing. Five things
-to keep straight.
+door would encrypt one hop of a mesh. Certificates are **supplied, never minted**: as files
+(`--tls-cert`/`--tls-key` to serve, `--tls-ca`/`--tls-domain` to dial) or as the PEM itself
+(`--tls-cert-pem`/`--tls-key-pem`/`--tls-ca-pem`). Six things to keep straight.
 
 1. **The rule is not "TLS unless you said otherwise".** That would make `cargo run` need
    certificates, which is the same rule that forbids it needing Postgres. The rule is: **binding a
@@ -223,6 +223,11 @@ to keep straight.
    means changing the `--workers` URLs too, and a half-converted fleet fails loudly. Note the trap
    `discovery.rs` creates: a DNS endpoint is expanded to one URL *per task IP*, so the name verified
    is an IP unless the certificate carries IP SANs or `--tls-domain` names the certificate's host.
+   On ECS the first is unavailable — a Fargate task's IP is allocated at task start and changes on
+   every replacement and scale event, which is the elasticity `discovery.rs` exists to deliver — so
+   `infra/` mints **one** fleet leaf carrying `DNS:fleet.lldb.local` and sets `--tls-domain` to it.
+   One name and not one per warehouse, because the dialing trust is process-global (5) while a
+   coordinator dials several warehouses: there is exactly one name available to verify against.
 5. **Two process-globals, both argued rather than assumed.** rustls's crypto provider is *installed*
    (`ring`, once, idempotently) rather than inferred from crate features — inference panics if a
    future dependency adds `aws-lc-rs`. And the dialing trust is ambient
@@ -231,11 +236,23 @@ to keep straight.
    `https://`**, which is what makes installing one inert for every plaintext caller — and is what
    lets the TLS tests live in the shared `integration` binary at all.
 
+6. **The inline spelling exists for one platform, and does not replace the file one.** ECS Fargate
+   resolves a Secrets Manager value into an **environment variable and by no other means**, so a
+   fleet there cannot be given a certificate file at all without an entrypoint writing the key to
+   disk, an EFS volume, or a $400/month private CA — all priced in #73, all worse. Hence
+   `--tls-*-pem`. Two rules keep it honest: a path and its `-pem` twin together are an **error**
+   (there is no way to tell which was meant, and the thing being guessed about is a private key),
+   and inline material is checked for a `-----BEGIN` line where a file is not — an env var has no
+   filename to name in the error, and its realistic failures (an unfilled secret, a shell-mangled
+   value) would otherwise surface as an opaque rustls parse failure. `TlsArgs`/`TlsClientArgs`
+   carry a hand-written `Debug` rendering PEM as presence, `ServicesArgs`-style.
+
 `docker-compose.yml` is the plaintext path and says so out loud: `LLDB_ALLOW_PLAINTEXT` is set on
 every service that binds a port, with a comment explaining that deleting it stops the cluster coming
-up — which is the guard working. `infra/` carries a **`KNOWN GAP`**: Fargate cannot mount a Secrets
-Manager value as a file, so provisioning certificates there is its own piece of work, and the stack
-deliberately does not set `LLDB_ALLOW_PLAINTEXT` either (a CDK test asserts that).
+up — which is the guard working. `infra/` is no longer a gap: `-c tls=fleet` injects the PEM from
+three Secrets Manager secrets that `scripts/mint-fleet-tls.sh` fills, and the stack **imports** them
+rather than creating them so that a private key is never something CDK holds. It still does not set
+`LLDB_ALLOW_PLAINTEXT`, in either mode, and a CDK test asserts that in both.
 
 ## A catalog per tenant — the boundary the grant check no longer carries alone
 

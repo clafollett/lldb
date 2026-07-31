@@ -149,7 +149,9 @@ x-fleet-env: &fleet-env
 # every container and set LLDB_TLS_CERT / LLDB_TLS_KEY / LLDB_TLS_CA to their paths (plus
 # LLDB_TLS_DOMAIN if the certificate's name is not the address dialed), change every `http://` in
 # the commands below to `https://`, and drop this. The engine reads certificates; it does not
-# generate them — see crates/lldb-qe-core/src/tls.rs for why that is deliberate.
+# generate them — see crates/lldb-qe-control/src/tls.rs for why that is deliberate. (The LLDB_TLS_*_PEM
+# variables carry the material inline instead of a path; compose can mount files, so it does. That
+# spelling exists for ECS Fargate, which cannot — see infra/README.md.)
 x-plaintext-env: &plaintext-env
   LLDB_ALLOW_PLAINTEXT: "true"
 

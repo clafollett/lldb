@@ -106,10 +106,13 @@ pub fn install_test_trust() {
 pub fn no_tls_configured() -> Result<ServerTls> {
     TlsArgs {
         tls_cert: None,
+        tls_cert_pem: None,
         tls_key: None,
+        tls_key_pem: None,
         allow_plaintext: false,
         client: TlsClientArgs {
             tls_ca: None,
+            tls_ca_pem: None,
             tls_domain: None,
         },
     }
@@ -131,10 +134,13 @@ pub fn server_tls(dir: &std::path::Path) -> Result<ServerTls> {
 
     TlsArgs {
         tls_cert: Some(cert_path),
+        tls_cert_pem: None,
         tls_key: Some(key_path),
+        tls_key_pem: None,
         allow_plaintext: false,
         client: TlsClientArgs {
             tls_ca: None,
+            tls_ca_pem: None,
             tls_domain: None,
         },
     }
@@ -142,4 +148,40 @@ pub fn server_tls(dir: &std::path::Path) -> Result<ServerTls> {
     // is a *unit* test in `lldb_qe_core::tls` because it needs no socket. What is under test here
     // is the transport.
     .resolve_server(lldb_qe_core::tls::CredentialCheck::None)
+}
+
+/// The same identity, supplied **inline** — no file, no directory, no path anywhere.
+///
+/// This is the shape ECS Fargate forces (issue #73): a Secrets Manager value reaches a task as an
+/// environment variable and by no other means, so `LLDB_TLS_CERT_PEM` / `LLDB_TLS_KEY_PEM` are how
+/// a fleet there gets an identity at all. Kept beside [`server_tls`] rather than replacing it,
+/// because the file path is still what compose and a laptop use and both must keep working.
+pub fn server_tls_inline() -> Result<ServerTls> {
+    let certs = shared();
+    TlsArgs {
+        tls_cert: None,
+        tls_cert_pem: Some(certs.cert_pem.clone()),
+        tls_key: None,
+        tls_key_pem: Some(certs.key_pem.clone()),
+        allow_plaintext: false,
+        client: TlsClientArgs {
+            tls_ca: None,
+            tls_ca_pem: None,
+            tls_domain: None,
+        },
+    }
+    .resolve_server(lldb_qe_core::tls::CredentialCheck::None)
+}
+
+/// The dialing half of the same story: a trust built from `--tls-ca-pem` rather than `--tls-ca`.
+///
+/// Returned rather than installed, because the ambient trust is process-global and this binary
+/// shares one — see [`install_test_trust`] and `main.rs`.
+pub fn inline_trust() -> Result<ClientTrust> {
+    TlsClientArgs {
+        tls_ca: None,
+        tls_ca_pem: Some(shared().ca_pem.clone()),
+        tls_domain: Some(TEST_DOMAIN.to_string()),
+    }
+    .to_trust()
 }

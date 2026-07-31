@@ -6,6 +6,7 @@ import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as rds from 'aws-cdk-lib/aws-rds';
+import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as servicediscovery from 'aws-cdk-lib/aws-servicediscovery';
 
 /** The Flight port every worker listens on (matches `LLDB_WORKER_BIND` in the image). */
@@ -31,8 +32,36 @@ export const WORKER_SERVICE_NAME = 'worker';
  * Map name per warehouse is the whole routing mechanism: each warehouse's ECS service registers
  * its tasks under its *own* name, so `<warehouse>.lldb.local` resolves to exactly that
  * warehouse's fleet and nothing else.
+ *
+ * The scheme is not decoration — it is the switch. `https://` dials TLS and `http://` does not,
+ * with no fallback in either direction, so a fleet serving certificates needs every worker URL
+ * rewritten or it fails loudly at the first query. See {@link TlsMode}.
  */
-export const WAREHOUSE_ENDPOINT_TEMPLATE = `http://{warehouse}.${NAMESPACE}:${WORKER_PORT}`;
+export const warehouseEndpointTemplate = (scheme: 'http' | 'https'): string =>
+  `${scheme}://{warehouse}.${NAMESPACE}:${WORKER_PORT}`;
+
+/** The plaintext template — what the stack renders in the default `tls: 'none'` mode. */
+export const WAREHOUSE_ENDPOINT_TEMPLATE = warehouseEndpointTemplate('http');
+
+/**
+ * The one name every worker's certificate is issued for, and the name every client verifies
+ * against (`LLDB_TLS_DOMAIN`).
+ *
+ * It is a fixed fleet-wide name rather than a per-warehouse one, and that is forced rather than
+ * chosen — twice over. `lldb_qe_core::discovery` expands a Cloud Map name into one URL **per task
+ * IP**, so what a client would otherwise verify is `10.0.1.47`, an address allocated at task start
+ * that changes on every replacement and every scale event; no certificate minted in advance can
+ * carry those as IP SANs. And the dialing trust is process-global (a `FlightReaderExec` is
+ * serialized into a plan and can carry nothing per-call), while one coordinator dials several
+ * warehouses — so there is exactly one name available to verify against, for all of them.
+ *
+ * The certificate therefore carries `DNS:fleet.lldb.local`: the URL's IP connects, this name
+ * verifies, and it is a SAN the leaf genuinely has rather than a mismatch papered over.
+ */
+export const FLEET_TLS_DOMAIN = `fleet.${NAMESPACE}`;
+
+/** Prefix of the three Secrets Manager secrets holding the fleet's PEM material. */
+export const DEFAULT_TLS_SECRET_PREFIX = 'lldb/fleet-tls';
 
 /**
  * A virtual warehouse: a named, independently sized pool of workers.
@@ -92,6 +121,35 @@ export type EgressMode = 'none' | 'nat-instance' | 'nat-gateway';
  */
 export type ServicesDbMode = 'aurora' | 'none';
 
+/**
+ * Whether Flight traffic inside the VPC is encrypted.
+ *
+ * - `none` (default): every Flight port is plaintext, as it has been since this stack existed.
+ *   Legal, and not a hole: the engine refuses a plaintext port only when a credential is actually
+ *   checked on it, and nothing here checks one yet. Traffic is confined to the VPC by the security
+ *   groups, and `LLDB_ALLOW_PLAINTEXT` is *not* set in this mode either — see below.
+ * - `fleet`: workers serve TLS and every role dials `https://`, from PEM delivered as
+ *   `LLDB_TLS_*_PEM` out of three Secrets Manager secrets.
+ *
+ * **Why the material is imported rather than created here.** Fargate injects a Secrets Manager
+ * value as an environment variable and by no other means, so the delivery mechanism was never in
+ * question — the *issuance* was. A private key must never reach `cdk.out`, and the strongest form
+ * of that guarantee is CDK never holding the key at all: `scripts/mint-fleet-tls.sh` mints a CA
+ * and one leaf locally and writes them straight to Secrets Manager, and this stack imports them by
+ * name. Creating them here instead would also deadlock: CloudFormation would make three empty
+ * secrets, the ECS service would fail to stabilise on the empty PEM, the deployment circuit
+ * breaker would fail the stack, and the rollback would delete the secrets you were about to fill.
+ *
+ * Three whole-string secrets rather than one with JSON keys, because that is what buys the IAM
+ * boundary worth having: **the coordinator's execution role is granted the CA alone — never the
+ * certificate and never the private key.** It binds no port, so an identity is material it has no
+ * use for, and the least it can be given is the trust it dials with. (`ecs.Secret` grants read on
+ * a whole secret; a JSON key selects a field, it does not scope access — which is why one secret
+ * with three keys would make this a convention rather than a boundary.) It costs ~$1.20/month, and
+ * only in this mode.
+ */
+export type TlsMode = 'none' | 'fleet';
+
 /** fck-nat (https://fck-nat.dev) — a free, purpose-built NAT AMI. Published under this owner. */
 const FCK_NAT_OWNER = '568608671756';
 const FCK_NAT_AMI_NAME = 'fck-nat-amzn2-*-arm64-ebs';
@@ -130,6 +188,14 @@ export interface LldbStackProps extends cdk.StackProps {
   readonly natInstanceType?: ec2.InstanceType;
   /** Whether to provision the services database. See {@link ServicesDbMode}. Defaults to `aurora`. */
   readonly servicesDb?: ServicesDbMode;
+  /** Whether Flight traffic is encrypted. See {@link TlsMode}. Defaults to `none`. */
+  readonly tls?: TlsMode;
+  /**
+   * Prefix of the three secrets `tls: 'fleet'` reads — `<prefix>-ca`, `<prefix>-cert`,
+   * `<prefix>-key`. Defaults to {@link DEFAULT_TLS_SECRET_PREFIX}. Give two stacks in one account
+   * different prefixes unless they are meant to be one trust domain.
+   */
+  readonly tlsSecretPrefix?: string;
 }
 
 /**
@@ -367,35 +433,63 @@ export class LldbStack extends cdk.Stack {
       RUST_LOG: 'info',
     };
 
+    // ---- Transport security --------------------------------------------------------------
+    // What each role needs is not the same thing, and the difference is the point: a worker
+    // *serves* a Flight port and so holds an identity (certificate + private key), while the
+    // coordinator binds nothing at all — it is a one-shot client, and its entire TLS surface is
+    // "what do I trust, and under what name". So the private key is injected into worker tasks
+    // only, and the coordinator's execution role is never granted it.
+    //
+    // The PEM travels as `LLDB_TLS_*_PEM` rather than as a path because ECS resolves a secret into
+    // an environment variable and offers no way to put one on a filesystem.
+    // `crates/lldb-qe-control/src/tls.rs` accepts either spelling for exactly this reason; compose
+    // and a laptop still use files. Note what does NOT appear anywhere below:
+    // `LLDB_ALLOW_PLAINTEXT`. Encrypting this
+    // traffic is the point, and the escape hatch that disarms the engine's guard is not something
+    // a stack sets on the way past (`infra/test/lldb-stack.test.ts` asserts its absence in *both*
+    // modes).
+    const tlsMode: TlsMode = props.tls ?? 'none';
+    const scheme = tlsMode === 'fleet' ? 'https' : 'http';
+    const tlsSecretPrefix = validateSecretPrefix(props.tlsSecretPrefix ?? DEFAULT_TLS_SECRET_PREFIX);
+
+    const tlsEnv: Record<string, string> = {};
+    const workerTlsSecrets: Record<string, ecs.Secret> = {};
+    const clientTlsSecrets: Record<string, ecs.Secret> = {};
+
+    if (tlsMode === 'fleet') {
+      // Imported, never created — see {@link TlsMode} for why, and for the deadlock creating them
+      // would cause. A secret that does not exist yet fails at task start with an ECS event naming
+      // it, which is loud, immediate, and fixable by running the mint script.
+      const caSecret = secretsmanager.Secret.fromSecretNameV2(this, 'FleetTlsCa', `${tlsSecretPrefix}-ca`);
+      const certSecret = secretsmanager.Secret.fromSecretNameV2(this, 'FleetTlsCert', `${tlsSecretPrefix}-cert`);
+      const keySecret = secretsmanager.Secret.fromSecretNameV2(this, 'FleetTlsKey', `${tlsSecretPrefix}-key`);
+
+      // One name, every role, every warehouse. See {@link FLEET_TLS_DOMAIN}: this is what makes a
+      // fleet dialed by task IP verifiable at all.
+      tlsEnv.LLDB_TLS_DOMAIN = FLEET_TLS_DOMAIN;
+
+      clientTlsSecrets.LLDB_TLS_CA_PEM = ecs.Secret.fromSecretsManager(caSecret);
+      workerTlsSecrets.LLDB_TLS_CA_PEM = clientTlsSecrets.LLDB_TLS_CA_PEM;
+      // A worker dials its peers as well as serving them (the worker-to-worker shuffle pulls map
+      // stages directly), so it needs the trust *and* the identity. The coordinator needs the
+      // trust alone.
+      workerTlsSecrets.LLDB_TLS_CERT_PEM = ecs.Secret.fromSecretsManager(certSecret);
+      workerTlsSecrets.LLDB_TLS_KEY_PEM = ecs.Secret.fromSecretsManager(keySecret);
+    }
+
     // ---- Warehouses: one worker fleet each ----------------------------------------------
     // Each warehouse gets its own task definition, its own ECS service, and — the part that makes
     // routing work — its own Cloud Map name. `analytics.lldb.local` resolves to the analytics
     // warehouse's tasks and to nothing else, so a coordinator handed a warehouse name cannot
     // reach another warehouse's compute even by accident.
     //
-    // KNOWN GAP (issue #33): **no TLS certificates are provisioned**, so every Flight port this
-    // stack deploys is plaintext. It comes up regardless, and that is a property of the guard
-    // rather than a hole in it: the engine refuses a plaintext port only when a credential is
-    // actually checked on it, and nothing here checks one — no `LLDB_FLEET_TOKEN` on the workers
-    // (the gap below), and no `lldb-qe-server` in this stack at all (the coordinator is a one-shot
-    // *client*, which binds nothing). Traffic is confined to the VPC by the security groups above.
-    //
-    // Closing it is genuinely separate work and deserves its own review, because the engine takes
-    // certificates as **mounted files** (`LLDB_TLS_CERT` / `LLDB_TLS_KEY` / `LLDB_TLS_CA`) and
-    // Fargate has no first-class way to put a Secrets Manager value on a filesystem: `ecs.Secret`
-    // injects *environment variables* only. The three real options — an EFS access point mounted
-    // into every task; an entrypoint that materializes PEMs from secret-backed env vars into files
-    // at start (which puts private key material in the task's environment, the thing the
-    // `LLDB_METADATA_PASSWORD` handling above is careful to avoid); or ACM Private CA with an
-    // issuing sidecar — differ in cost, blast radius and rotation story, and picking among them is
-    // a decision, not a detail. Half-building one here would ship the worst of all three.
-    //
-    // Note the interaction with the gap below, because it will bite whoever closes that one first:
-    // the moment `LLDB_FLEET_TOKEN` is set on these tasks, a worker starts *checking* a credential,
-    // and it will then refuse to bind until certificates exist — or until `LLDB_ALLOW_PLAINTEXT` is
-    // set, which is a deliberate, reviewable line and not something this stack sets pre-emptively
-    // (`infra/test/lldb-stack.test.ts` asserts that it does not). See
-    // crates/lldb-qe-core/src/tls.rs.
+    // Transport: plaintext in the default mode, TLS under `tls: 'fleet'` — see {@link TlsMode} and
+    // the injection block above. Worth stating explicitly for whoever wires the gap below, because
+    // it is what used to block them: the moment `LLDB_FLEET_TOKEN` is set on these tasks a worker
+    // starts *checking* a credential, and it then refuses to bind a plaintext port. That refusal is
+    // now satisfiable — deploy `-c tls=fleet` and the port it binds is encrypted — instead of only
+    // being escapable with `LLDB_ALLOW_PLAINTEXT`, which would ship the fleet secret in the clear.
+    // Fleet token and TLS must therefore land together, in that order.
     //
     // KNOWN GAP (issue #19): `LLDB_FLEET_TOKEN` is NOT set here, so worker Flight ports on ECS are
     // reachable by anything inside the VPC that can resolve `<warehouse>.lldb.local` — a worker
@@ -418,11 +512,13 @@ export class LldbStack extends cdk.Stack {
       task.addContainer('worker', {
         image,
         command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
-        environment: { ...storageEnv, ...metadataEnv },
-        secrets: metadataSecrets,
+        environment: { ...storageEnv, ...metadataEnv, ...tlsEnv },
+        secrets: { ...metadataSecrets, ...workerTlsSecrets },
         portMappings: [{ containerPort: WORKER_PORT }],
         logging: ecs.LogDrivers.awsLogs({ streamPrefix: `worker-${definition.name}`, logGroup }),
-        // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port.
+        // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port. A
+        // TCP probe, so it is unchanged by TLS — it proves the port is bound, and the engine has
+        // already failed at startup if the certificate did not parse.
         healthCheck: {
           command: ['CMD-SHELL', `nc -z 127.0.0.1 ${WORKER_PORT} || exit 1`],
           interval: cdk.Duration.seconds(15),
@@ -472,15 +568,16 @@ export class LldbStack extends cdk.Stack {
       environment: {
         ...storageEnv,
         ...metadataEnv,
+        ...tlsEnv,
         // Two routing paths, and the coordinator picks by whether `--warehouse` is set.
         // `LLDB_WORKERS` is the pre-warehouse behaviour (the first warehouse's fleet, verbatim),
         // so a `run-task` with no extra arguments works exactly as it always did.
-        LLDB_WORKERS: `http://${warehouses[0].name}.${NAMESPACE}:${WORKER_PORT}`,
+        LLDB_WORKERS: `${scheme}://${warehouses[0].name}.${NAMESPACE}:${WORKER_PORT}`,
         // …and this is the template `--warehouse <name>` renders into. Override `LLDB_WAREHOUSE`
         // per `run-task` to send a query to a specific warehouse.
-        LLDB_WAREHOUSE_ENDPOINT: WAREHOUSE_ENDPOINT_TEMPLATE,
+        LLDB_WAREHOUSE_ENDPOINT: warehouseEndpointTemplate(scheme),
       },
-      secrets: metadataSecrets,
+      secrets: { ...metadataSecrets, ...clientTlsSecrets },
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'coordinator', logGroup }),
     });
     this.warehouse.grantReadWrite(this.coordinatorTask.taskRole);
@@ -513,6 +610,22 @@ export class LldbStack extends cdk.Stack {
     });
     new cdk.CfnOutput(this, 'EgressMode', { value: egress });
     new cdk.CfnOutput(this, 'ServicesDbMode', { value: servicesDbMode });
+    new cdk.CfnOutput(this, 'TlsMode', {
+      value: tlsMode,
+      description: 'none = plaintext Flight inside the VPC; fleet = TLS from the minted fleet certificate',
+    });
+    if (tlsMode === 'fleet') {
+      // The names, never the material — `scripts/mint-fleet-tls.sh` writes to exactly these, and a
+      // task that cannot start with a secrets error is almost always one of them missing.
+      new cdk.CfnOutput(this, 'FleetTlsSecrets', {
+        value: ['ca', 'cert', 'key'].map((part) => `${tlsSecretPrefix}-${part}`).join(','),
+        description: 'Secrets Manager secrets holding the fleet CA, certificate and private key',
+      });
+      new cdk.CfnOutput(this, 'FleetTlsDomain', {
+        value: FLEET_TLS_DOMAIN,
+        description: 'The name the fleet certificate is issued for, and that every client verifies',
+      });
+    }
     if (this.servicesDb) {
       new cdk.CfnOutput(this, 'ServicesDbEndpoint', {
         value: this.servicesDb.clusterEndpoint.socketAddress,
@@ -571,6 +684,26 @@ function validateWarehouses(warehouses: WarehouseDefinition[]): WarehouseDefinit
     }
   }
   return warehouses;
+}
+
+/** Secrets Manager names allow alphanumerics and `/_+=.@-`. Ours also append `-ca`/`-cert`/`-key`. */
+const SECRET_PREFIX_RE = /^[A-Za-z0-9/_+=.@-]{1,400}$/;
+
+/**
+ * Refuse a secret prefix that could not name a secret, at synth time.
+ *
+ * The failure this prevents is the expensive kind: an unnameable secret synthesizes fine, deploys
+ * fine, and surfaces as tasks that will not start with a `ResourceInitializationError` — after a
+ * rollout, on a fleet that was working a minute ago.
+ */
+function validateSecretPrefix(prefix: string): string {
+  if (!SECRET_PREFIX_RE.test(prefix)) {
+    throw new Error(
+      `tlsSecretPrefix ${JSON.stringify(prefix)} is not a usable Secrets Manager name: ` +
+        'up to 400 characters of [A-Za-z0-9/_+=.@-] (it becomes <prefix>-ca, <prefix>-cert, <prefix>-key)',
+    );
+  }
+  return prefix;
 }
 
 /** `wh-analytics` → `WhAnalytics`, for a construct id. Ids are alphanumeric by convention and

@@ -8,6 +8,8 @@ import {
   NAMESPACE,
   WORKER_SERVICE_NAME,
   WAREHOUSE_ENDPOINT_TEMPLATE,
+  warehouseEndpointTemplate,
+  FLEET_TLS_DOMAIN,
 } from '../lib/lldb-stack';
 
 const IMAGE_TAG = '0.1.0+abcdef123456';
@@ -429,31 +431,149 @@ describe('services database', () => {
 });
 
 describe('transport security', () => {
-  // Issue #33 ships TLS in the engine and a KNOWN GAP in this stack: certificates are mounted
-  // files, and Fargate has no first-class way to mount a Secrets Manager value, so provisioning
-  // them is its own piece of work (see the comment above the warehouse loop in lldb-stack.ts).
-  //
-  // These two assertions pin the shape of that gap so it stays honest. It is deliberately *not*
-  // asserted that TLS is off forever — the day certificates land, the first test changes and the
-  // second should still hold.
-  test('no TLS certificates are configured yet, and none are faked', () => {
+  /** A container's `Environment` as a plain object. */
+  function envOf(container: any): Record<string, string> {
+    return Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
+  }
+  /** A container's `Secrets` as name → the ARN it resolves from. */
+  function secretsOf(container: any): Record<string, string> {
+    return Object.fromEntries(((container.Secrets ?? []) as any[]).map((s) => [s.Name, JSON.stringify(s.ValueFrom)]));
+  }
+
+  test('the default mode configures no certificates, and fakes none', () => {
+    // `tls: 'none'` is byte-for-byte the fleet this stack deployed before certificates existed.
     for (const container of containers(synth())) {
-      const env = Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
+      const env = envOf(container);
       expect(env.LLDB_TLS_CERT).toBeUndefined();
       expect(env.LLDB_TLS_KEY).toBeUndefined();
+      expect(env.LLDB_TLS_DOMAIN).toBeUndefined();
+      expect(Object.keys(secretsOf(container)).filter((n) => n.startsWith('LLDB_TLS'))).toEqual([]);
     }
   });
 
-  test('the stack never pre-emptively opts out of the plaintext guard', () => {
-    // `LLDB_ALLOW_PLAINTEXT` is what lets a process serve a plaintext port while checking a
-    // credential. Nothing here checks one today, so setting it would buy nothing — and would
-    // silently disarm the guard for whoever later sets LLDB_FLEET_TOKEN (issue #19's gap) and would
-    // otherwise have been stopped. If a future change needs it, it should be an explicit line in
-    // the stack and an explicit edit to this test, not an inheritance.
-    for (const container of containers(synth())) {
-      const env = Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
-      expect(env.LLDB_ALLOW_PLAINTEXT).toBeUndefined();
+  // The assertion this file has carried since the gap existed, now made to hold in BOTH modes.
+  // `LLDB_ALLOW_PLAINTEXT` is what lets a process serve a plaintext port while checking a
+  // credential. Setting it would silently disarm the guard for whoever later sets LLDB_FLEET_TOKEN
+  // (issue #19's gap) and would otherwise have been stopped — which is precisely the shortcut
+  // `tls: 'fleet'` exists to make unnecessary. If a future change needs it, it should be an
+  // explicit line in the stack and an explicit edit to this test, not an inheritance.
+  test.each(['none', 'fleet'] as const)(
+    'the stack never pre-emptively opts out of the plaintext guard (tls=%s)',
+    (tls) => {
+      for (const container of containers(synth({ tls }))) {
+        expect(envOf(container).LLDB_ALLOW_PLAINTEXT).toBeUndefined();
+      }
+    },
+  );
+
+  test('tls=fleet gives every worker an identity and a trust, from secrets', () => {
+    const template = synth({ tls: 'fleet', warehouses: [{ name: 'analytics', size: 2 }, { name: 'etl', size: 1 }] });
+    const workers = containers(template).filter((c) => c.Name === 'worker');
+    // Both warehouses, not just the first — a fleet half of which serves TLS is a fleet whose
+    // queries fail on whichever half the coordinator happens to dial.
+    expect(workers).toHaveLength(2);
+    for (const worker of workers) {
+      const secrets = secretsOf(worker);
+      // A worker serves a port (cert + key) AND dials its peers for the shuffle (ca).
+      expect(Object.keys(secrets).sort()).toEqual(
+        expect.arrayContaining(['LLDB_TLS_CA_PEM', 'LLDB_TLS_CERT_PEM', 'LLDB_TLS_KEY_PEM']),
+      );
+      expect(secrets.LLDB_TLS_KEY_PEM).toContain('lldb/fleet-tls-key');
+      expect(envOf(worker).LLDB_TLS_DOMAIN).toBe(FLEET_TLS_DOMAIN);
     }
+  });
+
+  test('the coordinator gets the trust but never the private key', () => {
+    // It binds no port, so an identity would be material it has no use for. This is the reason the
+    // stack imports three whole-string secrets rather than one with JSON keys: `ecs.Secret` grants
+    // read on a *secret*, so only separate secrets make this a boundary rather than a convention.
+    const coordinator = containers(synth({ tls: 'fleet' })).find((c) => c.Name === 'coordinator');
+    const secrets = secretsOf(coordinator);
+    expect(secrets.LLDB_TLS_CA_PEM).toContain('lldb/fleet-tls-ca');
+    expect(secrets.LLDB_TLS_CERT_PEM).toBeUndefined();
+    expect(secrets.LLDB_TLS_KEY_PEM).toBeUndefined();
+    expect(envOf(coordinator).LLDB_TLS_DOMAIN).toBe(FLEET_TLS_DOMAIN);
+  });
+
+  test('the private key is unreadable by the coordinator task role, in IAM and not only in env', () => {
+    // The env wiring above is the intent; this is the enforcement. An execution role granted the
+    // key secret could read it whether or not the task definition injects it.
+    const policies = synth({ tls: 'fleet' }).findResources('AWS::IAM::Policy');
+    const rendered = Object.fromEntries(
+      Object.entries(policies)
+        .filter(([name]) => name.includes('ExecutionRoleDefaultPolicy'))
+        .map(([name, policy]) => [name, JSON.stringify((policy as any).Properties.PolicyDocument)]),
+    );
+
+    const coordinator = Object.entries(rendered).find(([name]) => name.includes('Coordinator'))!;
+    expect(coordinator[1]).toContain('fleet-tls-ca');
+    expect(coordinator[1]).not.toContain('fleet-tls-key');
+
+    const worker = Object.entries(rendered).find(([name]) => name.includes('Worker'))!;
+    expect(worker[1]).toContain('fleet-tls-key');
+  });
+
+  test('no PEM material of any kind reaches the synthesized template', () => {
+    // The hard constraint: a private key must never appear in source, in CDK context, or in a
+    // `cdk.out` artifact. The stack imports secrets by name and never holds the bytes, so this is
+    // structurally true — asserted anyway, because the failure mode of getting it wrong is a key
+    // committed to whatever stores the deploy artifact.
+    for (const tls of ['none', 'fleet'] as const) {
+      const rendered = JSON.stringify(synth({ tls }).toJSON());
+      expect(rendered).not.toContain('-----BEGIN');
+      expect(rendered).not.toContain('PRIVATE KEY');
+    }
+    // …and the TLS variables are secret *references*, never plain environment, exactly like the
+    // services-database password.
+    for (const container of containers(synth({ tls: 'fleet' }))) {
+      for (const name of Object.keys(envOf(container))) {
+        expect(name).not.toMatch(/^LLDB_TLS_(CA|CERT|KEY)_PEM$/);
+      }
+    }
+  });
+
+  test('turning TLS on rewrites every worker URL to https, because the scheme is the switch', () => {
+    // `https://` dials TLS and `http://` does not, with no fallback either way — so a fleet
+    // serving certificates that a coordinator still dials as `http://` fails on every query.
+    const plaintext = containers(synth()).find((c) => c.Name === 'coordinator');
+    expect(envOf(plaintext).LLDB_WORKERS).toBe(`http://${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`);
+    expect(envOf(plaintext).LLDB_WAREHOUSE_ENDPOINT).toBe(WAREHOUSE_ENDPOINT_TEMPLATE);
+
+    const encrypted = containers(synth({ tls: 'fleet' })).find((c) => c.Name === 'coordinator');
+    const env = envOf(encrypted);
+    expect(env.LLDB_WORKERS).toBe(`https://${WORKER_SERVICE_NAME}.${NAMESPACE}:${WORKER_PORT}`);
+    expect(env.LLDB_WAREHOUSE_ENDPOINT).toBe(warehouseEndpointTemplate('https'));
+    // The placeholder survives the rewrite — otherwise every warehouse would route to one fleet.
+    expect(env.LLDB_WAREHOUSE_ENDPOINT).toContain('{warehouse}');
+  });
+
+  test('the certificate is verified under one fleet-wide name, not a per-warehouse one', () => {
+    // The SAN problem, as an assertion. `discovery.rs` expands a Cloud Map name into one URL per
+    // *task IP*, so a certificate for `analytics.lldb.local` would never be the name verified —
+    // and the dialing trust is process-global, so a coordinator spanning warehouses has exactly
+    // one name to offer. Both roles must therefore agree on the single name the leaf carries.
+    const domains = containers(
+      synth({ tls: 'fleet', warehouses: [{ name: 'analytics', size: 1 }, { name: 'etl', size: 1 }] }),
+    ).map((c) => envOf(c).LLDB_TLS_DOMAIN);
+    expect(new Set(domains)).toEqual(new Set([FLEET_TLS_DOMAIN]));
+    expect(FLEET_TLS_DOMAIN.endsWith(NAMESPACE)).toBe(true);
+    expect(FLEET_TLS_DOMAIN).not.toContain('{warehouse}');
+  });
+
+  test('the stack creates no secret of its own for TLS — it imports what the operator minted', () => {
+    // Creating them would put CDK between an operator and a private key, and would deadlock a
+    // first deploy: empty secrets, tasks that cannot start, a circuit breaker that fails the
+    // stack, and a rollback that deletes the secrets you were about to fill.
+    const template = synth({ tls: 'fleet', servicesDb: 'none' });
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+  });
+
+  test('the secret names are configurable, and an unusable one fails at synth', () => {
+    const secrets = containers(synth({ tls: 'fleet', tlsSecretPrefix: 'team/lldb-prod' })).flatMap((c) =>
+      Object.values(secretsOf(c)),
+    );
+    expect(secrets.some((arn) => arn.includes('team/lldb-prod-key'))).toBe(true);
+    expect(() => synth({ tls: 'fleet', tlsSecretPrefix: 'no spaces allowed' })).toThrow(/Secrets Manager name/);
   });
 });
 

@@ -20,15 +20,38 @@
 //! bytes — in the clear. There is therefore no "or terminate in front" mode here, and adding one
 //! would be adding a way to be half-encrypted.
 //!
-//! # Certificates are mounted files
+//! # Certificates are supplied, never minted — as a file *or* as the material itself
 //!
 //! `--tls-cert` / `--tls-key` (server identity) and `--tls-ca` (what this process trusts when it
-//! dials), each a path, each with the `LLDB_TLS_*` env fallback every other option in this repo
-//! has. **The engine generates nothing and issues nothing**: no private-CA machinery, no
-//! self-signed fallback, no ACME. A binary that could mint its own certificate could also mint one
-//! an operator did not mean to trust, and "TLS is on" would stop implying "someone decided who the
-//! peers are". Certificate lifecycle belongs to the deployment (Secrets Manager, a mounted volume,
-//! cert-manager); this reads two files.
+//! dials), each a path; and beside each a `*-pem` twin (`--tls-cert-pem` / `--tls-key-pem` /
+//! `--tls-ca-pem`) carrying the PEM **inline**. Every one has the `LLDB_TLS_*` env fallback that
+//! every other option in this repo has. **The engine generates nothing and issues nothing**: no
+//! private-CA machinery, no self-signed fallback, no ACME. A binary that could mint its own
+//! certificate could also mint one an operator did not mean to trust, and "TLS is on" would stop
+//! implying "someone decided who the peers are". Certificate lifecycle belongs to the deployment
+//! (Secrets Manager, a mounted volume, cert-manager).
+//!
+//! The inline half exists because one large deployment target cannot do the file half at all.
+//! **ECS Fargate injects a Secrets Manager value as an environment variable and by no other
+//! means** — there is no way to mount one as a file. The alternatives were priced in issue #73 and
+//! each is worse: a container entrypoint that writes the PEM to disk puts the key in the
+//! environment *and* on the task's ephemeral volume (Fargate does not support `tmpfs`, so it is a
+//! disk, not RAM); an EFS volume adds a stateful, AZ-bound dependency to the boot path of a fleet
+//! whose premise is stateless workers, and nothing in CloudFormation can populate it without
+//! putting the key in a deploy artifact; a private CA with an issuing sidecar costs $400/month and
+//! its one differentiator — automatic renewal — is inert here anyway, because
+//! [`ServerTls::configure`] builds the acceptor eagerly at startup and nothing re-reads it.
+//!
+//! Two rules keep the widened surface honest. **A path and its `-pem` twin are mutually
+//! exclusive** — set both and it is an error, because there is no way to tell which was meant.
+//! And **inline material is validated for a `-----BEGIN` line** where a file is not: an env var
+//! has no filename to name in the error, and the realistic failures there (an unfilled secret
+//! placeholder, a value mangled by a shell) produce an empty or non-PEM string that would
+//! otherwise surface as an opaque rustls parse failure.
+//!
+//! `TlsArgs` and `TlsClientArgs` therefore carry a hand-written [`std::fmt::Debug`] that renders
+//! PEM fields as presence, never bytes — [`crate::services::ServicesArgs`]' precedent, for the
+//! same standing rule that a credential is never logged.
 //!
 //! # The rule: a plaintext port is opt-in exactly when a credential is checked on it
 //!
@@ -96,6 +119,13 @@
 //! silently accepting the wrong peer, which is the right failure — but it fails on every query, so
 //! it is worth knowing before the certificates are minted rather than after.
 //!
+//! `infra/` picks the second, and IP SANs are not merely inconvenient there but unavailable: a
+//! Fargate task's IP is allocated at task start and changes on every replacement and every scale
+//! event, which is the property [`crate::discovery`] exists to deliver. So the fleet shares one
+//! certificate carrying `DNS:fleet.lldb.local`, and both roles set `--tls-domain` to that name —
+//! the URL's IP connects, the certificate's own SAN verifies. A shared leaf authenticates the
+//! *fleet*, not the *member*, which is exactly the scope stated above.
+//!
 //! **There is no trust store compiled in.** `tls-native-roots` / `tls-webpki-roots` are
 //! deliberately off (see the workspace `Cargo.toml`): this fleet verifies against the CA file the
 //! deployment mounts, so a bundled root store would be a dependency bought for nothing — and,
@@ -136,13 +166,21 @@ pub fn install_crypto_provider() {
 // CLI surface
 // ---------------------------------------------------------------------------
 
+/// How each flag pair is named in an error, so one spelling reaches every message.
+const CERT_FLAG: &str = "--tls-cert (LLDB_TLS_CERT)";
+const CERT_PEM_FLAG: &str = "--tls-cert-pem (LLDB_TLS_CERT_PEM)";
+const KEY_FLAG: &str = "--tls-key (LLDB_TLS_KEY)";
+const KEY_PEM_FLAG: &str = "--tls-key-pem (LLDB_TLS_KEY_PEM)";
+const CA_FLAG: &str = "--tls-ca (LLDB_TLS_CA)";
+const CA_PEM_FLAG: &str = "--tls-ca-pem (LLDB_TLS_CA_PEM)";
+
 /// What this process trusts when it *dials* — the client half, shared by every role.
 ///
 /// Split out from [`TlsArgs`] so the one-shot `lldb-qe-coordinator`, which binds no port and can
 /// therefore never be the thing that serves plaintext, takes only the flags that mean something to
 /// it. The env-var names are the same in both, so one environment block configures every role in a
 /// compose file or a task definition.
-#[derive(Debug, Clone, Args)]
+#[derive(Clone, Args)]
 pub struct TlsClientArgs {
     /// PEM CA bundle used to verify the certificate of any `https://` peer this process dials.
     ///
@@ -151,6 +189,11 @@ pub struct TlsClientArgs {
     /// rather than silently trusting whoever answers.
     #[arg(long, env = "LLDB_TLS_CA", value_name = "PATH")]
     pub tls_ca: Option<PathBuf>,
+
+    /// The CA bundle itself, inline, for a platform that cannot mount a file — see the module docs.
+    /// Mutually exclusive with `--tls-ca`.
+    #[arg(long, env = "LLDB_TLS_CA_PEM", value_name = "PEM")]
+    pub tls_ca_pem: Option<String>,
 
     /// Hostname to verify a dialed peer's certificate against, when it is not the URL's host.
     ///
@@ -164,10 +207,14 @@ pub struct TlsClientArgs {
 impl TlsClientArgs {
     /// Load the CA bundle, if one is configured.
     pub fn to_trust(&self) -> Result<ClientTrust> {
-        let ca = match &self.tls_ca {
-            None => None,
-            Some(path) => Some(read_pem(path, "--tls-ca (LLDB_TLS_CA)")?),
-        };
+        let ca = PemSource::pick(
+            self.tls_ca.as_ref(),
+            self.tls_ca_pem.as_ref(),
+            CA_FLAG,
+            CA_PEM_FLAG,
+        )?
+        .map(|source| source.load(CA_FLAG, CA_PEM_FLAG))
+        .transpose()?;
         Ok(ClientTrust {
             ca_pem: ca.map(Arc::new),
             domain: self.tls_domain.clone(),
@@ -175,16 +222,48 @@ impl TlsClientArgs {
     }
 }
 
+/// Presence of PEM material, for a `Debug` that must never render the bytes.
+struct PemPresence(bool);
+
+impl std::fmt::Debug for PemPresence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0 { "Some(<pem>)" } else { "None" })
+    }
+}
+
+/// Hand-written so `--tls-ca-pem` cannot reach a log. See [`crate::services::ServicesArgs`].
+impl std::fmt::Debug for TlsClientArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsClientArgs")
+            .field("tls_ca", &self.tls_ca)
+            .field("tls_ca_pem", &PemPresence(self.tls_ca_pem.is_some()))
+            .field("tls_domain", &self.tls_domain)
+            .finish()
+    }
+}
+
 /// The full TLS surface of a binary that **binds** a Flight port.
-#[derive(Debug, Clone, Args)]
+#[derive(Clone, Args)]
 pub struct TlsArgs {
     /// PEM certificate chain this process serves. Set with `--tls-key`; either alone is an error.
     #[arg(long, env = "LLDB_TLS_CERT", value_name = "PATH")]
     pub tls_cert: Option<PathBuf>,
 
+    /// The certificate chain itself, inline. Mutually exclusive with `--tls-cert`.
+    #[arg(long, env = "LLDB_TLS_CERT_PEM", value_name = "PEM")]
+    pub tls_cert_pem: Option<String>,
+
     /// PEM private key for `--tls-cert`.
     #[arg(long, env = "LLDB_TLS_KEY", value_name = "PATH")]
     pub tls_key: Option<PathBuf>,
+
+    /// The private key itself, inline. Mutually exclusive with `--tls-key`.
+    ///
+    /// This is the one flag in the repo that carries a private key in an environment variable, and
+    /// it exists because ECS Fargate offers no other way to deliver one. It is redacted from
+    /// `Debug`; do not add it to a log line, and prefer `--tls-key` wherever a file is possible.
+    #[arg(long, env = "LLDB_TLS_KEY_PEM", value_name = "PEM")]
+    pub tls_key_pem: Option<String>,
 
     /// Serve a **plaintext** port even though a credential is checked on it.
     ///
@@ -199,6 +278,20 @@ pub struct TlsArgs {
 
     #[command(flatten)]
     pub client: TlsClientArgs,
+}
+
+/// Hand-written so `--tls-key-pem` cannot reach a log. See [`crate::services::ServicesArgs`].
+impl std::fmt::Debug for TlsArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsArgs")
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_cert_pem", &PemPresence(self.tls_cert_pem.is_some()))
+            .field("tls_key", &self.tls_key)
+            .field("tls_key_pem", &PemPresence(self.tls_key_pem.is_some()))
+            .field("allow_plaintext", &self.allow_plaintext)
+            .field("client", &self.client)
+            .finish()
+    }
 }
 
 impl TlsArgs {
@@ -218,8 +311,24 @@ impl TlsArgs {
     /// - neither, and nothing on this port checks a credential → plaintext, silently legal;
     /// - neither, a credential **is** checked, `--allow-plaintext` → plaintext, warned about;
     /// - neither, a credential **is** checked, no opt-in → **error**, naming both ways out.
+    ///
+    /// "A cert" means either spelling — the path flag or its `-pem` twin. Which one was used is
+    /// resolved *before* anything is read, so a certificate configured without its key is still the
+    /// error naming the key rather than a failure to open a file that was never the problem.
     pub fn resolve_server(&self, credential: CredentialCheck) -> Result<ServerTls> {
-        match (&self.tls_cert, &self.tls_key) {
+        let cert = PemSource::pick(
+            self.tls_cert.as_ref(),
+            self.tls_cert_pem.as_ref(),
+            CERT_FLAG,
+            CERT_PEM_FLAG,
+        )?;
+        let key = PemSource::pick(
+            self.tls_key.as_ref(),
+            self.tls_key_pem.as_ref(),
+            KEY_FLAG,
+            KEY_PEM_FLAG,
+        )?;
+        match (cert, key) {
             (Some(cert), Some(key)) => {
                 if self.allow_plaintext {
                     tracing::info!(
@@ -228,8 +337,8 @@ impl TlsArgs {
                     );
                 }
                 let identity = Identity::from_pem(
-                    read_pem(cert, "--tls-cert (LLDB_TLS_CERT)")?,
-                    read_pem(key, "--tls-key (LLDB_TLS_KEY)")?,
+                    cert.load(CERT_FLAG, CERT_PEM_FLAG)?,
+                    key.load(KEY_FLAG, KEY_PEM_FLAG)?,
                 );
                 install_crypto_provider();
                 Ok(ServerTls::Tls(Box::new(
@@ -237,12 +346,14 @@ impl TlsArgs {
                 )))
             }
             (Some(_), None) => bail!(
-                "--tls-cert is set without --tls-key (LLDB_TLS_KEY): a certificate cannot be \
-                 served without its private key"
+                "a certificate is set without a private key: a certificate cannot be served \
+                 without one. Set {KEY_FLAG} to a file, or {KEY_PEM_FLAG} to the material itself \
+                 where a file cannot be mounted."
             ),
             (None, Some(_)) => bail!(
-                "--tls-key is set without --tls-cert (LLDB_TLS_CERT): a private key names no \
-                 certificate to serve"
+                "a private key is set without a certificate: a private key names nothing to \
+                 serve. Set {CERT_FLAG} to a file, or {CERT_PEM_FLAG} to the material itself \
+                 where a file cannot be mounted."
             ),
             (None, None) => match (credential, self.allow_plaintext) {
                 (CredentialCheck::None, _) => {
@@ -255,10 +366,49 @@ impl TlsArgs {
                     "refusing to serve a PLAINTEXT port while a credential is checked on it: the \
                      secret callers present would cross the network in the clear, where anyone on \
                      the path can read and replay it. Configure --tls-cert (LLDB_TLS_CERT) and \
-                     --tls-key (LLDB_TLS_KEY) to serve TLS, or set --allow-plaintext \
+                     --tls-key (LLDB_TLS_KEY) — or {CERT_PEM_FLAG} and {KEY_PEM_FLAG}, where a \
+                     file cannot be mounted — to serve TLS, or set --allow-plaintext \
                      (LLDB_ALLOW_PLAINTEXT) to accept that risk deliberately."
                 ),
             },
+        }
+    }
+}
+
+/// Where one PEM blob comes from: a file the deployment mounted, or the material itself.
+///
+/// Deliberately resolved (which spelling?) separately from loaded (what are the bytes?): the
+/// half-configured-identity errors above must fire on *presence*, before anything is opened, or a
+/// mistyped path would mask a missing key.
+enum PemSource<'a> {
+    Path(&'a Path),
+    Inline(&'a str),
+}
+
+impl<'a> PemSource<'a> {
+    /// Pick between a path flag and its inline twin. Both set is an error — one names a file and
+    /// the other carries the material, so a process that guessed would be guessing about a key.
+    fn pick(
+        path: Option<&'a PathBuf>,
+        inline: Option<&'a String>,
+        path_flag: &str,
+        pem_flag: &str,
+    ) -> Result<Option<Self>> {
+        match (path, inline) {
+            (Some(_), Some(_)) => bail!(
+                "{path_flag} and {pem_flag} are both set: one names a file and the other carries \
+                 the PEM itself, so there is no way to tell which was meant. Set exactly one."
+            ),
+            (Some(path), None) => Ok(Some(Self::Path(path.as_path()))),
+            (None, Some(pem)) => Ok(Some(Self::Inline(pem.as_str()))),
+            (None, None) => Ok(None),
+        }
+    }
+
+    fn load(&self, path_flag: &str, pem_flag: &str) -> Result<Vec<u8>> {
+        match self {
+            Self::Path(path) => read_pem(path, path_flag),
+            Self::Inline(pem) => read_inline_pem(pem, pem_flag),
         }
     }
 }
@@ -401,8 +551,8 @@ impl ClientTrust {
             bail!(
                 "cannot dial {url} over TLS: no CA is configured, so there is nothing to verify \
                  the peer's certificate against. Set --tls-ca (LLDB_TLS_CA) to the PEM bundle that \
-                 signed the fleet's certificates. (No system trust store is compiled in, on \
-                 purpose — see the tls module docs.)"
+                 signed the fleet's certificates, or {CA_PEM_FLAG} to the bundle itself. (No \
+                 system trust store is compiled in, on purpose — see the tls module docs.)"
             );
         };
         install_crypto_provider();
@@ -500,6 +650,35 @@ fn read_pem(path: &Path, flag: &str) -> Result<Vec<u8>> {
         })
 }
 
+/// The armour every PEM block opens with. Looked for, not parsed — the parsing is rustls's job.
+const PEM_BEGIN: &str = "-----BEGIN";
+
+/// Take PEM material handed over inline, checking it is plausibly PEM at all.
+///
+/// The check the file path deliberately does not make, for a reason specific to this spelling:
+/// there is no filename to put in the error, and the realistic failures are an environment variable
+/// that was never filled in (a scaffolded secret) or one a shell mangled. Both produce an empty or
+/// non-PEM string, and without this they surface much later as an opaque rustls parse failure
+/// naming nothing. `contains` rather than `starts_with` because PEM files legitimately carry
+/// human-readable preamble above the first block.
+///
+/// The material itself never appears in an error — only the flag that carried it.
+fn read_inline_pem(pem: &str, flag: &str) -> Result<Vec<u8>> {
+    if pem.trim().is_empty() {
+        bail!(
+            "{flag} is set but empty. If it is wired to a secret, the secret has no value yet — \
+             fill it before starting this process."
+        );
+    }
+    if !pem.contains(PEM_BEGIN) {
+        bail!(
+            "{flag} does not contain PEM material (no `{PEM_BEGIN}` line). Its value must be the \
+             PEM text itself, not a path or an identifier — use the path flag for a file."
+        );
+    }
+    Ok(pem.as_bytes().to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -507,14 +686,21 @@ mod tests {
     fn args() -> TlsArgs {
         TlsArgs {
             tls_cert: None,
+            tls_cert_pem: None,
             tls_key: None,
+            tls_key_pem: None,
             allow_plaintext: false,
             client: TlsClientArgs {
                 tls_ca: None,
+                tls_ca_pem: None,
                 tls_domain: None,
             },
         }
     }
+
+    /// Enough of a PEM block to pass the shape check. Never parsed here — the tests that need real
+    /// key material live in `tests/integration/flight_tls.rs`, against a minted CA.
+    const FAKE_PEM: &str = "-----BEGIN CERTIFICATE-----\nnot a real one\n-----END CERTIFICATE-----";
 
     /// The single-node bargain, as an assertion: no services database, no fleet token, no
     /// certificate and no flag — and the process still binds. CLAUDE.md's rule that `cargo run`
@@ -567,22 +753,39 @@ mod tests {
     /// A half-configured identity is always a mistake, never a posture, so it is an error in both
     /// directions rather than a silent fall-through to plaintext — which is the failure mode that
     /// would turn a typo into an unencrypted production port.
+    ///
+    /// Each message must name **both** spellings of the half that is missing. Naming only the path
+    /// one would send an ECS operator looking for a flag their platform cannot satisfy — a file is
+    /// exactly what they do not have, which is the whole reason the `-pem` variants exist.
     #[test]
-    fn half_an_identity_is_an_error_either_way() {
+    fn half_an_identity_is_an_error_either_way_and_names_both_spellings() {
         let mut cert_only = args();
         cert_only.tls_cert = Some(PathBuf::from("/nonexistent/cert.pem"));
         let error = cert_only
             .resolve_server(CredentialCheck::None)
             .expect_err("a certificate with no key cannot be served");
-        assert!(format!("{error:#}").contains("--tls-key"), "got: {error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("--tls-key "), "got: {message}");
+        assert!(message.contains("--tls-key-pem"), "got: {message}");
 
         let mut key_only = args();
         key_only.tls_key = Some(PathBuf::from("/nonexistent/key.pem"));
         let error = key_only
             .resolve_server(CredentialCheck::None)
             .expect_err("a key with no certificate names nothing to serve");
+        let message = format!("{error:#}");
+        assert!(message.contains("--tls-cert "), "got: {message}");
+        assert!(message.contains("--tls-cert-pem"), "got: {message}");
+
+        // …and the same for an identity whose *present* half arrived inline, which is the shape a
+        // Fargate task actually has.
+        let mut inline_cert_only = args();
+        inline_cert_only.tls_cert_pem = Some(FAKE_PEM.to_string());
+        let error = inline_cert_only
+            .resolve_server(CredentialCheck::None)
+            .expect_err("an injected certificate with no key cannot be served");
         assert!(
-            format!("{error:#}").contains("--tls-cert"),
+            format!("{error:#}").contains("--tls-key-pem"),
             "got: {error:#}"
         );
     }
@@ -675,5 +878,155 @@ mod tests {
     fn installing_the_crypto_provider_twice_is_a_no_op() {
         install_crypto_provider();
         install_crypto_provider();
+    }
+
+    // -- inline PEM (the Fargate spelling) ---------------------------------------------------
+
+    /// The whole point of the inline half: an identity supplied entirely through environment
+    /// variables, with no filesystem anywhere in the path, resolves to TLS.
+    #[test]
+    fn an_identity_supplied_inline_resolves_to_tls() {
+        let mut args = args();
+        args.tls_cert_pem = Some(FAKE_PEM.to_string());
+        args.tls_key_pem = Some(FAKE_PEM.to_string());
+        let resolved = args
+            .resolve_server(CredentialCheck::Enforced)
+            .expect("inline material is an identity like any other");
+        assert!(resolved.is_tls());
+    }
+
+    /// …and mixes: a certificate from a file with its key from a secret is a legal deployment, so
+    /// the two spellings must compose rather than being all-or-nothing.
+    #[test]
+    fn a_path_and_an_inline_pem_may_be_mixed_across_cert_and_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cert = dir.path().join("cert.pem");
+        std::fs::write(&cert, FAKE_PEM).expect("write cert");
+
+        let mut args = args();
+        args.tls_cert = Some(cert);
+        args.tls_key_pem = Some(FAKE_PEM.to_string());
+        assert!(
+            args.resolve_server(CredentialCheck::None)
+                .expect("a file certificate with an injected key is a real shape")
+                .is_tls()
+        );
+    }
+
+    /// A path and its inline twin together is ambiguous about *a private key*, so it is refused
+    /// rather than resolved by precedence — a silent winner here is a process serving material
+    /// nobody chose.
+    #[test]
+    fn a_path_and_its_inline_twin_together_are_refused() {
+        let mut both = args();
+        both.tls_key = Some(PathBuf::from("/nonexistent/key.pem"));
+        both.tls_key_pem = Some(FAKE_PEM.to_string());
+        let error = both
+            .resolve_server(CredentialCheck::None)
+            .expect_err("two sources for one key must not be silently ranked");
+        let message = format!("{error:#}");
+        assert!(message.contains("--tls-key"), "got: {message}");
+        assert!(message.contains("--tls-key-pem"), "got: {message}");
+
+        let mut both_ca = TlsClientArgs {
+            tls_ca: Some(PathBuf::from("/nonexistent/ca.pem")),
+            tls_ca_pem: Some(FAKE_PEM.to_string()),
+            tls_domain: None,
+        };
+        assert!(both_ca.to_trust().is_err(), "the CA half has the same rule");
+        both_ca.tls_ca = None;
+        assert!(
+            both_ca.to_trust().expect("inline alone is fine").has_ca(),
+            "an inline CA is a CA"
+        );
+    }
+
+    /// An unfilled secret is the realistic failure of the inline spelling, and it must name the
+    /// variable rather than reaching rustls as an empty buffer.
+    #[test]
+    fn an_empty_inline_pem_names_the_variable_that_is_unset() {
+        let mut args = args();
+        args.tls_cert_pem = Some("   \n".to_string());
+        args.tls_key_pem = Some(FAKE_PEM.to_string());
+        let error = args
+            .resolve_server(CredentialCheck::None)
+            .expect_err("an empty value is not material");
+        assert!(
+            format!("{error:#}").contains("LLDB_TLS_CERT_PEM"),
+            "got: {error:#}"
+        );
+    }
+
+    /// …and a value that is not PEM at all — the classic being a *path* pasted into the inline
+    /// variable — says so, instead of failing later inside the handshake.
+    #[test]
+    fn an_inline_value_that_is_not_pem_is_refused_with_advice() {
+        let mut args = args();
+        args.tls_cert_pem = Some(FAKE_PEM.to_string());
+        args.tls_key_pem = Some("/run/secrets/tls.key".to_string());
+        let error = args
+            .resolve_server(CredentialCheck::None)
+            .expect_err("a path is not PEM material");
+        let message = format!("{error:#}");
+        assert!(message.contains("-----BEGIN"), "got: {message}");
+        assert!(
+            !message.contains("/run/secrets/tls.key"),
+            "the value must never be echoed — it may be the key itself: {message}"
+        );
+    }
+
+    /// The standing rule that a credential is never logged, as an assertion. `TlsArgs` is a field
+    /// of every binary's `Cli`, and a derived `Debug` would put a private key in any dump of it.
+    #[test]
+    fn debug_renders_pem_material_as_presence_and_never_as_bytes() {
+        let mut args = args();
+        args.tls_cert_pem = Some(FAKE_PEM.to_string());
+        args.tls_key_pem = Some("-----BEGIN PRIVATE KEY-----\nsupersecret\n".to_string());
+        args.client.tls_ca_pem = Some(FAKE_PEM.to_string());
+
+        let rendered = format!("{args:?}");
+        assert!(!rendered.contains("supersecret"), "got: {rendered}");
+        assert!(!rendered.contains("BEGIN"), "got: {rendered}");
+        assert!(
+            rendered.contains("tls_key_pem: Some(<pem>)"),
+            "got: {rendered}"
+        );
+        assert!(
+            rendered.contains("tls_ca_pem: Some(<pem>)"),
+            "got: {rendered}"
+        );
+    }
+
+    /// An inline CA is dialed against exactly like a file one, including the domain override that
+    /// makes an IP-addressed fleet verifiable — the shape `infra/` deploys.
+    #[tokio::test]
+    async fn an_inline_ca_configures_the_same_trust_a_file_would() {
+        let trust = TlsClientArgs {
+            tls_ca: None,
+            tls_ca_pem: Some(FAKE_PEM.to_string()),
+            tls_domain: Some("fleet.lldb.local".to_string()),
+        }
+        .to_trust()
+        .expect("inline CA");
+        assert!(trust.has_ca());
+
+        // A port nothing is listening on, so the failure is immediate and local — an unroutable
+        // address would make this test wait out a TCP timeout.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        drop(listener);
+
+        // Getting as far as the connection means the CA was found: `dial` builds the client config
+        // (and would refuse for a missing CA) strictly before it opens a socket.
+        let error = trust
+            .dial(&format!("https://{addr}"))
+            .await
+            .expect_err("nothing is listening");
+        assert!(
+            !format!("{error:#}").contains("no CA is configured"),
+            "an inline CA must be found, got: {error:#}"
+        );
     }
 }
