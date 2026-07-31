@@ -49,7 +49,7 @@ out with `path-refs-allow: <that path>` somewhere in the same file.
 `iceberg`. That is the constraint `CLAUDE.md` actually imposes; it replaced a hand-maintained
 duplicate *total* that had gone stale and could not express the rule anyway (#78).
 
-Four things that surprise people:
+Five things that surprise people:
 
 - **The benches are behind a feature, and the clippy gate is what keeps them compiling.** Both
   `[[bench]]` targets carry `required-features = ["benches"]`, so a default build no longer links
@@ -66,6 +66,14 @@ Four things that surprise people:
   `Cargo.toml` already sets `debug = 0` and `incremental = false`; passing `CARGO_PROFILE_DEV_DEBUG`
   or `CARGO_INCREMENTAL` yourself invalidates the whole target directory and forces a full rebuild.
   See [`docs/build-performance.md`](docs/build-performance.md).
+
+- **On macOS, every fat binary links with an `__eh_frame` warning, and that is expected.** It means
+  debug-build unwinding takes the slower path; correctness is unaffected. **No gate catches it** —
+  `cargo clippy` never links, so `-D warnings` there structurally cannot see a linker message, and
+  CI runs on Linux where this particular warning does not fire. Do not add `RUSTFLAGS=-Dwarnings` to
+  a build step without reading
+  [`docs/build-performance.md`](docs/build-performance.md) first: it would be green on CI and red on
+  every Mac (#105).
 
 - **If you use git worktrees, sweep them.** Each one is a full checkout with **its own `target/`**,
   which is the point of the isolation and also why they run 3–7 GB apiece. Nothing removes them when
