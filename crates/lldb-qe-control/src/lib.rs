@@ -24,9 +24,16 @@
 //! ```
 //!
 //! `sqlx` is the deliberate exception and is not a leak: the control plane *is* a database. What
-//! that buys is the operator one-shots — `lldb-qe-migrate`, `lldb-qe-warehouse`, `lldb-qe-auth`
-//! and `lldb-qe-reap` — linking this crate instead of the query engine, and a control-plane test
-//! binary that does not wait on DataFusion to build.
+//! that buys is `lldb-qe-admin` — the operator one-shots `lldb-qe-migrate`, `lldb-qe-warehouse`,
+//! `lldb-qe-auth` and `lldb-qe-reap` — linking this crate *instead of* the query engine, and a
+//! control-plane test binary that does not wait on DataFusion to build. That is a package boundary
+//! and has to be: cargo resolves dependencies per package, not per binary, so while those four were
+//! `src/bin/` targets of `lldb-qe-coordinator` they compiled DataFusion regardless of what they
+//! imported.
+//!
+//! [`services::MIGRATOR`] therefore stays *here*. `sqlx::migrate!` resolves its directory relative
+//! to the crate manifest at compile time, and `migrations/` is this crate's — moving the macro
+//! invocation into `lldb-qe-admin` would silently embed nothing.
 //!
 //! ## What is deliberately *not* here
 //!

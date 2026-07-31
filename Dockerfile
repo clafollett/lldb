@@ -52,22 +52,29 @@ COPY . .
 # the build context, so the SHA must be injected). Defaults keep local `docker build` working.
 ARG GIT_SHA=unknown
 ENV LLDB_GIT_SHA=$GIT_SHA
-# The coordinator package also builds the control-plane one-shots: `lldb-qe-migrate` (applies
-# services-DB migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual
-# warehouse), `lldb-qe-auth` (users, API keys, roles, grants) and `lldb-qe-reap` (resolve
-# query-history rows stranded by a dead coordinator), plus `lldb-qe-server`, the long-running query
-# scheduler. They ship in the same image on purpose — migrations are embedded in the binary at
-# compile time, the build that writes a warehouse row must be the build that reads it, the build
-# that writes a grant must be the build that checks it, and a coordinator (one-shot or serving) must
-# be the identical build to every worker it ships a plan to.
+# Three packages, seven binaries. `lldb-qe-coordinator` builds the one-shot coordinator and
+# `lldb-qe-server` (the long-running query scheduler); `lldb-qe-worker` builds the worker; and
+# `lldb-qe-admin` builds the control-plane one-shots — `lldb-qe-migrate` (applies services-DB
+# migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a virtual warehouse),
+# `lldb-qe-auth` (users, API keys, roles, grants) and `lldb-qe-reap` (resolve query-history rows
+# stranded by a dead coordinator).
 #
-# **Every binary this package produces must be listed here and copied into the runtime stage
+# **`-p lldb-qe-admin` is load-bearing, not tidiness.** Those four moved out of the coordinator
+# package in issue #92 so they stop compiling DataFusion; dropping the flag would build an image
+# whose `db-migrate`, `warehouse-setup` and `auth-setup` services have no entrypoint.
+#
+# They ship in the same image on purpose — migrations are embedded in the binary at compile time,
+# the build that writes a warehouse row must be the build that reads it, the build that writes a
+# grant must be the build that checks it, and a coordinator (one-shot or serving) must be the
+# identical build to every worker it ships a plan to.
+#
+# **Every binary these packages produce must be listed here and copied into the runtime stage
 # below.** `docker-compose.yml` and the CDK stack both invoke these by name, so a binary that is
 # built but not copied is a service whose entrypoint does not exist in the image it runs — which is
 # exactly how `lldb-qe-auth` went missing (issue #51). `distributed_cluster.rs`'s
 # `image_contains_every_binary_the_cluster_invokes` is the test that now fails when this list and
-# `src/bin/` disagree.
-RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker \
+# those packages' binary targets disagree.
+RUN cargo build --release -p lldb-qe-coordinator -p lldb-qe-worker -p lldb-qe-admin \
     && cp target/release/lldb-qe-coordinator target/release/lldb-qe-migrate \
           target/release/lldb-qe-warehouse target/release/lldb-qe-auth \
           target/release/lldb-qe-reap target/release/lldb-qe-server \

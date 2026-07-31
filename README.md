@@ -66,18 +66,24 @@ Writes are not distributed at all: the coordinator commits them itself.
 | `lldb-qe-types` | The vocabulary — privileges and grants, the storage declaration. No datafusion / arrow / iceberg / parquet / object_store / sqlx |
 | `lldb-qe-control` | The control plane — services DB and migrations, accounts and API keys, warehouses, discovery, admission, cancellation, query history, liveness, the reaper, TLS, tenancy. Postgres, no query engine |
 | `lldb-qe-core` | The query engine — storage abstraction, config-as-data catalog, session setup, Flight transport, plan codec, staging planner, result cache, the plan-time grant check, and `server.rs`, which wires the control plane to the engine |
-| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds the operator binaries below |
+| `lldb-qe-coordinator` | SQL entry point; builds a plan and dispatches it to workers over Flight. Also builds `lldb-qe-server` |
+| `lldb-qe-admin` | The operator one-shots. Depends on `lldb-qe-control` and `lldb-qe-types` — no datafusion / arrow / iceberg / parquet |
 | `lldb-qe-worker` | Stateless Flight server that executes shipped sub-plans |
 
-`lldb-qe-coordinator` runs **one** query and exits. The binaries it also builds:
+`lldb-qe-coordinator` runs **one** query and exits. The other binaries:
 
-| Binary | Role |
-| - | - |
-| `lldb-qe-server` | The long-running front end — concurrent submissions over Arrow Flight, admission control, query history. **The only binary that authenticates** |
-| `lldb-qe-migrate` | Applies the services-DB migrations; an explicit one-shot, never startup magic |
-| `lldb-qe-warehouse` | Create / list / resize / suspend / resume a virtual warehouse |
-| `lldb-qe-auth` | Accounts, API keys, roles, grants |
-| `lldb-qe-reap` | Resolves query-history rows stranded by a coordinator that died |
+| Binary | Package | Role |
+| - | - | - |
+| `lldb-qe-server` | `lldb-qe-coordinator` | The long-running front end — concurrent submissions over Arrow Flight, admission control, query history. **The only binary that authenticates** |
+| `lldb-qe-migrate` | `lldb-qe-admin` | Applies the services-DB migrations; an explicit one-shot, never startup magic |
+| `lldb-qe-warehouse` | `lldb-qe-admin` | Create / list / resize / suspend / resume a virtual warehouse |
+| `lldb-qe-auth` | `lldb-qe-admin` | Accounts, API keys, roles, grants |
+| `lldb-qe-reap` | `lldb-qe-admin` | Resolves query-history rows stranded by a coordinator that died |
+
+The split is a build fact, not bookkeeping: cargo resolves dependencies **per package, not per
+binary**, so while the four one-shots were `src/bin/` targets of `lldb-qe-coordinator` they each
+compiled the whole DataFusion graph and then discarded it at link time. `lldb-qe-server` stays
+there because it genuinely runs queries.
 
 ## Services database (control plane)
 
@@ -92,7 +98,7 @@ rolling fleet must not race to apply the same DDL.
 
 ```bash
 # Apply migrations and make sure an account exists (idempotent; safe on every deploy).
-cargo run -p lldb-qe-coordinator --bin lldb-qe-migrate -- \
+cargo run -p lldb-qe-admin --bin lldb-qe-migrate -- \
   --metadata-url postgres://lldb:lldb@localhost:5432/lldb --seed-account default
 ```
 
@@ -111,7 +117,7 @@ same tables and neither can slow the other down, because the only thing they sha
 rest.
 
 ```bash
-WH="cargo run -q -p lldb-qe-coordinator --bin lldb-qe-warehouse -- \
+WH="cargo run -q -p lldb-qe-admin --bin lldb-qe-warehouse -- \
   --metadata-url postgres://lldb:lldb@localhost:5432/lldb"
 
 $WH create --name analytics --size 4     # define it
@@ -160,7 +166,7 @@ cache is consulted — so revoking `SELECT` refuses the next query even when the
 cached.
 
 ```bash
-AUTH="cargo run -q -p lldb-qe-coordinator --bin lldb-qe-auth -- \
+AUTH="cargo run -q -p lldb-qe-admin --bin lldb-qe-auth -- \
   --metadata-url postgres://lldb:lldb@localhost:5432/lldb"
 
 $AUTH user create --name alice

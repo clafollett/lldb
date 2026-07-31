@@ -3,9 +3,9 @@
 //! # What this binary does, precisely
 //!
 //! It **edits rows** in the services database, exactly like `lldb-qe-warehouse` does for compute.
-//! The rows it edits are what [`lldb_qe_core::auth`] authenticates against and what
-//! [`lldb_qe_core::rbac`] authorizes against, so this is where a deployment goes from "reachable by
-//! anyone" to "reachable by the people you issued keys to".
+//! The rows it edits are what [`lldb_qe_control::auth`] authenticates against and what
+//! [`lldb_qe_types::rbac`] authorizes against, so this is where a deployment goes from "reachable
+//! by anyone" to "reachable by the people you issued keys to".
 //!
 //! # Why a separate binary, and what that implies about *its* security
 //!
@@ -39,15 +39,18 @@
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
-use lldb_qe_core::auth::{Role, User};
-use lldb_qe_core::rbac::{ObjectRef, ObjectType, Privilege};
-use lldb_qe_core::{Account, ServicesArgs, ServicesDb, init_tracing, redact_url};
+use lldb_qe_control::auth::{Role, User};
+use lldb_qe_control::{Account, ServicesArgs, ServicesDb, init_tracing, redact_url};
+// Straight from `lldb_qe_types`, the vocabulary crate — deliberately NOT via `lldb_qe_core::rbac`,
+// which re-exports these but drags the whole query engine in with them. `lldb_qe_control::auth`
+// imports them by the same route and for the same reason.
+use lldb_qe_types::rbac::{ObjectRef, ObjectType, Privilege};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "lldb-qe-auth",
     about = "Manage accounts' users, API keys, roles and grants",
-    version = lldb_qe_core::BUILD_VERSION
+    version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {
     /// Tenant every operation here is scoped to. User, role and key names are unique *within* an
@@ -175,7 +178,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     tracing::info!(
-        version = lldb_qe_core::BUILD_VERSION,
+        version = lldb_qe_control::BUILD_VERSION,
         "starting lldb-qe-auth"
     );
 

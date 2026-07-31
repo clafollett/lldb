@@ -28,13 +28,13 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Parser;
-use lldb_qe_core::{ServicesArgs, init_tracing, redact_url};
+use lldb_qe_control::{ServicesArgs, init_tracing, redact_url};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "lldb-qe-migrate",
     about = "Apply lldb services-database migrations and seed accounts",
-    version = lldb_qe_core::BUILD_VERSION
+    version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {
     /// Account name to create if missing. Repeatable; `LLDB_SEED_ACCOUNTS` takes a
@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
     init_tracing();
     let cli = Cli::parse();
     tracing::info!(
-        version = lldb_qe_core::BUILD_VERSION,
+        version = lldb_qe_control::BUILD_VERSION,
         "starting lldb-qe-migrate"
     );
 
@@ -87,7 +87,7 @@ async fn main() -> Result<()> {
     // The count is what this build *carries*, not what this run applied — the migrator reports no
     // such number, and re-running is usually a no-op. Named accordingly, because "migrations=1"
     // on a rerun would otherwise read as "one migration was just applied".
-    let embedded = lldb_qe_core::services::MIGRATOR.iter().count();
+    let embedded = lldb_qe_control::services::MIGRATOR.iter().count();
     tracing::info!(
         embedded_migrations = embedded,
         url = %redacted,

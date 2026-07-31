@@ -7,9 +7,14 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 description = "lldb coordinator: plans a query and runs it on a remote worker over Arrow Flight."
-# This package also ships the control-plane one-shots (`src/bin/lldb-qe-migrate.rs`,
-# `src/bin/lldb-qe-warehouse.rs`), which makes a bare `cargo run -p lldb-qe-coordinator`
-# ambiguous. The coordinator stays the default.
+# This package also ships `src/bin/lldb-qe-server.rs`, the long-running scheduler, which makes a
+# bare `cargo run -p lldb-qe-coordinator` ambiguous. The one-shot coordinator stays the default.
+#
+# Both targets here run queries, and that is now the entry rule for this package: because cargo
+# resolves dependencies per package rather than per binary, anything living here compiles the whole
+# DataFusion graph below. The control-plane one-shots that do not run queries — `lldb-qe-migrate`,
+# `lldb-qe-warehouse`, `lldb-qe-auth`, `lldb-qe-reap` — are in `lldb-qe-admin` for that reason. Do
+# not add a binary here unless it needs the engine.
 default-run = "lldb-qe-coordinator"
 
 [dependencies]
@@ -19,5 +24,3 @@ tokio.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 tracing.workspace = true
-# `lldb-qe-auth` turns `--expires-in-days` into a timestamp.
-chrono.workspace = true
