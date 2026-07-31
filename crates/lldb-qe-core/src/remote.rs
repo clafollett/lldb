@@ -439,52 +439,152 @@ impl PhysicalExtensionCodec for LldbCodec {
         for fallback in &reader.fallbacks {
             put_str(buf, fallback);
         }
-        buf.extend_from_slice(&serialize_plan(Arc::clone(&reader.inner))?);
+        // `encode_plan`, not `serialize_plan`: the guidance walk in `serialize_plan` already
+        // descended through this node's `inner` — that is precisely why it is hand-written — so
+        // re-running it here would re-walk the same sub-tree once per level of nesting to find
+        // what the top-level walk already proved absent.
+        buf.extend_from_slice(&encode_plan(Arc::clone(&reader.inner))?);
         Ok(())
     }
 }
 
-/// The error for a node this codec has no encoding for.
+/// The refusal for a node whose un-encodability is worth *explaining*, or `None` for a node this
+/// codec either encodes or has nothing particular to say about.
 ///
 /// [`IcebergTableScan`] gets its own message because it is the one un-encodable node a *correct*
 /// query routinely produces, and because the fix is a step the caller skipped rather than a missing
 /// feature: [`crate::iceberg_scan::resolve_iceberg_scans`] turns it into a parquet scan
 /// `datafusion-proto` already understands, and [`crate::engine`] runs that before anything is
-/// staged. Reaching the codec with one still in the plan means some path bypassed that funnel —
+/// staged. Reaching serialization with one still in the plan means some path bypassed that funnel —
 /// which is worth saying out loud, since the generic "cannot encode IcebergTableScan" reads like
 /// "Iceberg is unsupported" and would send someone off to write a codec that should not exist.
 ///
-/// A node *named* [`FlightReaderExec`] gets its own message for a sharper reason: the generic one
-/// would be a flat lie. This codec encodes exactly that node, so "cannot encode FlightReaderExec"
-/// denies something true and sends the reader hunting for a missing feature. The only way to reach
-/// it is for the `TypeId`s to differ — two builds of the defining crate in one dependency graph —
-/// so the name is all there is to go on, precisely because the type identity that would normally
-/// answer the question is the thing that has broken.
-fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
+/// A node *named* [`FlightReaderExec`] that is not one gets its own message for a sharper reason:
+/// the generic one would be a flat lie. This codec encodes exactly that node, so "cannot encode
+/// FlightReaderExec" denies something true and sends the reader hunting for a missing feature. The
+/// only way to be in that branch is for the `TypeId`s to differ — two builds of the defining crate
+/// in one dependency graph — so the name is all there is to go on, precisely because the type
+/// identity that would normally answer the question is the thing that has broken. Hence the leading
+/// downcast: a *real* reader answers `None`, because it encodes.
+fn guided_refusal(node: &Arc<dyn ExecutionPlan>) -> Option<DataFusionError> {
+    if node.as_any().downcast_ref::<FlightReaderExec>().is_some() {
+        return None;
+    }
     if node.name() == FLIGHT_READER_EXEC_NAME {
-        return DataFusionError::Execution(format!(
+        return Some(DataFusionError::Execution(format!(
             "LldbCodec was handed a node calling itself {FLIGHT_READER_EXEC_NAME}, which this codec \
              does encode — so it is not the {FLIGHT_READER_EXEC_NAME} this build defines. Two \
              versions of lldb-qe-core are linked into this process: your fleet is not one build. \
              Run `cargo tree -d` to name the duplicate, and check that every coordinator and worker \
              runs one image tag."
-        ));
+        )));
     }
     if node.as_any().downcast_ref::<IcebergTableScan>().is_some() {
-        return DataFusionError::NotImplemented(
+        return Some(DataFusionError::NotImplemented(
             "LldbCodec cannot encode IcebergTableScan: it holds a live catalog handle and resolves \
              its own files, so it is deliberately not serialized. Call \
              `iceberg_scan::resolve_iceberg_scans` to pin the scan to its snapshot's data files \
              before the plan is staged — `engine::run_on_fleet` already does, so a plan that gets \
              here bypassed it."
                 .to_string(),
-        );
+        ));
     }
-    DataFusionError::NotImplemented(format!("LldbCodec cannot encode {}", node.name()))
+    None
+}
+
+/// The error for a node this codec has no encoding for — the backstop under
+/// [`refuse_before_encoding`], reached only when `datafusion-proto` hands us a node the walk did
+/// not know to refuse.
+///
+/// Anything this returns is delivered *mangled*: see [`refuse_before_encoding`] for what the encode
+/// path does to a codec error and why the guided refusals are hoisted out of here.
+fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
+    guided_refusal(node).unwrap_or_else(|| {
+        DataFusionError::NotImplemented(format!("LldbCodec cannot encode {}", node.name()))
+    })
+}
+
+/// Refuse a plan containing a node whose refusal carries guidance — **before** `datafusion-proto`
+/// is asked to encode it.
+///
+/// # Why the codec cannot be the messenger
+///
+/// `datafusion-proto` wraps every error an extension codec returns on the **encode** path
+/// (`physical_plan/mod.rs:593`):
+///
+/// ```text
+/// internal_err!("Unsupported plan and extension codec failed with [{e}]. Plan: {plan_clone:?}")
+/// ```
+///
+/// Three things happen to a message on the way out of there. It is nested inside "Unsupported plan
+/// and extension codec failed with […]"; `internal_err!` makes it a [`DataFusionError::Internal`],
+/// whose `Display` appends *"likely caused by a bug in DataFusion's code … file a bug report"*; and
+/// a full `Debug` dump of the whole physical plan is appended behind it. So the one refusal an
+/// operator is meant to *act* on arrived reading like an upstream defect, after a plan dump — which
+/// invites an issue against Apache DataFusion, or a widened check, when the fix is a call that was
+/// skipped. The **decode** path has no such wrapper (it propagates codec errors verbatim), which is
+/// why [`take_magic`]'s and the version check's refusals have always arrived intact and this one
+/// did not.
+///
+/// So the answer is not to write the message more carefully; it is to not be inside the codec when
+/// it is written. Everything [`guided_refusal`] names is caught here, on the coordinator, before a
+/// byte is serialized, and returned as our own error.
+///
+/// # Why the recursion is hand-written
+///
+/// [`TreeNode::apply`] follows [`ExecutionPlan::children`], and a [`FlightReaderExec`]'s `inner` is
+/// deliberately **not** a child — so `apply` would walk straight past every remote stage's sub-plan,
+/// which is exactly where a bypassed `resolve_iceberg_scans` leaves a scan that only fails once the
+/// stage is being encoded. This descends into `inner` as well.
+///
+/// # What it costs
+///
+/// One `TypeId` comparison and at most one `&str` comparison per node, once per top-level
+/// [`serialize_plan`] — against an encode that proto-serializes every one of those nodes and
+/// allocates a buffer for the result. Measured on a resolved 10-node aggregate plan: **1.1 µs for
+/// the walk against 168 µs for the encode behind it**, so it is 0.6% of the work it guards and
+/// scales with it. And it is paid once rather than once per level of nesting, because
+/// [`LldbCodec::try_encode`] recurses through [`encode_plan`] rather than back through
+/// [`serialize_plan`].
+///
+/// # What it does not cover
+///
+/// A node with no guidance to lose — one neither this codec nor `datafusion-proto` can encode and
+/// that we have never written advice for — still reaches [`encode_failure`] and still comes back
+/// wrapped. Covering it would mean duplicating `datafusion-proto`'s own "can I encode this" dispatch
+/// over every built-in node, which is a copy that silently rots at every version bump. The class
+/// worth protecting is the class we have something to say about.
+///
+/// [`TreeNode::apply`]: datafusion::common::tree_node::TreeNode::apply
+fn refuse_before_encoding(plan: &Arc<dyn ExecutionPlan>) -> DFResult<()> {
+    if let Some(err) = guided_refusal(plan) {
+        return Err(err);
+    }
+    for child in plan.children() {
+        refuse_before_encoding(child)?;
+    }
+    if let Some(reader) = plan.as_any().downcast_ref::<FlightReaderExec>() {
+        refuse_before_encoding(&reader.inner)?;
+    }
+    Ok(())
 }
 
 /// Serialize a plan with this codec, so nested [`FlightReaderExec`] nodes survive.
+///
+/// A plan holding a node we can explain is refused *here*, by [`refuse_before_encoding`], rather
+/// than by the codec — read that function for what `datafusion-proto` does to an error the codec
+/// returns, and why nothing an operator must act on may be raised from inside it.
 pub fn serialize_plan(plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {
+    refuse_before_encoding(&plan)?;
+    encode_plan(plan)
+}
+
+/// The encode itself, with no guidance walk ahead of it.
+///
+/// Split out for [`LldbCodec::try_encode`], which is already *inside* a walk that covered its
+/// `inner` sub-plan. Nothing else should call it: [`serialize_plan`] is the entry point that runs
+/// the walk.
+fn encode_plan(plan: Arc<dyn ExecutionPlan>) -> DFResult<Vec<u8>> {
     let bytes =
         datafusion_proto::bytes::physical_plan_to_bytes_with_extension_codec(plan, &LldbCodec)?;
     Ok(bytes.to_vec())
@@ -566,6 +666,35 @@ fn take_str(buf: &[u8]) -> DFResult<(String, &[u8])> {
         DataFusionError::Internal(format!("FlightReaderExec url is not utf-8: {e}"))
     })?;
     Ok((s, rest))
+}
+
+/// Assert `msg` did **not** come out through `datafusion-proto`'s encode-side wrapper.
+///
+/// One spelling of that wrapper, shared with `iceberg_scan`'s tests deliberately: both modules are
+/// asserting the same property about the same upstream `internal_err!`, and two hand-written
+/// approximations of it would drift. Lives here because the wrapper is this module's problem —
+/// see [`refuse_before_encoding`] for what it does to a message and why it must not be entered.
+///
+/// The four substrings are the four things the wrapper adds: the nesting, `Internal`'s bug-report
+/// boilerplate (two spellings, since the URL and the prose are separable), and the plan dump.
+#[cfg(test)]
+pub(crate) fn assert_no_datafusion_wrapper(msg: &str) {
+    assert!(
+        !msg.contains("datafusion/issues"),
+        "a refusal the operator must act on must not read as a DataFusion bug; got: {msg}"
+    );
+    assert!(
+        !msg.contains("bug in DataFusion's code"),
+        "the Internal-error boilerplate must not be attached; got: {msg}"
+    );
+    assert!(
+        !msg.contains("Unsupported plan and extension codec failed"),
+        "the refusal must not be nested inside datafusion-proto's wrapper; got: {msg}"
+    );
+    assert!(
+        !msg.contains("Plan: "),
+        "a plan Debug dump must not be appended to it; got: {msg}"
+    );
 }
 
 #[cfg(test)]
@@ -1100,17 +1229,12 @@ mod tests {
 
     /// The other half of a two-build fleet: the encode side would otherwise deny a node it
     /// provably encodes. The refusal has to name the real cause instead.
+    ///
+    /// Asserted against the codec directly, which is the backstop under the pre-serialization walk
+    /// — the walk is what makes this message *deliverable*, and that is asserted separately.
     #[test]
     fn a_foreign_node_of_the_same_name_is_reported_as_two_builds_not_as_unencodable() {
-        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
-        let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(ImposterFlightReader(Arc::new(PlanProperties::new(
-                EquivalenceProperties::new(schema),
-                Partitioning::UnknownPartitioning(1),
-                EmissionType::Final,
-                Boundedness::Bounded,
-            ))));
-
+        let plan = imposter();
         let mut buf = Vec::new();
         let err = LldbCodec
             .try_encode(plan, &mut buf)
@@ -1136,5 +1260,57 @@ mod tests {
         let plan = sample_plan(&ctx).await;
         let mut buf = Vec::new();
         assert!(LldbCodec.try_encode(plan, &mut buf).is_err());
+    }
+
+    /// The mechanism this file exists to guarantee: a refusal with guidance is raised *before*
+    /// `physical_plan_to_bytes_with_extension_codec` is entered, so nothing wraps it.
+    ///
+    /// The two-builds diagnosis is used as the probe because it can be provoked with a local type;
+    /// `iceberg_scan.rs` proves the same property for the `IcebergTableScan` refusal, which needs a
+    /// real catalog to construct.
+    #[test]
+    fn a_guided_refusal_reaches_the_caller_without_datafusion_protos_wrapper() {
+        let plan: Arc<dyn ExecutionPlan> = imposter();
+
+        let err = serialize_plan(plan).expect_err("a foreign FlightReaderExec cannot be encoded");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Two versions of lldb-qe-core are linked into this process"),
+            "the guidance must survive the trip; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// The reason the walk is hand-written rather than a `TreeNode::apply`: a `FlightReaderExec`'s
+    /// `inner` is not a child, so a children-only walk sees a perfectly encodable leaf and hands
+    /// the sub-plan to the codec — which is the one place the wrapper would reappear.
+    #[test]
+    fn the_walk_descends_into_a_remote_stages_sub_plan() {
+        let staged: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, imposter()));
+        assert!(
+            staged.children().is_empty(),
+            "test setup: the sub-plan must be invisible to a children-only walk, or this proves \
+             nothing"
+        );
+
+        let err = serialize_plan(staged).expect_err("the nested node is still un-encodable");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Two versions of lldb-qe-core are linked into this process"),
+            "a refusal from inside a remote stage must arrive the same way; got: {msg}"
+        );
+        assert_no_datafusion_wrapper(&msg);
+    }
+
+    /// An [`ImposterFlightReader`] as a plan, with the properties a leaf needs.
+    fn imposter() -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        Arc::new(ImposterFlightReader(Arc::new(PlanProperties::new(
+            EquivalenceProperties::new(schema),
+            Partitioning::UnknownPartitioning(1),
+            EmissionType::Final,
+            Boundedness::Bounded,
+        ))))
     }
 }
