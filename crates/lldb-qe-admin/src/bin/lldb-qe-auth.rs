@@ -35,6 +35,10 @@
 //!   lldb-qe-auth --metadata-url postgres://lldb@localhost/lldb \
 //!     grant --role analyst --privilege SELECT --object-type namespace --object-name lldb.sales
 //!   lldb-qe-auth --metadata-url postgres://lldb@localhost/lldb show
+//!
+//! # Not a fleet member
+//!
+//! fleet-posture-allow: its credential is the services database, not the fleet secret; binds no port.
 
 use anyhow::{Context, Result, bail};
 use chrono::{Duration, Utc};

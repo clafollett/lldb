@@ -28,6 +28,10 @@
 //!   lldb-qe-warehouse --metadata-url postgres://lldb@localhost/lldb resize --name analytics --size 8
 //!   lldb-qe-warehouse --metadata-url postgres://lldb@localhost/lldb suspend --name analytics
 //!   lldb-qe-warehouse --metadata-url postgres://lldb@localhost/lldb resume  --name analytics
+//!
+//! # Not a fleet member
+//!
+//! fleet-posture-allow: it edits desired-state rows; binds no port, never handed LLDB_FLEET_TOKEN.
 
 use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};

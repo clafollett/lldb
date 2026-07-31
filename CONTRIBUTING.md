@@ -35,9 +35,10 @@ cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D war
 cargo test --workspace
 ./scripts/check-path-refs.sh
 ./scripts/check-dep-dupes.sh
+./scripts/check-fleet-posture.sh
 ```
 
-The last two are cheap and catch things review reliably misses. `check-path-refs.sh` asserts that
+The last three are cheap and catch things review reliably misses. `check-path-refs.sh` asserts that
 every `crates/<pkg>/…` path mentioned in a tracked file actually exists — module docs carry this
 project's design rationale, and `git mv` renames files without rewriting the strings pointing at
 them, so a crate split silently rots every reference into it (#90). It runs on **every** PR, not
@@ -48,6 +49,25 @@ out with `path-refs-allow: <that path>` somewhere in the same file.
 `check-dep-dupes.sh` asserts zero duplicate versions of `arrow`, `datafusion`, `object_store` and
 `iceberg`. That is the constraint `CLAUDE.md` actually imposes; it replaced a hand-maintained
 duplicate *total* that had gone stale and could not express the rule anyway (#78).
+
+`check-fleet-posture.sh` asserts that every binary in the workspace either calls
+`check_fleet_posture_from_env()` or states why it does not (#116). `LLDB_REQUIRE_FLEET_TOKEN` is a
+deployment's assertion that its worker fleet is closed, and it is only worth something on a process
+that checks it; a binary that forgets the call compiles, lints, tests and runs, leaving that
+assertion unevaluated with no signal at all. The list of binaries comes from `cargo metadata`, not
+from the script — a sweep for the binaries known to receive the token would go stale the moment a
+fourth one appeared, which is the defect rather than the fix — so **a new binary fails by default**.
+If yours genuinely never joins the fleet, put the marker in its own source with the reason on the
+same line, `path-refs-allow:`'s idiom:
+
+```rust
+//! fleet-posture-allow: a DDL one-shot; binds no port, never handed LLDB_FLEET_TOKEN.
+```
+
+It needs `jq` — `cargo metadata` is JSON, and hand-parsing it is how a check starts lying. It runs
+under the `rust` path filter rather than unconditionally like `check-path-refs.sh`, because its
+inputs are only manifests and `.rs` sources: a docs-only PR cannot add a binary target or delete a
+call.
 
 Five things that surprise people:
 

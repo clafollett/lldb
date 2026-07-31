@@ -161,6 +161,16 @@ jobs:
       - name: Dependency pins
         run: ./scripts/check-dep-dupes.sh
 
+      # Every binary cargo builds must either call `check_fleet_posture_from_env` or say why it
+      # does not (#116). Unlike `paths` above this is gated on the rust filter and belongs here
+      # rather than in its own always-run job, because its two inputs are exactly what that filter
+      # selects: a `[[bin]]` target (a Cargo.toml, or a new file under src/bin/) and the target's
+      # own source. No .md change can add a binary or delete a posture call, so a docs-only PR has
+      # nothing to break — which is the opposite of `check-path-refs.sh`, whose references live in
+      # the markdown itself. It also needs cargo, which the `paths` job deliberately does not have.
+      - name: Fleet posture
+        run: ./scripts/check-fleet-posture.sh
+
       # `--features lldb-qe-core/benches` is NOT optional and must not be dropped to save time.
       # The two criterion benches are behind `required-features = ["benches"]` so a default build
       # stops producing their 629 MB of binaries (issue #97), and the only thing keeping them from

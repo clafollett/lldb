@@ -1128,6 +1128,11 @@ pub fn check_fleet_posture(required: Option<&str>, token: Option<&str>) -> Resul
 
 /// [`check_fleet_posture`] against this process's own environment. Call it from `main`.
 ///
+/// `scripts/check-fleet-posture.sh` is what makes "call it from `main`" more than advice: it
+/// enumerates every binary target `cargo metadata` reports and fails one that neither calls this nor
+/// carries a `fleet-posture-allow:` line saying why it does not join the fleet (#116). A new binary
+/// therefore fails by default, which is the only shape that survives a fourth one being added.
+///
 /// # Why a startup function and not a fallible `FleetAuth::from_env`
 ///
 /// `from_env` initializes a `OnceLock` (`lldb_qe_core::flight::ambient_fleet_auth`), and a
