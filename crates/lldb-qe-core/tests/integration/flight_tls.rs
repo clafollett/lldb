@@ -1,14 +1,15 @@
 //! **TLS on both Flight boundaries** (issue #33): a query crossing an encrypted client→coordinator
 //! hop *and* an encrypted coordinator→worker hop, a plaintext client refused by a TLS server, and
-//! the no-configuration path proven still to work.
+//! the no-configuration path proven still to work — plus the one property a *runbook* rests on, a
+//! `--tls-ca` bundle anchoring more than one root (issue #137).
 //!
 //! The refusal to *start* insecurely — a checked credential on a plaintext port — is deliberately
 //! not here. It is a pure function of flags, so it lives as unit tests in
 //! [`lldb_qe_core::tls`] where it needs no socket, no database and no fleet; a test that spent
 //! three seconds standing up servers to assert a `bail!` would be slower and prove less.
 //!
-//! Everything below runs against a CA this binary mints for itself (`support::certs`), never
-//! against committed key material.
+//! Everything below runs against certificate authorities this binary mints for itself
+//! (`support::certs`), never against committed key material.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -247,6 +248,72 @@ async fn a_plaintext_client_is_refused_by_a_tls_worker() -> Result<()> {
     assert!(
         format!("{error:#}").contains(&worker.to_string()),
         "the failure must name the worker it could not talk to, got: {error:#}"
+    );
+    Ok(())
+}
+
+/// **A CA bundle anchors every root in it — and only the ones that actually signed the chain.**
+///
+/// This is the one TLS property `infra/README.md`'s *Rotating* runbook tells an operator to lean
+/// on. Replacing the fleet's CA in a single pass is an outage — mid-roll, half the fleet trusts a
+/// root the other half does not sign under, and every handshake between the halves fails, worker to
+/// worker included. The way through is a window in which **both** roots are trusted, and the only
+/// reason such a window is expressible is that `--tls-ca` / `--tls-ca-pem` is a bundle: every PEM
+/// block in it becomes a trust anchor.
+///
+/// That property is **inherited, not ours** — `ClientTrust::from_pem` hands the whole PEM to tonic's
+/// `Certificate::from_pem`, which reaches rustls's `add_parsable_certificates`. A tonic or rustls
+/// change that made trust single-anchor, or that rejected a bundle containing a root the handshake
+/// does not need, would break a documented production procedure with nothing going red and the
+/// operator finding out mid-rotation on a live fleet. Hence a test rather than a comment (#137).
+///
+/// **The second half is what makes the first half mean anything.** A client that ignored its CA
+/// entirely would pass the positive assertion, so the same bundle minus the signing root has to
+/// fail — same server, same dial, one PEM block different.
+///
+/// The unrelated root is deliberately **first** in the bundle. That is the harder order and it is
+/// also pass 2 of the runbook, where the leaves have moved to the new root while the retired one is
+/// still listed: a bundle reader that only ever looked at the first block would pass with the two
+/// swapped.
+///
+/// Note what this test does *not* touch: [`lldb_qe_core::tls::install_client_trust`]. Its trusts are
+/// built per dial and dialed with directly, because a suite about *what a client trusts* is exactly
+/// the suite that must not install a second value into process-global state that every other test
+/// here reads. See `support/certs.rs` and `main.rs`.
+#[tokio::test]
+async fn a_ca_bundle_anchors_every_root_in_it_and_no_others() -> Result<()> {
+    let tmp = tempfile::tempdir()?;
+    let mut servers = Servers::new();
+    // Serves the shared CA's leaf, and that CA signed it alone — no cross-signature, no second
+    // chain, so the unrelated root below is genuinely irrelevant to this handshake.
+    let worker = start_worker(&mut servers, certs::server_tls(tmp.path())?).await?;
+    let url = format!("https://{worker}");
+
+    // `dial` connects, which for an `https://` endpoint means completing the TLS handshake — so
+    // reaching `Ok` here is the peer's certificate having been verified against this bundle.
+    certs::bundle_trust(&[certs::unrelated_root(), &certs::shared().ca_pem])
+        .dial(&url)
+        .await
+        .context(
+            "a bundle must anchor the root that signed the peer, even beside an unrelated one",
+        )?;
+
+    let error = certs::bundle_trust(&[certs::unrelated_root()])
+        .dial(&url)
+        .await
+        .expect_err("a root that signed nothing in the chain must not verify it");
+    let message = format!("{error:#}");
+    // The two assertions that keep this control honest, and neither is about wording. The refusal
+    // must come from the *handshake* — if the bundle had failed to load at all, the dial would have
+    // been refused by `client_config` before a socket was opened, and this test would be asserting
+    // that a misconfiguration fails rather than that an unrelated root does not verify.
+    assert!(
+        !message.contains("no CA is configured"),
+        "the bundle must have been loaded; this failure means it was not: {message}"
+    );
+    assert!(
+        message.contains("connecting to"),
+        "the refusal must come from the handshake, not from resolving the flags: {message}"
     );
     Ok(())
 }
