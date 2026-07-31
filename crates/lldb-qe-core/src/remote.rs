@@ -43,6 +43,18 @@
 //! reassigns itself on a transport failure. See [`FlightReaderExec::execute`] for the one
 //! correctness constraint that buys (a partition is collected in full before anything is emitted)
 //! and [`crate::retry`] for which failures are worth reassigning at all.
+//!
+//! **The partition a leaf names is checked where the leaf is built.** `remote_partition` selects a
+//! partition of `inner`, and whoever constructs the leaf is holding `inner` — so both constructors
+//! are fallible and there is deliberately no unchecked twin beside them. Deferring the check to the
+//! pull does not merely move it later, it moves it onto another machine and behind the whole cost of
+//! the stage: a worker reaches the range test only after a connect, a plan deserialize and a *full*
+//! materialization into its [`StageCache`](crate::stage_cache::StageCache), and then answers
+//! `InvalidArgument`, which [`crate::retry`] classifies fatal — so the query dies having paid for
+//! the stage and learned nothing the coordinator did not already know. A checked constructor
+//! standing next to an unchecked one would leave the invariant opt-in, which is the shape being
+//! removed; [`LldbCodec::try_decode`] runs the same check on the way in, so a plan arriving from a
+//! peer that names a partition its own sub-plan does not have is refused rather than run.
 
 use std::any::Any;
 use std::collections::HashSet;
@@ -61,6 +73,7 @@ use datafusion::physical_plan::{
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use futures::TryStreamExt;
 use iceberg_datafusion::physical_plan::IcebergTableScan;
+use url::Url;
 
 use crate::flight;
 use crate::retry::RetryPolicy;
@@ -92,11 +105,14 @@ impl FlightReaderExec {
     /// This is the pre-fault-tolerance shape and it still means exactly what it always did: one
     /// worker, one chance. Use [`with_fallbacks`](Self::with_fallbacks) to hand the leaf the rest of
     /// the fleet.
+    ///
+    /// Errors if `remote_partition` is not a partition of `inner` — see the module header for why
+    /// that is refused here rather than discovered on the worker.
     pub fn new(
         worker_url: impl Into<String>,
         remote_partition: u32,
         inner: Arc<dyn ExecutionPlan>,
-    ) -> Self {
+    ) -> DFResult<Self> {
         Self::with_fallbacks(worker_url, Vec::new(), remote_partition, inner)
     }
 
@@ -106,12 +122,23 @@ impl FlightReaderExec {
     /// The primary is unchanged by the presence of fallbacks — placement policy stays with the
     /// staging planner, and this list only says *where else the same work is valid*, which is
     /// everywhere, because the stage is content-addressed and re-materializes identically.
+    ///
+    /// Errors if `remote_partition` is not a partition of `inner` — see the module header for why
+    /// that is refused here rather than discovered on the worker.
     pub fn with_fallbacks(
         worker_url: impl Into<String>,
         fallbacks: Vec<String>,
         remote_partition: u32,
         inner: Arc<dyn ExecutionPlan>,
-    ) -> Self {
+    ) -> DFResult<Self> {
+        let available = inner.properties().partitioning.partition_count();
+        if remote_partition as usize >= available {
+            return Err(DataFusionError::Internal(format!(
+                "FlightReaderExec would read partition {remote_partition} of a remote stage that \
+                 exposes {available}; the leaf and the sub-plan it names disagree, which is a bug \
+                 in whatever staged this plan"
+            )));
+        }
         let schema = inner.schema();
         // A remote read hands back the producer's partition batch-for-batch, in order — Flight is a
         // stream, not a set — so whatever ordering the remote plan guarantees *within* a partition
@@ -134,13 +161,13 @@ impl FlightReaderExec {
             EmissionType::Final,
             Boundedness::Bounded,
         ));
-        Self {
+        Ok(Self {
             worker_url: worker_url.into(),
             fallbacks,
             remote_partition,
             inner,
             properties,
-        }
+        })
     }
 
     pub fn worker_url(&self) -> &str {
@@ -161,20 +188,87 @@ impl FlightReaderExec {
         &self.inner
     }
 
-    /// Every worker this leaf may pull from, primary first, **deduplicated** preserving order.
+    /// Every worker this leaf may pull from, primary first, **deduplicated by
+    /// [`WorkerIdentity`]** preserving order.
     ///
     /// Dedup matters: the staging planner hands each leaf the rest of the fleet, and a fleet list
     /// that happens to contain the primary would otherwise spend one of the bounded attempts
-    /// re-dialing the node we already know is gone.
+    /// re-dialing the node we already know is gone. Comparing the strings is not enough to deliver
+    /// that, because two spellings of one node are not hypothetical — see [`WorkerIdentity`].
+    ///
+    /// The *survivor* is the original spelling, never the normalized one: the normalization exists
+    /// to answer "same node?", and what gets dialed is what the planner was configured with.
     fn candidates(&self) -> Vec<String> {
         let mut seen = HashSet::new();
         let mut out = Vec::with_capacity(1 + self.fallbacks.len());
         for url in std::iter::once(&self.worker_url).chain(self.fallbacks.iter()) {
-            if seen.insert(url.as_str()) {
+            if seen.insert(WorkerIdentity::of(url)) {
                 out.push(url.clone());
             }
         }
         out
+    }
+}
+
+/// What two spellings of the same worker have in common: the origin a dial actually routes on.
+///
+/// A worker URL is an **origin**. [`crate::tls::dial`] hands it to `Channel::from_shared`, which
+/// connects on scheme, host and port, and gRPC composes its own request path from the service and
+/// method — so `http://w:50051` and `http://w:50051/` are one node, differing only by the trailing
+/// slash a URL serializer adds, and `http://W:50051` is that node again because DNS does not
+/// distinguish case either.
+///
+/// Near-duplicate spellings are a fact of the fleet rather than a hypothetical:
+/// [`crate::discovery`] expands one DNS endpoint into one URL per task IP, and the fleet list a
+/// staged leaf carries is assembled from whatever an operator wrote on the command line beside it.
+/// Since attempts are bounded, one dead node spelled two ways burns two of them — exactly the waste
+/// the dedup exists to prevent.
+///
+/// [`Verbatim`](Self::Verbatim) is for a string `url` cannot parse. It keys on itself, and folding
+/// two such strings together on a guess would be worse than trying both: an unparseable URL fails
+/// at the dial as `http::uri::InvalidUri`, which [`crate::retry`] deliberately classifies *fatal*
+/// rather than replaying it across the fleet, so it costs one attempt and stops.
+#[derive(Debug, PartialEq, Eq, Hash)]
+enum WorkerIdentity {
+    Origin {
+        scheme: String,
+        host: String,
+        /// `port_or_known_default`, so `http://w` and `http://w:80` are one node. `None` only for a
+        /// scheme with no default port, which nothing here dials.
+        port: Option<u16>,
+    },
+    Verbatim(String),
+}
+
+impl WorkerIdentity {
+    fn of(url: &str) -> Self {
+        match Url::parse(url) {
+            // Parsing is not enough — the result has to *have* an origin. `w1:50051`, which is what
+            // an operator writes when they forget the scheme, parses happily as scheme `w1` with
+            // `50051` in its **path** and no host at all. Treating that as an origin would key every
+            // such spelling on `(scheme, "", None)`, so `w1:50051` and `w1:60000` would be one
+            // identity and the second worker would be silently dropped from the candidate list.
+            // Falling through to `Verbatim` is the same call made just below for the same reason:
+            // when we cannot say two strings are one node, trying both costs one bounded attempt
+            // and guessing wrong costs a worker.
+            // Parsing is not enough — the result has to *have* an origin. `w1:50051`, which is what
+            // an operator writes when they forget the scheme, parses happily as scheme `w1` with
+            // `50051` in its **path** and no host at all. Treating that as an origin would key every
+            // such spelling on `(scheme, "", None)`, so `w1:50051` and `w1:60000` would be one
+            // identity and the second worker would be silently dropped from the candidate list.
+            // Falling through to `Verbatim` is the same call made just below for the same reason:
+            // when we cannot say two strings are one node, trying both costs one bounded attempt
+            // and guessing wrong costs a worker.
+            Ok(parsed) => match parsed.host_str() {
+                Some(host) => Self::Origin {
+                    scheme: parsed.scheme().to_string(),
+                    host: host.to_string(),
+                    port: parsed.port_or_known_default(),
+                },
+                None => Self::Verbatim(url.to_string()),
+            },
+            Err(_) => Self::Verbatim(url.to_string()),
+        }
     }
 }
 
@@ -409,12 +503,14 @@ impl PhysicalExtensionCodec for LldbCodec {
         let inner = datafusion_proto::bytes::physical_plan_from_bytes_with_extension_codec(
             rest, ctx, self,
         )?;
+        // Through the checked constructor, so the range test the coordinator already made is made
+        // again here rather than trusted: these bytes came off a socket.
         Ok(Arc::new(FlightReaderExec::with_fallbacks(
             url,
             fallbacks,
             remote_partition,
             inner,
-        )))
+        )?))
     }
 
     fn try_encode(&self, node: Arc<dyn ExecutionPlan>, buf: &mut Vec<u8>) -> DFResult<()> {
@@ -431,19 +527,30 @@ impl PhysicalExtensionCodec for LldbCodec {
             )));
         }
 
-        buf.extend_from_slice(WIRE_MAGIC);
-        buf.push(FORMAT_VERSION);
-        put_str(buf, &reader.worker_url);
-        buf.extend_from_slice(&reader.remote_partition.to_le_bytes());
-        buf.extend_from_slice(&(reader.fallbacks.len() as u32).to_le_bytes());
+        // Built into a scratch buffer and appended once, at the end, because everything below this
+        // line can fail and `buf` belongs to the caller. `datafusion-proto` happens to discard it on
+        // error today — every caller does — but that is a caller invariant nobody wrote down and
+        // nothing enforces, and the failures are not theoretical: `put_str` refuses a string the
+        // length prefix cannot carry, and `encode_plan` refuses an un-encodable sub-plan, both after
+        // the header is already written. Appending on success alone means a failed encode is a
+        // no-op on `buf` whatever the caller does with it next.
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(WIRE_MAGIC);
+        encoded.push(FORMAT_VERSION);
+        put_str(&mut encoded, &reader.worker_url)?;
+        encoded.extend_from_slice(&reader.remote_partition.to_le_bytes());
+        // `as u32` is sound here and only here: the bound checked above is 1024.
+        encoded.extend_from_slice(&(reader.fallbacks.len() as u32).to_le_bytes());
         for fallback in &reader.fallbacks {
-            put_str(buf, fallback);
+            put_str(&mut encoded, fallback)?;
         }
         // `encode_plan`, not `serialize_plan`: the guidance walk in `serialize_plan` already
         // descended through this node's `inner` — that is precisely why it is hand-written — so
         // re-running it here would re-walk the same sub-tree once per level of nesting to find
         // what the top-level walk already proved absent.
-        buf.extend_from_slice(&encode_plan(Arc::clone(&reader.inner))?);
+        encoded.extend_from_slice(&encode_plan(Arc::clone(&reader.inner))?);
+
+        buf.append(&mut encoded);
         Ok(())
     }
 }
@@ -596,9 +703,31 @@ pub fn deserialize_plan(bytes: &[u8], ctx: &TaskContext) -> DFResult<Arc<dyn Exe
 }
 
 /// Append a length-prefixed string.
-fn put_str(buf: &mut Vec<u8>, s: &str) {
-    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+fn put_str(buf: &mut Vec<u8>, s: &str) -> DFResult<()> {
+    buf.extend_from_slice(&len_prefix(s.len())?.to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+    Ok(())
+}
+
+/// The `u32` length prefix for a `len`-byte field, or a refusal rather than a wrapped cast.
+///
+/// `len as u32` is unreachable-by-construction today — the only strings encoded here are worker
+/// URLs — but the failure it would produce is the one this wire format has already spent a version
+/// byte and a magic marker avoiding: a length that wraps writes a *shorter* prefix than the bytes
+/// that follow, so the decode succeeds, hands back a truncated URL, and the fleet dials somewhere
+/// that does not exist. Nothing downstream can tell that from a misconfiguration. An error names it
+/// at the only point where the truth is still known.
+///
+/// Split out of [`put_str`] because that is what makes the bound testable: proving `as u32` wraps
+/// needs a 4 GiB string, proving this needs an integer.
+fn len_prefix(len: usize) -> DFResult<u32> {
+    u32::try_from(len).map_err(|_| {
+        DataFusionError::Internal(format!(
+            "FlightReaderExec string field is {len} bytes, more than the {} its u32 length prefix \
+             can carry; encoding it would truncate the round trip instead of failing",
+            u32::MAX
+        ))
+    })
 }
 
 /// Consume and validate the leading [`WIRE_MAGIC`], returning everything after it.
@@ -703,6 +832,7 @@ mod tests {
     use datafusion::arrow::array::Int64Array;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
+    use datafusion::catalog::TableProvider;
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
@@ -731,11 +861,37 @@ mod tests {
             .unwrap()
     }
 
+    /// A local plan with exactly `partitions` output partitions, for the tests that need a
+    /// `remote_partition` other than 0 — which the constructor now range-checks.
+    ///
+    /// Built straight off the table provider rather than through SQL on purpose: the physical
+    /// optimizer's repartitioning is a function of the machine's core count, and a test that needs
+    /// "partition 3 exists" must not depend on how many cores CI has.
+    async fn sample_plan_with_partitions(
+        ctx: &SessionContext,
+        partitions: usize,
+    ) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]; partitions]).unwrap();
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(
+            plan.properties().partitioning.partition_count(),
+            partitions,
+            "test setup: the stand-in stage must really expose that many partitions"
+        );
+        plan
+    }
+
     #[tokio::test]
     async fn is_a_leaf_that_keeps_the_inner_schema() {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
-        let reader = FlightReaderExec::new("http://w:50051", 0, Arc::clone(&inner));
+        let reader = FlightReaderExec::new("http://w:50051", 0, Arc::clone(&inner)).unwrap();
 
         assert!(
             reader.children().is_empty(),
@@ -758,6 +914,7 @@ mod tests {
         );
         assert!(
             FlightReaderExec::new("http://w:50051", 0, unsorted)
+                .unwrap()
                 .properties()
                 .output_ordering()
                 .is_none(),
@@ -776,7 +933,7 @@ mod tests {
             .output_ordering()
             .expect("test setup: an ORDER BY plan is ordered")
             .clone();
-        let reader = FlightReaderExec::new("http://w:50051", 0, sorted);
+        let reader = FlightReaderExec::new("http://w:50051", 0, sorted).unwrap();
         assert_eq!(
             reader.properties().output_ordering(),
             Some(&expected),
@@ -787,9 +944,9 @@ mod tests {
     #[tokio::test]
     async fn round_trips_through_the_codec() {
         let ctx = SessionContext::new();
-        let inner = sample_plan(&ctx).await;
+        let inner = sample_plan_with_partitions(&ctx, 4).await;
         let plan: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://worker-2:50051", 3, inner));
+            Arc::new(FlightReaderExec::new("http://worker-2:50051", 3, inner).unwrap());
 
         let bytes = serialize_plan(Arc::clone(&plan)).expect("encode");
         let back = deserialize_plan(&bytes, ctx.task_ctx().as_ref()).expect("decode");
@@ -808,10 +965,10 @@ mod tests {
     #[tokio::test]
     async fn nested_remote_stages_survive() {
         let ctx = SessionContext::new();
-        let inner = sample_plan(&ctx).await;
-        let map = Arc::new(FlightReaderExec::new("http://map:50051", 1, inner));
+        let inner = sample_plan_with_partitions(&ctx, 2).await;
+        let map = Arc::new(FlightReaderExec::new("http://map:50051", 1, inner).unwrap());
         let reduce: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://reduce:50051", 0, map));
+            Arc::new(FlightReaderExec::new("http://reduce:50051", 0, map).unwrap());
 
         let bytes = serialize_plan(Arc::clone(&reduce)).expect("encode");
         let back = deserialize_plan(&bytes, ctx.task_ctx().as_ref()).expect("decode");
@@ -836,12 +993,67 @@ mod tests {
         assert!(take_str(&[9, 0, 0, 0, b'a']).is_err());
     }
 
+    /// A leaf naming a partition its sub-plan does not have is refused **here**, with no worker
+    /// involved. The alternative is the whole point: the same plan reaches a worker, connects,
+    /// deserializes, materializes the entire stage, and only then answers `InvalidArgument` — which
+    /// [`crate::retry`] classifies fatal, so the query dies at that cost with nothing learned.
+    #[tokio::test]
+    async fn a_partition_the_inner_plan_does_not_have_is_refused_locally() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan_with_partitions(&ctx, 2).await;
+
+        assert!(
+            FlightReaderExec::new("http://w:50051", 1, Arc::clone(&inner)).is_ok(),
+            "test premise: the last real partition must be accepted"
+        );
+        let err = FlightReaderExec::new("http://w:50051", 2, Arc::clone(&inner))
+            .expect_err("partition 2 of a 2-partition stage does not exist");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("partition 2") && msg.contains("exposes 2"),
+            "the refusal must name what was asked for and what exists; got: {msg}"
+        );
+
+        assert!(
+            FlightReaderExec::with_fallbacks(
+                "http://w1:50051",
+                vec!["http://w2:50051".into()],
+                7,
+                inner,
+            )
+            .is_err(),
+            "the fallback-carrying constructor is the same constructor"
+        );
+    }
+
+    /// The same check on the way *in*: these bytes came off a socket, so the range test the
+    /// coordinator made is made again rather than trusted.
+    #[tokio::test]
+    async fn a_decoded_leaf_naming_a_missing_partition_is_refused() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        // Hand-built, because a well-formed encoder cannot produce this payload any more.
+        let mut buf = header();
+        put_str(&mut buf, "http://w:50051").unwrap();
+        buf.extend_from_slice(&9u32.to_le_bytes()); // remote_partition
+        buf.extend_from_slice(&0u32.to_le_bytes()); // fallback_count
+        buf.extend_from_slice(&serialize_plan(inner).expect("inner plan"));
+
+        let err = codec
+            .try_decode(&buf, &[], &task_ctx)
+            .expect_err("a leaf whose partition its own sub-plan lacks must not be executed");
+        assert!(err.to_string().contains("partition 9"), "got: {err}");
+    }
+
     /// A leaf built by `new` has no failover targets — the pre-fault-tolerance meaning, preserved.
     #[tokio::test]
     async fn a_plain_reader_has_no_fallbacks() {
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
-        let reader = FlightReaderExec::new("http://w:50051", 0, inner);
+        let reader = FlightReaderExec::new("http://w:50051", 0, inner).unwrap();
         assert!(reader.fallbacks().is_empty());
         assert_eq!(reader.candidates(), vec!["http://w:50051".to_string()]);
     }
@@ -862,7 +1074,8 @@ mod tests {
             ],
             0,
             inner,
-        );
+        )
+        .unwrap();
         assert_eq!(
             reader.candidates(),
             vec![
@@ -873,19 +1086,95 @@ mod tests {
         );
     }
 
+    /// Two spellings of one worker are one candidate. `discovery.rs` expands a DNS endpoint into a
+    /// URL per task IP and an operator writes the fleet list by hand beside it, so a trailing slash
+    /// or a capital letter is a realistic way for the same node to appear twice — and since attempts
+    /// are bounded, a dead node spelled two ways burns two of them, which is the exact waste the
+    /// dedup exists to prevent.
+    #[tokio::test]
+    async fn candidates_are_deduplicated_by_host_identity_not_by_spelling() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let reader = FlightReaderExec::with_fallbacks(
+            "http://w1:50051",
+            vec![
+                "http://w1:50051/".into(), // the primary, with the slash a serializer adds
+                "http://W1:50051".into(),  // the primary again — DNS is case-insensitive
+                "http://w2:50051".into(),  // a genuinely different node
+                "http://w2:50051/".into(), // …and its other spelling
+                "https://w2:50051".into(), // a different scheme *is* a different endpoint
+                "http://w2".into(),        // port 80, so not w2:50051 either
+                "not a url at all".into(), // unparseable: kept, keyed on itself
+                "not a url at all".into(), // …but still only once
+                "also not a url".into(),
+            ],
+            0,
+            inner,
+        )
+        .unwrap();
+        assert_eq!(
+            reader.candidates(),
+            vec![
+                "http://w1:50051".to_string(),
+                "http://w2:50051".to_string(),
+                "https://w2:50051".to_string(),
+                "http://w2".to_string(),
+                "not a url at all".to_string(),
+                "also not a url".to_string(),
+            ],
+            "one node is one candidate, and the surviving spelling is the one we were handed"
+        );
+    }
+
+    /// A default port and an explicit one are the same endpoint; anything else about the URL is not
+    /// part of a worker's identity.
+    #[test]
+    fn a_workers_identity_is_its_scheme_host_and_port() {
+        assert_eq!(
+            WorkerIdentity::of("http://w:80"),
+            WorkerIdentity::of("http://w"),
+            "the scheme's default port is the port"
+        );
+        assert_eq!(
+            WorkerIdentity::of("https://w:443/"),
+            WorkerIdentity::of("https://W"),
+            "…and it is scheme-specific"
+        );
+        assert_ne!(
+            WorkerIdentity::of("http://w:50051"),
+            WorkerIdentity::of("https://w:50051"),
+            "a plaintext dial and a TLS dial are not interchangeable"
+        );
+        assert_ne!(
+            WorkerIdentity::of("://nonsense"),
+            WorkerIdentity::of("also nonsense"),
+            "two strings we cannot parse are not assumed to be one node"
+        );
+        // Parses, but into a scheme and a path with no host — the shape a forgotten `http://`
+        // produces. Keying these on their origin would make every one of them equal.
+        assert_ne!(
+            WorkerIdentity::of("w1:50051"),
+            WorkerIdentity::of("w1:60000"),
+            "a URL that parses without a host is not an origin, and two of them are not one node"
+        );
+    }
+
     #[tokio::test]
     async fn fallbacks_round_trip_through_the_codec() {
         let ctx = SessionContext::new();
-        let inner = sample_plan(&ctx).await;
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::with_fallbacks(
-            "http://worker-2:50051",
-            vec![
-                "http://worker-3:50051".into(),
-                "http://worker-4:50051".into(),
-            ],
-            3,
-            inner,
-        ));
+        let inner = sample_plan_with_partitions(&ctx, 4).await;
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            FlightReaderExec::with_fallbacks(
+                "http://worker-2:50051",
+                vec![
+                    "http://worker-3:50051".into(),
+                    "http://worker-4:50051".into(),
+                ],
+                3,
+                inner,
+            )
+            .unwrap(),
+        );
 
         let bytes = serialize_plan(Arc::clone(&plan)).expect("encode");
         let back = deserialize_plan(&bytes, ctx.task_ctx().as_ref()).expect("decode");
@@ -909,12 +1198,9 @@ mod tests {
         // The one-worker-fleet shape: a zero count, then straight into the inner plan bytes.
         let ctx = SessionContext::new();
         let inner = sample_plan(&ctx).await;
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::with_fallbacks(
-            "http://only:50051",
-            Vec::new(),
-            0,
-            inner,
-        ));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(
+            FlightReaderExec::with_fallbacks("http://only:50051", Vec::new(), 0, inner).unwrap(),
+        );
 
         let bytes = serialize_plan(Arc::clone(&plan)).expect("encode");
         let back = deserialize_plan(&bytes, ctx.task_ctx().as_ref()).expect("decode");
@@ -935,15 +1221,15 @@ mod tests {
 
         // url "u", partition 0, promises 2 fallbacks, then runs out after one.
         let mut truncated = header();
-        put_str(&mut truncated, "u");
+        put_str(&mut truncated, "u").unwrap();
         truncated.extend_from_slice(&0u32.to_le_bytes());
         truncated.extend_from_slice(&2u32.to_le_bytes());
-        put_str(&mut truncated, "http://w:50051");
+        put_str(&mut truncated, "http://w:50051").unwrap();
         assert!(codec.try_decode(&truncated, &[], &task_ctx).is_err());
 
         // A count far beyond the bound is refused outright.
         let mut absurd = header();
-        put_str(&mut absurd, "u");
+        put_str(&mut absurd, "u").unwrap();
         absurd.extend_from_slice(&0u32.to_le_bytes());
         absurd.extend_from_slice(&u32::MAX.to_le_bytes());
         let err = codec
@@ -959,16 +1245,19 @@ mod tests {
     #[tokio::test]
     async fn the_payload_leads_with_the_format_version_and_round_trips() {
         let ctx = SessionContext::new();
-        let inner = sample_plan(&ctx).await;
+        let inner = sample_plan_with_partitions(&ctx, 4).await;
         let task_ctx = ctx.task_ctx();
         let codec = LldbCodec;
 
-        let node: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::with_fallbacks(
-            "http://worker-2:50051",
-            vec!["http://worker-3:50051".into()],
-            3,
-            inner,
-        ));
+        let node: Arc<dyn ExecutionPlan> = Arc::new(
+            FlightReaderExec::with_fallbacks(
+                "http://worker-2:50051",
+                vec!["http://worker-3:50051".into()],
+                3,
+                inner,
+            )
+            .unwrap(),
+        );
         let mut buf = Vec::new();
         codec
             .try_encode(Arc::clone(&node), &mut buf)
@@ -1004,7 +1293,7 @@ mod tests {
         let codec = LldbCodec;
 
         let node: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner));
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner).unwrap());
         let mut buf = Vec::new();
         codec.try_encode(node, &mut buf).expect("encode");
 
@@ -1046,7 +1335,7 @@ mod tests {
         let inner = sample_plan(&ctx).await;
         // Distinctive enough to locate unambiguously inside the proto blob.
         let url = "http://version-probe:50051";
-        let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(url, 0, inner));
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(url, 0, inner).unwrap());
         let mut bytes = serialize_plan(plan).expect("encode");
 
         // The extension payload is `magic | version | u32 LE url_len | url | …`, so the version
@@ -1114,7 +1403,7 @@ mod tests {
         let codec = LldbCodec;
 
         let node: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner));
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner).unwrap());
         let mut buf = Vec::new();
         codec.try_encode(node, &mut buf).expect("encode");
         buf[0] = b'X';
@@ -1153,7 +1442,7 @@ mod tests {
         // Exactly the pre-version encoding: no magic, no version, straight into `u32 LE url_len`.
         // A one-character url is what makes the low byte collide.
         let mut legacy = Vec::new();
-        put_str(&mut legacy, "u");
+        put_str(&mut legacy, "u").unwrap();
         legacy.extend_from_slice(&0u32.to_le_bytes()); // remote_partition
         legacy.extend_from_slice(&0u32.to_le_bytes()); // fallback_count
         legacy.extend_from_slice(&serialize_plan(inner).expect("inner plan"));
@@ -1262,6 +1551,58 @@ mod tests {
         assert!(LldbCodec.try_encode(plan, &mut buf).is_err());
     }
 
+    /// `buf` belongs to the caller, and a failed encode must be a no-op on it. Every current caller
+    /// happens to discard the buffer on error — that is an invariant nobody wrote down and nothing
+    /// enforced, and this is what replaces it.
+    ///
+    /// The failure is provoked where it really lives: the header, url, partition and fallbacks are
+    /// all written before `encode_plan` is asked for the sub-plan, so an un-encodable `inner` is
+    /// exactly a mid-write error.
+    #[test]
+    fn a_failed_encode_leaves_the_callers_buffer_untouched() {
+        let staged: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, imposter()).unwrap());
+
+        // Non-empty on the way in, so the assertion distinguishes "appended nothing" from
+        // "truncated to empty".
+        let prior = b"bytes the caller already had".to_vec();
+        let mut buf = prior.clone();
+        LldbCodec
+            .try_encode(staged, &mut buf)
+            .expect_err("the sub-plan is un-encodable, so the encode must fail");
+        assert_eq!(
+            buf, prior,
+            "a failed encode must not leave a partial payload in the caller's buffer"
+        );
+    }
+
+    /// The bound [`put_str`] enforces, tested at the seam that makes it testable at all: proving
+    /// `s.len() as u32` wraps would need a 4 GiB string, proving [`len_prefix`] refuses needs an
+    /// integer. Unreachable with worker URLs — the point is that a wrapped length writes a *shorter*
+    /// prefix than the bytes behind it, so the decode succeeds and hands back a truncated URL, which
+    /// is indistinguishable from a misconfigured fleet.
+    ///
+    /// 64-bit only because on a 32-bit target `usize::MAX == u32::MAX`, so there is no length to
+    /// refuse and the expression below would overflow rather than test anything.
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn a_string_longer_than_the_length_prefix_can_carry_is_refused() {
+        assert_eq!(len_prefix(0).unwrap(), 0);
+        assert_eq!(
+            len_prefix(u32::MAX as usize).unwrap(),
+            u32::MAX,
+            "the largest representable length is still legal"
+        );
+
+        let too_long = u32::MAX as usize + 1;
+        let err = len_prefix(too_long).expect_err("one byte past the prefix must not wrap");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&too_long.to_string()) && msg.contains("truncate"),
+            "the refusal must name the length and what it would otherwise do; got: {msg}"
+        );
+    }
+
     /// The mechanism this file exists to guarantee: a refusal with guidance is raised *before*
     /// `physical_plan_to_bytes_with_extension_codec` is entered, so nothing wraps it.
     ///
@@ -1287,7 +1628,7 @@ mod tests {
     #[test]
     fn the_walk_descends_into_a_remote_stages_sub_plan() {
         let staged: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://w:50051", 0, imposter()));
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, imposter()).unwrap());
         assert!(
             staged.children().is_empty(),
             "test setup: the sub-plan must be invisible to a children-only walk, or this proves \

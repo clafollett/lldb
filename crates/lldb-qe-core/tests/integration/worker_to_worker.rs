@@ -92,7 +92,7 @@ async fn a_worker_pulls_from_another_worker() -> anyhow::Result<()> {
     let scan = Arc::new(CoalescePartitionsExec::new(scan));
 
     // Stage 2 (runs on the reduce worker): read stage 1 *from the map worker*.
-    let stage2: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, scan));
+    let stage2: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, scan)?);
 
     // The coordinator asks only the reduce worker. For it to answer, it must decode the
     // FlightReaderExec leaf and pull from the map worker itself.
@@ -146,7 +146,7 @@ async fn aggregation_reduces_on_a_worker() -> anyhow::Result<()> {
         .create_physical_plan()
         .await?;
     let map = Arc::new(CoalescePartitionsExec::new(map));
-    let remote_map: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, map));
+    let remote_map: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, map)?);
 
     // Reduce stage: the coordinator asks the reduce worker, which pulls the map output.
     let batches = flight::fetch(&reduce_worker, 0, remote_map).await?;

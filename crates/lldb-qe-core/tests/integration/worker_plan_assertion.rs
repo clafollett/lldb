@@ -340,7 +340,7 @@ async fn a_worker_forwards_the_assertion_to_the_worker_it_pulls_from() -> Result
     let scan = Arc::new(CoalescePartitionsExec::new(
         scan_plan(&orders, "orders").await?,
     ));
-    let stage2: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, scan));
+    let stage2: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(&map_worker, 0, scan)?);
 
     // Minted from the *outer* plan, which is what a coordinator has. It covers the scan's files
     // because the read walk descends into a remote stage's inner plan — without that, this pull
@@ -412,7 +412,7 @@ async fn a_reassigned_stage_carries_the_assertion_to_the_worker_that_serves_it()
         vec![healthy.clone()],
         0,
         scan,
-    ));
+    )?);
 
     let assertion = mint(&secret, "alice", &staged, SystemTime::now());
     let ctx = SessionContext::new();

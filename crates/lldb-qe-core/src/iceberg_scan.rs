@@ -566,7 +566,7 @@ mod tests {
         let (ctx, _lake) = seeded(tmp.path(), 4).await?;
         let plan = physical(&ctx, &format!("SELECT id, label FROM lldb.{NS}.orders")).await?;
         let staged: Arc<dyn ExecutionPlan> =
-            Arc::new(FlightReaderExec::new("http://worker-1:50051", 0, plan));
+            Arc::new(FlightReaderExec::new("http://worker-1:50051", 0, plan)?);
 
         let err = serialize_plan(staged)
             .expect_err("an unresolved scan is un-encodable wherever it sits in the plan");
