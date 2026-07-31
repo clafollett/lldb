@@ -175,7 +175,9 @@ impl std::fmt::Debug for ServicesArgs {
 }
 
 /// What a redacted secret prints as.
-const REDACTED: &str = "****";
+/// One spelling of "a secret was here", shared with [`crate::discovery`] so that a redacted worker
+/// endpoint and a redacted connection URL look the same in a log.
+pub(crate) const REDACTED: &str = "****";
 
 /// Placeholder for a URL that could not be parsed. An unparseable string might still *contain* a
 /// password, so it is dropped whole rather than echoed.
@@ -425,10 +427,24 @@ impl From<(i64, String, DateTime<Utc>)> for Account {
 ///
 /// Never panics and never leaks: input it cannot parse is dropped entirely rather than echoed,
 /// because a malformed string is exactly as likely to contain a credential as a well-formed one.
+///
+/// **`password()` is not on its own enough to conclude there is no password.** A URL written
+/// without its `//` — `postgres:hunter2@db.internal:5432/lldb`, which is a plausible typing of a
+/// `LLDB_METADATA_URL` — parses perfectly happily as scheme `postgres` with an *opaque path*, so
+/// there is no authority for `url` to have found a credential in, `password()` answers `None`, and
+/// returning the string as "nothing to hide" echoes the password in full. Such a URL has no host
+/// either, which is what the host check below keys on; found while closing #124, whose worker-URL
+/// half is the same mistake one layer up.
 pub fn redact_url(url: &str) -> String {
     let Ok(mut parsed) = Url::parse(url) else {
         return UNPARSEABLE_URL.to_string();
     };
+    if parsed.host_str().is_none() {
+        // No authority, so nothing above proves anything about a credential in the text. This is
+        // not a connection URL we could use in any case — `sqlx` needs a host — so drop it whole,
+        // which is this function's existing answer for a string it cannot vouch for.
+        return UNPARSEABLE_URL.to_string();
+    }
     if parsed.password().is_none() {
         return parsed.into();
     }
@@ -571,8 +587,18 @@ mod tests {
 
     #[test]
     fn redact_url_never_echoes_garbage() {
-        // A string that isn't a URL may still be a password-bearing typo; drop it whole.
-        for garbage in ["", "not a url", "://:hunter2@", "postgres://[bad"] {
+        // A string that isn't a URL may still be a password-bearing typo; drop it whole. The last
+        // two *do* parse — as a scheme with an opaque path — and are the #124 shape: `password()`
+        // is `None` and the password is in the text regardless, so "no password" must be concluded
+        // from the presence of an authority and not from `password()` alone.
+        for garbage in [
+            "",
+            "not a url",
+            "://:hunter2@",
+            "postgres://[bad",
+            "postgres:hunter2@db.internal:5432/lldb",
+            "postgres:lldb:hunter2@db.internal/lldb",
+        ] {
             let redacted = redact_url(garbage);
             assert_eq!(redacted, UNPARSEABLE_URL, "input: {garbage}");
             assert!(!redacted.contains("hunter2"));

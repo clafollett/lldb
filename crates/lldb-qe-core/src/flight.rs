@@ -114,6 +114,7 @@ use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::auth::{AUTHORIZATION_HEADER, AuthError, FleetAuth, bearer_header, bearer_token};
+use crate::discovery::redact_endpoint;
 use crate::plan_assertion::{
     AssertionError, PLAN_ASSERTION_HEADER, PlanAuth, SignedAssertion, VerifiedAssertion,
 };
@@ -701,10 +702,12 @@ async fn fetch_partition(
         assertion,
     )
     .await?;
-    stream
-        .try_collect::<Vec<_>>()
-        .await
-        .with_context(|| format!("streaming partition {partition} from worker {worker_url}"))
+    stream.try_collect::<Vec<_>>().await.with_context(|| {
+        format!(
+            "streaming partition {partition} from worker {}",
+            redact_endpoint(&worker_url)
+        )
+    })
 }
 
 /// Fetch one partition of an already-serialized plan, walking `candidates` until one answers.
@@ -864,7 +867,7 @@ pub async fn fetch_stream_with(
     // security. See [`crate::tls`].
     let channel = crate::tls::dial(&worker_url)
         .await
-        .with_context(|| format!("dialing worker {worker_url}"))?;
+        .with_context(|| format!("dialing worker {}", redact_endpoint(&worker_url)))?;
     let mut client = FlightServiceClient::new(channel);
 
     // The credential rides in the request metadata, never in the ticket: a ticket is hashed into a
@@ -893,7 +896,7 @@ pub async fn fetch_stream_with(
     let flight_data = client
         .do_get(request)
         .await
-        .with_context(|| format!("do_get request to worker {worker_url}"))?
+        .with_context(|| format!("do_get request to worker {}", redact_endpoint(&worker_url)))?
         .into_inner()
         .map_err(|status| FlightError::ExternalError(Box::new(status)));
 
