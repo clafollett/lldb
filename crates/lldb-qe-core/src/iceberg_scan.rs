@@ -433,7 +433,9 @@ mod tests {
     use crate::manifest::{
         CatalogBackend, CatalogDef, ColumnDef, Manifest, NamespaceDef, TableDef,
     };
-    use crate::remote::{deserialize_plan, serialize_plan};
+    use crate::remote::{
+        FlightReaderExec, assert_no_datafusion_wrapper, deserialize_plan, serialize_plan,
+    };
     use crate::scan_split::split_scan;
     use crate::storage::StorageConfig;
     use crate::tenancy::TenantScope;
@@ -526,9 +528,9 @@ mod tests {
         let plan = physical(&ctx, &format!("SELECT id, label FROM lldb.{NS}.orders")).await?;
 
         // Bypassing this module is still an error — but one that names the step that was skipped
-        // rather than reading as "Iceberg is unsupported". (`LldbCodec::try_encode`'s side of this
-        // lives in `remote::encode_failure`; it is asserted here because building a real
-        // `IcebergTableScan` needs a real catalog, which this module's tests already have.)
+        // rather than reading as "Iceberg is unsupported". (The wording lives in
+        // `remote::guided_refusal`; it is asserted here because building a real `IcebergTableScan`
+        // needs a real catalog, which this module's tests already have.)
         let err = serialize_plan(Arc::clone(&plan))
             .expect_err("an IcebergTableScan has no encoding — that is the bug");
         let message = err.to_string();
@@ -537,6 +539,7 @@ mod tests {
             message.contains("resolve_iceberg_scans"),
             "the error must name the fix: {message}"
         );
+        assert_no_datafusion_wrapper(&message);
 
         let resolved = resolve_iceberg_scans(&ctx, Arc::clone(&plan)).await?;
         assert!(!has_iceberg_scan(&resolved), "the scan must be replaced");
@@ -549,6 +552,30 @@ mod tests {
             scanned_data_files(&resolved),
             "the snapshot's file list must survive the wire — that is what pins it"
         );
+        Ok(())
+    }
+
+    /// The same refusal, reached from inside a remote stage — the shape a staging planner produces
+    /// and the one a children-only walk misses, because a `FlightReaderExec`'s sub-plan is
+    /// deliberately not a child. It is also the likeliest way to bypass this module: the top of the
+    /// plan is perfectly encodable and only the sub-plan is not.
+    #[tokio::test]
+    async fn an_iceberg_scan_inside_a_remote_stage_is_refused_with_the_same_guidance() -> Result<()>
+    {
+        let tmp = tempfile::tempdir()?;
+        let (ctx, _lake) = seeded(tmp.path(), 4).await?;
+        let plan = physical(&ctx, &format!("SELECT id, label FROM lldb.{NS}.orders")).await?;
+        let staged: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://worker-1:50051", 0, plan));
+
+        let err = serialize_plan(staged)
+            .expect_err("an unresolved scan is un-encodable wherever it sits in the plan");
+        let message = err.to_string();
+        assert!(
+            message.contains("resolve_iceberg_scans"),
+            "the error must name the fix even from inside a stage: {message}"
+        );
+        assert_no_datafusion_wrapper(&message);
         Ok(())
     }
 
