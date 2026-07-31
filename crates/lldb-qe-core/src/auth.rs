@@ -119,7 +119,11 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-use crate::rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization};
+// Straight from `lldb_qe_types`, deliberately NOT via `crate::rbac` — that module re-exports these
+// but also pulls in DataFusion for its plan walk, and this one has no business needing a query
+// engine to look up a grant. Same rule as `crate::config`'s `StorageConfig` import.
+use lldb_qe_types::rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization};
+
 use crate::services::ServicesDb;
 
 // ---------------------------------------------------------------------------
@@ -807,7 +811,7 @@ impl ServicesDb {
         privilege: Privilege,
         object: &ObjectRef,
     ) -> Result<()> {
-        crate::rbac::validate_object_name(object.object_type, &object.name)?;
+        lldb_qe_types::rbac::validate_object_name(object.object_type, &object.name)?;
         sqlx::query(
             "INSERT INTO grants (account_id, role_id, privilege, object_type, object_name) \
              VALUES ($1, $2, $3, $4, $5) \

@@ -51,7 +51,7 @@ use lldb_qe_core::manifest::{
 };
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
-    FlightReaderExec, Lakehouse, StageCache, StorageConfig, TableSource, apply_manifest,
+    FlightReaderExec, Lakehouse, StageCache, Storage, StorageConfig, TableSource, apply_manifest,
     contains_flight_reader, execute_query, plan_distributed, resolve_iceberg_scans,
     scanned_data_files, stage_id_of,
 };
@@ -172,7 +172,7 @@ async fn seeded(
     customers: i64,
 ) -> anyhow::Result<(SessionContext, Lakehouse)> {
     let ctx = distributing_ctx();
-    let storage = StorageConfig::Local(warehouse.to_path_buf()).build()?;
+    let storage = Storage::from_config(&StorageConfig::Local(warehouse.to_path_buf()))?;
     let mut lakes = apply_manifest(
         &ctx,
         &storage,

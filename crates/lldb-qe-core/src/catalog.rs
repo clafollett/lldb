@@ -245,7 +245,8 @@ mod tests {
 
     #[test]
     fn resolve_passes_through_urls_and_absolute() -> Result<()> {
-        let storage = crate::storage::StorageConfig::InMemory.build()?;
+        let storage =
+            crate::storage::Storage::from_config(&crate::storage::StorageConfig::InMemory)?;
         assert_eq!(
             resolve_source_path(&storage, "s3://b/x.parquet")?,
             "s3://b/x.parquet"

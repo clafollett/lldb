@@ -16,7 +16,7 @@ use crate::tpch::TPCH_TABLES;
 /// Returns the context plus the [`Storage`] handle — needed to resolve table paths and, for
 /// the in-memory backend, to seed data.
 pub async fn build_session(config: StorageConfig) -> Result<(SessionContext, Storage)> {
-    let storage = config.build()?;
+    let storage = Storage::from_config(&config)?;
     let ctx = SessionContext::new();
     storage.register_on(&ctx)?;
     Ok((ctx, storage))

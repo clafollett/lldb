@@ -9,6 +9,7 @@ authors.workspace = true
 description = "Core library for lldb: storage abstraction, session/catalog setup, and execution nodes."
 
 [dependencies]
+lldb-qe-types = { path = "../lldb-qe-types" }
 datafusion.workspace = true
 datafusion-proto.workspace = true
 iceberg.workspace = true
