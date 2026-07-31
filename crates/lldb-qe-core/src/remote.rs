@@ -192,9 +192,13 @@ impl DisplayAs for FlightReaderExec {
     }
 }
 
+/// The name [`FlightReaderExec`] reports, named once because [`encode_failure`] keys a diagnostic
+/// off it and the two must not drift apart.
+const FLIGHT_READER_EXEC_NAME: &str = "FlightReaderExec";
+
 impl ExecutionPlan for FlightReaderExec {
     fn name(&self) -> &str {
-        "FlightReaderExec"
+        FLIGHT_READER_EXEC_NAME
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -312,12 +316,21 @@ impl ExecutionPlan for FlightReaderExec {
 /// into an error instead of an allocation.
 const MAX_ENCODED_FALLBACKS: u32 = 1024;
 
+/// Wire format version, leading every encoded [`FlightReaderExec`].
+///
+/// Bumped whenever the encoding below changes; a decoder refuses anything else rather than guessing,
+/// exactly as [`crate::plan_assertion`] does with its own payload. Note what a mismatch *means*
+/// here: this byte is written and read by the same build, so seeing another value at all says the
+/// two ends of a Flight hop are not the same binary.
+const FORMAT_VERSION: u8 = 1;
+
 /// Extension codec that teaches `datafusion_proto` about [`FlightReaderExec`].
 ///
 /// Wire format:
 ///
 /// ```text
-/// u32 LE url_len | url | u32 LE remote_partition
+/// u8 FORMAT_VERSION
+///   | u32 LE url_len | url | u32 LE remote_partition
 ///   | u32 LE fallback_count | (u32 LE len | url)*
 ///   | serialized inner plan
 /// ```
@@ -325,9 +338,13 @@ const MAX_ENCODED_FALLBACKS: u32 = 1024;
 /// The fallback list sits **before** the inner plan because the plan is "the rest of the buffer" —
 /// it has no length prefix of its own, so anything variable-length has to precede it.
 ///
-/// There is no backward-compatibility obligation across this change: the coordinator and every
-/// worker run the identical build (`CLAUDE.md`), which the Flight boundary already requires for
-/// DataFusion plan bytes to mean the same thing on both ends.
+/// There is no backward-compatibility obligation across a bump, and the version byte does not
+/// create one: the coordinator and every worker must run the identical build (`CLAUDE.md`), which
+/// the Flight boundary already requires for DataFusion plan bytes to mean the same thing on both
+/// ends. What the byte buys is the *failure*. Without it a fleet running two builds fed a changed
+/// field layout into an unchanged buffer shape and parsed it into garbage; with it the decode
+/// refuses up front and names both versions, so "your fleet is not one build" is read off the error
+/// rather than inferred from a wrong answer.
 ///
 /// The output schema is *not* encoded — it is recovered by deserializing the inner plan and
 /// asking it, which keeps the two from ever disagreeing. Encoding the inner plan recurses
@@ -342,7 +359,21 @@ impl PhysicalExtensionCodec for LldbCodec {
         _inputs: &[Arc<dyn ExecutionPlan>],
         ctx: &TaskContext,
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
-        let (url, rest) = take_str(buf)?;
+        let (version, rest) = take_u8(buf)?;
+        if version != FORMAT_VERSION {
+            // `Execution`, not `Internal` like its neighbours below: `Internal`'s `Display` appends
+            // "likely caused by a bug in DataFusion's code, please file a bug report", which is
+            // precisely the wrong thing to tell the one person who can fix this. A version mismatch
+            // is a deployment fact, not a code defect.
+            return Err(DataFusionError::Execution(format!(
+                "FlightReaderExec wire format version {version}, but this build speaks \
+                 {FORMAT_VERSION}: the plan came from a different build of lldb than this process \
+                 is running. Your fleet is not one build — every coordinator and worker must run \
+                 the identical binary, so check that a rolling deploy finished and that every role \
+                 runs one image tag."
+            )));
+        }
+        let (url, rest) = take_str(rest)?;
         let (remote_partition, rest) = take_u32(rest)?;
         let (fallback_count, mut rest) = take_u32(rest)?;
         if fallback_count > MAX_ENCODED_FALLBACKS {
@@ -383,6 +414,7 @@ impl PhysicalExtensionCodec for LldbCodec {
             )));
         }
 
+        buf.push(FORMAT_VERSION);
         put_str(buf, &reader.worker_url);
         buf.extend_from_slice(&reader.remote_partition.to_le_bytes());
         buf.extend_from_slice(&(reader.fallbacks.len() as u32).to_le_bytes());
@@ -403,7 +435,23 @@ impl PhysicalExtensionCodec for LldbCodec {
 /// staged. Reaching the codec with one still in the plan means some path bypassed that funnel —
 /// which is worth saying out loud, since the generic "cannot encode IcebergTableScan" reads like
 /// "Iceberg is unsupported" and would send someone off to write a codec that should not exist.
+///
+/// A node *named* [`FlightReaderExec`] gets its own message for a sharper reason: the generic one
+/// would be a flat lie. This codec encodes exactly that node, so "cannot encode FlightReaderExec"
+/// denies something true and sends the reader hunting for a missing feature. The only way to reach
+/// it is for the `TypeId`s to differ — two builds of the defining crate in one dependency graph —
+/// so the name is all there is to go on, precisely because the type identity that would normally
+/// answer the question is the thing that has broken.
 fn encode_failure(node: &Arc<dyn ExecutionPlan>) -> DataFusionError {
+    if node.name() == FLIGHT_READER_EXEC_NAME {
+        return DataFusionError::Execution(format!(
+            "LldbCodec was handed a node calling itself {FLIGHT_READER_EXEC_NAME}, which this codec \
+             does encode — so it is not the {FLIGHT_READER_EXEC_NAME} this build defines. Two \
+             versions of lldb-qe-core are linked into this process: your fleet is not one build. \
+             Run `cargo tree -d` to name the duplicate, and check that every coordinator and worker \
+             runs one image tag."
+        ));
+    }
     if node.as_any().downcast_ref::<IcebergTableScan>().is_some() {
         return DataFusionError::NotImplemented(
             "LldbCodec cannot encode IcebergTableScan: it holds a live catalog handle and resolves \
@@ -433,6 +481,16 @@ pub fn deserialize_plan(bytes: &[u8], ctx: &TaskContext) -> DFResult<Arc<dyn Exe
 fn put_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+}
+
+fn take_u8(buf: &[u8]) -> DFResult<(u8, &[u8])> {
+    match buf.split_first() {
+        Some((first, rest)) => Ok((*first, rest)),
+        None => Err(DataFusionError::Internal(
+            "truncated FlightReaderExec payload: empty, so not even a format version byte"
+                .to_string(),
+        )),
+    }
 }
 
 fn take_u32(buf: &[u8]) -> DFResult<(u32, &[u8])> {
@@ -692,7 +750,7 @@ mod tests {
         let codec = LldbCodec;
 
         // url "u", partition 0, promises 2 fallbacks, then runs out after one.
-        let mut truncated = Vec::new();
+        let mut truncated = vec![FORMAT_VERSION];
         put_str(&mut truncated, "u");
         truncated.extend_from_slice(&0u32.to_le_bytes());
         truncated.extend_from_slice(&2u32.to_le_bytes());
@@ -700,7 +758,7 @@ mod tests {
         assert!(codec.try_decode(&truncated, &[], &task_ctx).is_err());
 
         // A count far beyond the bound is refused outright.
-        let mut absurd = Vec::new();
+        let mut absurd = vec![FORMAT_VERSION];
         put_str(&mut absurd, "u");
         absurd.extend_from_slice(&0u32.to_le_bytes());
         absurd.extend_from_slice(&u32::MAX.to_le_bytes());
@@ -710,6 +768,214 @@ mod tests {
         assert!(
             err.to_string().contains("exceeds the maximum"),
             "got: {err}"
+        );
+    }
+
+    /// The version byte leads the payload and survives a direct codec round trip.
+    #[tokio::test]
+    async fn the_payload_leads_with_the_format_version_and_round_trips() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        let node: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::with_fallbacks(
+            "http://worker-2:50051",
+            vec!["http://worker-3:50051".into()],
+            3,
+            inner,
+        ));
+        let mut buf = Vec::new();
+        codec
+            .try_encode(Arc::clone(&node), &mut buf)
+            .expect("encode");
+
+        assert_eq!(
+            buf.first(),
+            Some(&FORMAT_VERSION),
+            "the version must be the first byte, so a decoder can check it before anything else"
+        );
+
+        let back = codec.try_decode(&buf, &[], &task_ctx).expect("decode");
+        let back = back
+            .as_any()
+            .downcast_ref::<FlightReaderExec>()
+            .expect("still a FlightReaderExec");
+        assert_eq!(back.worker_url(), "http://worker-2:50051");
+        assert_eq!(back.remote_partition(), 3);
+        assert_eq!(back.fallbacks(), ["http://worker-3:50051"]);
+    }
+
+    /// A payload from another build is refused, and the refusal names both versions — the fleet is
+    /// running two binaries, and the error has to be readable as exactly that.
+    #[tokio::test]
+    async fn a_foreign_format_version_is_refused_naming_both_versions() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        let node: Arc<dyn ExecutionPlan> =
+            Arc::new(FlightReaderExec::new("http://w:50051", 0, inner));
+        let mut buf = Vec::new();
+        codec.try_encode(node, &mut buf).expect("encode");
+
+        // Everything after the first byte is a payload this build understands perfectly. Only the
+        // version differs — which is the whole failure mode: same shape, different meaning.
+        let foreign = FORMAT_VERSION.wrapping_add(7);
+        buf[0] = foreign;
+
+        let err = codec
+            .try_decode(&buf, &[], &task_ctx)
+            .expect_err("a payload from another build must be refused, not parsed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!("version {foreign}")),
+            "the error must name the version in the bytes; got: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("speaks {FORMAT_VERSION}")),
+            "the error must name the version this build expects; got: {msg}"
+        );
+        assert!(
+            msg.contains("fleet is not one build"),
+            "the error must say what a mismatch always means; got: {msg}"
+        );
+        assert!(
+            !msg.contains("datafusion/issues"),
+            "a deployment fact must not be reported as a DataFusion bug; got: {msg}"
+        );
+    }
+
+    /// The refusal has to survive the path that actually runs. A worker never calls
+    /// [`LldbCodec::try_decode`] itself — it calls [`deserialize_plan`], and `datafusion-proto`
+    /// sits in between. This flips the version byte inside a real serialized plan and demands the
+    /// message still arrives intact.
+    #[tokio::test]
+    async fn the_refusal_survives_the_real_deserialize_path() {
+        let ctx = SessionContext::new();
+        let inner = sample_plan(&ctx).await;
+        // Distinctive enough to locate unambiguously inside the proto blob.
+        let url = "http://version-probe:50051";
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(FlightReaderExec::new(url, 0, inner));
+        let mut bytes = serialize_plan(plan).expect("encode");
+
+        // The extension payload is `version | u32 LE url_len | url | …`, so the version byte sits
+        // five bytes ahead of the url. Asserted rather than assumed, so a format change fails here
+        // instead of quietly testing nothing.
+        let at = bytes
+            .windows(url.len())
+            .position(|w| w == url.as_bytes())
+            .expect("the url is in the serialized plan");
+        let version_at = at - 5;
+        assert_eq!(
+            bytes[version_at], FORMAT_VERSION,
+            "expected the version byte five bytes ahead of the url"
+        );
+        bytes[version_at] = FORMAT_VERSION.wrapping_add(1);
+
+        let err = deserialize_plan(&bytes, ctx.task_ctx().as_ref())
+            .expect_err("a plan from another build must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("fleet is not one build")
+                && msg.contains(&format!("speaks {FORMAT_VERSION}")),
+            "the refusal must reach the caller intact through datafusion-proto; got: {msg}"
+        );
+    }
+
+    /// Nothing after the version byte, and nothing at all: both are errors, neither is a panic.
+    #[tokio::test]
+    async fn a_payload_truncated_at_or_before_the_version_errors_rather_than_panics() {
+        let ctx = SessionContext::new();
+        let task_ctx = ctx.task_ctx();
+        let codec = LldbCodec;
+
+        assert!(take_u8(&[]).is_err(), "an empty buffer has no version byte");
+        assert!(
+            codec.try_decode(&[], &[], &task_ctx).is_err(),
+            "an empty payload must not panic"
+        );
+        assert!(
+            codec.try_decode(&[FORMAT_VERSION], &[], &task_ctx).is_err(),
+            "a version byte with no url behind it must not panic"
+        );
+    }
+
+    /// A *different type* that calls itself `FlightReaderExec` — which is exactly what a second
+    /// version of `lldb-qe-core` in one dependency graph looks like from the codec's side: the name
+    /// matches, the `TypeId` does not, and the downcast returns `None`.
+    #[derive(Debug)]
+    struct ImposterFlightReader(Arc<PlanProperties>);
+
+    impl DisplayAs for ImposterFlightReader {
+        fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
+            write!(f, "{FLIGHT_READER_EXEC_NAME}")
+        }
+    }
+
+    impl ExecutionPlan for ImposterFlightReader {
+        fn name(&self) -> &str {
+            FLIGHT_READER_EXEC_NAME
+        }
+
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn properties(&self) -> &Arc<PlanProperties> {
+            &self.0
+        }
+
+        fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
+            vec![]
+        }
+
+        fn with_new_children(
+            self: Arc<Self>,
+            _children: Vec<Arc<dyn ExecutionPlan>>,
+        ) -> DFResult<Arc<dyn ExecutionPlan>> {
+            Ok(self)
+        }
+
+        fn execute(
+            &self,
+            _partition: usize,
+            _context: Arc<TaskContext>,
+        ) -> DFResult<SendableRecordBatchStream> {
+            unimplemented!("exists only to be refused by the codec, never executed")
+        }
+    }
+
+    /// The other half of a two-build fleet: the encode side would otherwise deny a node it
+    /// provably encodes. The refusal has to name the real cause instead.
+    #[test]
+    fn a_foreign_node_of_the_same_name_is_reported_as_two_builds_not_as_unencodable() {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+        let plan: Arc<dyn ExecutionPlan> =
+            Arc::new(ImposterFlightReader(Arc::new(PlanProperties::new(
+                EquivalenceProperties::new(schema),
+                Partitioning::UnknownPartitioning(1),
+                EmissionType::Final,
+                Boundedness::Bounded,
+            ))));
+
+        let mut buf = Vec::new();
+        let err = LldbCodec
+            .try_encode(plan, &mut buf)
+            .expect_err("a FlightReaderExec from another build cannot be encoded");
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("LldbCodec cannot encode FlightReaderExec"),
+            "the generic message denies something true; got: {msg}"
+        );
+        assert!(
+            msg.contains("Two versions of lldb-qe-core are linked into this process"),
+            "the error must name the real cause; got: {msg}"
+        );
+        assert!(
+            msg.contains("fleet is not one build"),
+            "the error must read the same way the decode-side refusal does; got: {msg}"
         );
     }
 
