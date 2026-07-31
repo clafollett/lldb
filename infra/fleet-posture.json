@@ -1,0 +1,55 @@
+{
+  "_generated": "GENERATED — do not hand-edit. Written by `scripts/check-fleet-posture.sh --json`, which classifies every binary target `cargo metadata` reports; that script's normal run re-derives this and fails when the committed copy disagrees, so an edit here is reverted rather than believed. Regenerate with: scripts/check-fleet-posture.sh --json > infra/fleet-posture.json. Read by infra/test/fleet-posture.test.ts, which requires every container handed LLDB_REQUIRE_FLEET_TOKEN to run a binary listed here with posture \"checks\" — a binary absent from this list FAILS that test rather than being skipped as unknown.",
+  "generator": "scripts/check-fleet-posture.sh --json",
+  "binaries": [
+    {
+      "name": "lldb-qe-auth",
+      "package": "lldb-qe-admin",
+      "source": "crates/lldb-qe-admin/src/bin/lldb-qe-auth.rs",
+      "posture": "opted-out",
+      "reason": "its credential is the services database, not the fleet secret; binds no port."
+    },
+    {
+      "name": "lldb-qe-migrate",
+      "package": "lldb-qe-admin",
+      "source": "crates/lldb-qe-admin/src/bin/lldb-qe-migrate.rs",
+      "posture": "opted-out",
+      "reason": "a DDL one-shot; binds no port, never handed LLDB_FLEET_TOKEN."
+    },
+    {
+      "name": "lldb-qe-reap",
+      "package": "lldb-qe-admin",
+      "source": "crates/lldb-qe-admin/src/bin/lldb-qe-reap.rs",
+      "posture": "opted-out",
+      "reason": "an out-of-process sweep; binds no port, never handed LLDB_FLEET_TOKEN."
+    },
+    {
+      "name": "lldb-qe-warehouse",
+      "package": "lldb-qe-admin",
+      "source": "crates/lldb-qe-admin/src/bin/lldb-qe-warehouse.rs",
+      "posture": "opted-out",
+      "reason": "it edits desired-state rows; binds no port, never handed LLDB_FLEET_TOKEN."
+    },
+    {
+      "name": "lldb-qe-coordinator",
+      "package": "lldb-qe-coordinator",
+      "source": "crates/lldb-qe-coordinator/src/main.rs",
+      "posture": "checks",
+      "reason": null
+    },
+    {
+      "name": "lldb-qe-server",
+      "package": "lldb-qe-coordinator",
+      "source": "crates/lldb-qe-coordinator/src/bin/lldb-qe-server.rs",
+      "posture": "checks",
+      "reason": null
+    },
+    {
+      "name": "lldb-qe-worker",
+      "package": "lldb-qe-worker",
+      "source": "crates/lldb-qe-worker/src/main.rs",
+      "posture": "checks",
+      "reason": null
+    }
+  ]
+}

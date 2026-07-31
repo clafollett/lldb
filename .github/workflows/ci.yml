@@ -86,6 +86,11 @@ jobs:
               *.md)       ;;
               # A change to CI itself must exercise every job it governs.
               .github/*)  rust=true; infra=true ;;
+              # Lives under infra/ and is read by the CDK tests, but it is DERIVED from the Rust
+              # workspace — so a hand-edit of it has to reach the job that can re-derive it
+              # (`Fleet posture`, the only one with cargo). Without this line the one edit the
+              # freshness check exists to catch is the one edit that never runs it.
+              infra/fleet-posture.json) rust=true; infra=true ;;
               # The CDK app is TypeScript and does not depend on the Rust build.
               infra/*)    infra=true ;;
               *)          rust=true ;;
@@ -163,11 +168,18 @@ jobs:
 
       # Every binary cargo builds must either call `check_fleet_posture_from_env` or say why it
       # does not (#116). Unlike `paths` above this is gated on the rust filter and belongs here
-      # rather than in its own always-run job, because its two inputs are exactly what that filter
-      # selects: a `[[bin]]` target (a Cargo.toml, or a new file under src/bin/) and the target's
-      # own source. No .md change can add a binary or delete a posture call, so a docs-only PR has
-      # nothing to break — which is the opposite of `check-path-refs.sh`, whose references live in
-      # the markdown itself. It also needs cargo, which the `paths` job deliberately does not have.
+      # rather than in its own always-run job, because its inputs are exactly what that filter
+      # selects: a `[[bin]]` target (a Cargo.toml, or a new file under src/bin/), the target's own
+      # source, and `infra/fleet-posture.json`, which the filter above routes here for this reason.
+      # No .md change can add a binary or delete a posture call, so a docs-only PR has nothing to
+      # break — which is the opposite of `check-path-refs.sh`, whose references live in the markdown
+      # itself. It also needs cargo, which the `paths` job deliberately does not have.
+      #
+      # This step is ALSO where the roster's freshness is enforced (#126): the same run re-derives
+      # `infra/fleet-posture.json` and fails when the committed copy disagrees. That placement is the
+      # design — `infra/test/fleet-posture.test.ts` then reads a static file, and the
+      # `cdk synth • test` job needs neither cargo nor jq to assert that a container handed
+      # LLDB_REQUIRE_FLEET_TOKEN runs a binary that checks it.
       - name: Fleet posture
         run: ./scripts/check-fleet-posture.sh
 
