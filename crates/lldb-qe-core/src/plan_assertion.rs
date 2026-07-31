@@ -1203,6 +1203,51 @@ mod tests {
         );
     }
 
+    /// **The test the rest of this file cannot substitute for: a correct key id and a bad
+    /// signature.**
+    ///
+    /// Every other negative case here refuses at the key-id *lookup*, which means none of them
+    /// would notice if the signature were never checked at all — a suite that passes with
+    /// `verify_signed`'s verification step deleted is a suite asserting nothing about signatures.
+    /// This was caught by deleting exactly that step and watching every test stay green, so the
+    /// test exists because the omission was real rather than hypothetical.
+    ///
+    /// Tampering with the **body** rather than the key id is what makes it bite: the id still
+    /// matches, so the lookup succeeds and the signature is the only thing left that can refuse it.
+    #[test]
+    fn a_correct_key_id_with_a_bad_signature_is_refused_by_the_signature() {
+        let now = SystemTime::now();
+        let key = signing_key();
+        let signed = sample(now).sign_with(&key).expect("sign");
+        let (mut payload, signature) = signed.split().expect("split");
+
+        // Flip a bit well past the version byte and the key id, inside the body.
+        let body_byte = 1 + KEY_ID_BYTES + 2;
+        payload[body_byte] ^= 0x01;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let forged = SignedAssertion(format!(
+            "{}.{}",
+            b64.encode(&payload),
+            b64.encode(&signature)
+        ));
+
+        // The lookup must SUCCEED here — otherwise this test degenerates into the one above.
+        let (_, named) = PlanAssertion::decode_versioned(&payload).expect("still decodes");
+        assert_eq!(
+            named,
+            Some(key.id()),
+            "the tampered payload must still name the real key, or this proves nothing"
+        );
+
+        assert!(
+            matches!(
+                forged.verify_signed(&[key.verifying_key()], now),
+                Err(AssertionError::BadSignature)
+            ),
+            "a payload the signature does not cover must be refused by the signature check"
+        );
+    }
+
     /// The signature covers the key id, so it cannot be rewritten to point a verifier elsewhere.
     #[test]
     fn tampering_with_the_key_id_invalidates_the_signature() {
