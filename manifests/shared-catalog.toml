@@ -15,7 +15,7 @@
 #
 # The catalog creates and owns its own two tables (`iceberg_tables`,
 # `iceberg_namespace_properties`) the first time it is opened; they are NOT part of
-# `crates/lldb-qe-core/migrations/`, which owns the services schema and nothing else.
+# `crates/lldb-qe-control/migrations/`, which owns the services schema and nothing else.
 #
 # ONE MANIFEST, ONE CATALOG PER TENANT. The `name` and `warehouse` below are what SQL and an
 # operator see; they are not what lands in the database. A process running for account 7 opens this

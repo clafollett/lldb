@@ -200,7 +200,7 @@ pub enum FleetClaim {
 }
 
 /// The future [`FleetGate::claim`] returns. Boxed because the gate is used as a trait object and
-/// `async fn` in a trait is not object-safe; the same shape [`crate::engine::BoxResolver`] uses.
+/// `async fn` in a trait is not object-safe; the same shape `lldb_qe_core::engine::BoxResolver` uses.
 pub type FleetClaimFuture<'a> = Pin<Box<dyn Future<Output = FleetClaim> + Send + 'a>>;
 
 /// The bound the whole fleet shares — a warehouse's `K`, held somewhere every coordinator can see.

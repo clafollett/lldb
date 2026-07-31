@@ -5,7 +5,7 @@
 //! the port could name any tenant, read any table that tenant could read, and have their query
 //! recorded in that tenant's history. This module replaces the claim with a proof.
 //!
-//! [`crate::rbac`] is the other half — what an identity may *do*. The split is deliberate: this
+//! [`lldb_qe_types::rbac`] is the other half — what an identity may *do*. The split is deliberate: this
 //! side is I/O against the services database and can fail for transport reasons; that side is a
 //! pure function over a grant set.
 //!
@@ -38,7 +38,7 @@
 //!
 //! **The account stops being client-claimed.** After authentication the tenant is derived from the
 //! token. If the ticket also names an account it must *equal* the token's, or the request is
-//! `PERMISSION_DENIED`; it is never used to select the tenant. See [`crate::server`].
+//! `PERMISSION_DENIED`; it is never used to select the tenant. See `lldb_qe_core::server`.
 //!
 //! # An unconfigured services database is still legal
 //!
@@ -91,7 +91,7 @@
 //! that could present it could have an arbitrary physical plan executed, reading whatever the
 //! worker's storage credentials could reach.
 //!
-//! [`crate::plan_assertion`] is the per-request half, and it is a **second** credential on the same
+//! `lldb_qe_core::plan_assertion` is the per-request half, and it is a **second** credential on the same
 //! call rather than a replacement for this one. The coordinator, having authenticated a request and
 //! authorized its logical plan, mints a short-lived assertion naming the account, the user and the
 //! object-store locations that plan may read, signs it with a key derived from this same fleet
@@ -119,7 +119,7 @@ use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
-// Straight from `lldb_qe_types`, deliberately NOT via `crate::rbac` — that module re-exports these
+// Straight from `lldb_qe_types`, deliberately NOT via `lldb_qe_core::rbac` — that module re-exports these
 // but also pulls in DataFusion for its plan walk, and this one has no business needing a query
 // engine to look up a grant. Same rule as `crate::config`'s `StorageConfig` import.
 use lldb_qe_types::rbac::{Grant, ObjectRef, ObjectType, Privilege, QueryAuthorization};

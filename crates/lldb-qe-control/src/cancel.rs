@@ -15,7 +15,7 @@
 //!
 //! There is no `QuerySlot::release()`, deliberately ([`crate::scheduler`] argues why), and this
 //! module does not add one. Cancellation is delivered as a **signal**, and the query's own task is
-//! what acts on it: [`crate::server`]'s `run_query` runs the admit-and-execute future in a
+//! what acts on it: `lldb_qe_core::server`'s `run_query` runs the admit-and-execute future in a
 //! `tokio::select!` against [`RunningQuery::cancelled`], so a cancellation drops that future — which
 //! drops the [`QuerySlot`](crate::scheduler::QuerySlot) guard, which hands the permit straight to the
 //! next waiter in line. The queue advances because the guard already worked that way for failures
@@ -65,7 +65,7 @@
 //!   A worker still *producing* into a reset stream stops when its send fails, so a large scan being
 //!   streamed back does stop fairly promptly. That is a side effect of the transport, not a
 //!   guarantee this module makes.
-//! - A stage that has already been **materialized into the worker's [`StageCache`]**, or is midway
+//! - A stage that has already been **materialized into the worker's `StageCache`**, or is midway
 //!   through materializing, runs to completion regardless: the cache deliberately decouples
 //!   producing a stage from the consumers pulling it (that is what makes a shuffle materialize
 //!   once), so no consumer going away can stop it.
@@ -78,17 +78,16 @@
 //! for the next consumer that asks for it. Each of those is a design with its own failure modes, and
 //! none of them is needed to stop one expensive mistake from holding a warehouse's slot.
 //!
-//! # Authorization lives in [`crate::server`], not here
+//! # Authorization lives in `lldb_qe_core::server`, not here
 //!
 //! This module is a map and a channel. Whether a caller may cancel a given query — the tenant
-//! boundary and the [`Privilege::Cancel`](crate::rbac::Privilege::Cancel) grant — is decided by
-//! [`Coordinator::cancel_query`](crate::server::Coordinator::cancel_query), which is where the
-//! credential is, for the same reason [`crate::rbac`] is a pure function of grants and a plan: a
+//! boundary and the [`Privilege::Cancel`](lldb_qe_types::rbac::Privilege::Cancel) grant — is decided by
+//! `lldb_qe_core::server::Coordinator::cancel_query`, which is where the
+//! credential is, for the same reason [`lldb_qe_types::rbac`] is a pure function of grants and a plan: a
 //! registry that checked permissions would be a registry that could not be tested without a
 //! database.
 //!
 //! [`Admission::acquire`]: crate::scheduler::Admission::acquire
-//! [`StageCache`]: crate::stage_cache::StageCache
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -159,7 +158,7 @@ impl Cancellation {
     /// It says *cancelled* in the first word so a row is greppable as one, names who asked, and
     /// states the consequence — that no results reached the client — because "cancelled" alone
     /// leaves a reader wondering whether partial output was delivered. It never was: batches are
-    /// collected whole before any are sent (see [`crate::engine`]).
+    /// collected whole before any are sent (see `lldb_qe_core::engine`).
     pub fn reason(&self) -> String {
         match &self.requested_by {
             Some(user) => format!(

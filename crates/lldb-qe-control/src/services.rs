@@ -3,7 +3,7 @@
 //! # Why a database at all
 //!
 //! Everything the engine has needed so far is *data-plane* state: bytes in object storage,
-//! Arrow batches in flight, a per-worker [`crate::stage_cache`]. All of it is either immutable
+//! Arrow batches in flight, a per-worker `lldb_qe_core::stage_cache`. All of it is either immutable
 //! or deliberately per-process, which is exactly why a worker can be started, killed, and
 //! replaced without ceremony.
 //!
@@ -31,7 +31,7 @@
 //! The Iceberg SQL catalog (#8) also lives in this database, but **not** in this schema:
 //! `iceberg-catalog-sql` creates and owns `iceberg_tables` and `iceberg_namespace_properties`
 //! itself, so they are deliberately absent from `migrations/`. Two owners for one table is how
-//! a schema ends up half-migrated — see [`crate::lakehouse`].
+//! a schema ends up half-migrated — see `lldb_qe_core::lakehouse`.
 //!
 //! # Migrations are an explicit step, never startup magic
 //!
@@ -89,7 +89,7 @@ use sqlx::migrate::Migrator;
 use sqlx::postgres::{PgPool, PgPoolOptions};
 use url::Url;
 
-/// The schema, compiled into the binary from `crates/lldb-qe-core/migrations/`.
+/// The schema, compiled into the binary from `crates/lldb-qe-control/migrations/`.
 ///
 /// `sqlx::migrate!` resolves the directory **at compile time** relative to this crate's
 /// manifest, hashes each file, and embeds the SQL — so a container image carries the schema it
@@ -224,7 +224,7 @@ impl ServicesArgs {
     /// all, instead of a second hand-rolled copy of the same rules that could drift.
     ///
     /// This exists for the one caller that is not a CLI: a manifest declaring a `sql` catalog
-    /// with no `uri` (see [`crate::manifest::CatalogBackend::Sql`]). A manifest is
+    /// with no `uri` (see `lldb_qe_core::manifest::CatalogBackend::Sql`). A manifest is
     /// config-as-data that lives in git, so it must not carry a password; the fleet's already
     /// configured `LLDB_METADATA_*` is where that credential belongs.
     pub fn from_env() -> Result<Self> {

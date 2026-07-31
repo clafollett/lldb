@@ -39,7 +39,9 @@ must-have crate would force a second version, stop and treat it as its own scope
 than bumping.
 
 Every binary is stamped with `version+git-sha` (workspace version + the commit, injected by
-`lldb-qe-core/build.rs`): both binaries report it via `--version` and a startup log line, so an
+`lldb-qe-control/build.rs` and re-exported from `lldb-qe-core` as `BUILD_VERSION`, because
+`liveness.rs` records it on every coordinator registration and is the lowest crate that reads
+it): both binaries report it via `--version` and a startup log line, so an
 operator can confirm a whole fleet is the identical build. CI builds one image, tags it by that
 version, and the compose cluster runs that single tag for every role (`LLDB_IMAGE`).
 
@@ -49,21 +51,27 @@ version, and the compose cluster runs that single tag for every role (`LLDB_IMAG
   (`rbac.rs`) and the storage *declaration* (`storage.rs`). Depends on **none** of
   datafusion / arrow / iceberg / parquet / object_store / sqlx, and
   `cargo tree -p lldb-qe-types` piped through that pattern must stay empty
-- `crates/lldb-qe-core` — storage (`storage.rs`, incl. S3), config-as-data catalog
-  (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, the coordinator-side
-  Iceberg-scan resolver that makes an Iceberg plan shippable and sliceable (`iceberg_scan.rs`),
-  shared CLI/logging config (`config.rs`), Postgres services DB / control plane (`services.rs` +
-  `migrations/`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
-  (`discovery.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline both
-  front ends share (`engine.rs`), admission control (`scheduler.rs`) with the fleet-wide bound
-  behind it (`fleet_admission.rs`) and the cancellation that
-  hands a slot back (`cancel.rs`), query history
+- `crates/lldb-qe-control` — the control plane, and the second crate the version wall does not
+  apply to: Postgres services DB (`services.rs` + `migrations/`), identity and credentials
+  (`auth.rs`), virtual warehouses (`warehouse.rs`) and the discovery that routes to them
+  (`discovery.rs`), admission control (`scheduler.rs`) with the fleet-wide bound behind it
+  (`fleet_admission.rs`) and the cancellation that hands a slot back (`cancel.rs`), query history
   (`query_log.rs`), coordinator liveness (`liveness.rs`) and the sweep that acts on it
-  (`reaper.rs`), the long-running coordinator (`server.rs`), access control — identity and
-  credentials (`auth.rs`) plus grants and the plan-time check (`rbac.rs`) — the signed, short-lived
-  assertion that carries that check's answer to a worker (`plan_assertion.rs`), the transport those
-  credentials travel over (`tls.rs`), and the per-account
-  catalog/warehouse partitioning auth and rbac rest on (`tenancy.rs`)
+  (`reaper.rs`), the transport those credentials travel over (`tls.rs`), the per-account
+  catalog/warehouse partitioning auth and rbac rest on (`tenancy.rs`), and the shared CLI/logging
+  config (`config.rs`). Depends on **none** of datafusion / arrow / iceberg / parquet, and
+  `cargo tree -p lldb-qe-control` piped through that pattern must stay empty. `sqlx` is expected
+  here — the control plane *is* a database
+- `crates/lldb-qe-core` — the query engine: storage (`storage.rs`, incl. S3), config-as-data
+  catalog (`manifest.rs` + `catalog.rs`), session, Flight transport, plan codec, the
+  coordinator-side Iceberg-scan resolver that makes an Iceberg plan shippable and sliceable
+  (`iceberg_scan.rs`), the cross-query result cache (`result_cache.rs`), the one-query pipeline
+  both front ends share (`engine.rs`), grants and the plan-time check (`rbac.rs`), the signed,
+  short-lived assertion that carries that check's answer to a worker (`plan_assertion.rs`), and
+  the long-running coordinator (`server.rs`) — which is the **composition root**, wiring the
+  control plane to the engine, and is why it lives here rather than in `lldb-qe-control`. Every
+  control-plane module is re-exported from `lib.rs`, so `lldb_qe_core::auth`, `::services`,
+  `::tls` and the rest still resolve exactly as before
 - `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` — thin clap/env-configured binaries.
   The coordinator package also builds (`src/bin/`): `lldb-qe-migrate` (applies the services-DB
   migrations), `lldb-qe-warehouse` (create/list/resize/suspend/resume a warehouse),
@@ -104,7 +112,8 @@ every session that never touched the crate about 8.8k tokens.
 Read that file before changing any of those subsystems: most of its sections exist to name a
 tempting alternative and say why it is wrong, and the module docs alone will not tell you that.
 
-**If you are working in `crates/lldb-qe-coordinator`, `crates/lldb-qe-worker` or `infra/` and the
+**If you are working in `crates/lldb-qe-control`, `crates/lldb-qe-coordinator`,
+`crates/lldb-qe-worker` or `infra/` and the
 change touches one of those subsystems, read it explicitly** — it will not have loaded for you.
 
 ## Non-negotiables — these apply everywhere, including outside `lldb-qe-core`
@@ -116,7 +125,7 @@ rule itself must not depend on that file having been loaded.
 - **Do NOT bump `datafusion`, `arrow`, `object_store`, `iceberg` or `sqlx` independently**, and do
   not add a dependency that pulls in a second `arrow` / `object_store` / `datafusion` version. Vet
   every new crate with `cargo tree -d` before committing.
-- **Schema changes are migrations**, in `crates/lldb-qe-core/migrations/`, applied only by
+- **Schema changes are migrations**, in `crates/lldb-qe-control/migrations/`, applied only by
   `lldb-qe-migrate`. Coordinators and workers never migrate — a rolling fleet racing the same DDL
   is a production footgun.
 - **An unconfigured services DB is legal.** `cargo run` must never need Postgres, certificates, or

@@ -1,0 +1,40 @@
+[package]
+name = "lldb-qe-control"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "lldb control plane: the services database, access control, warehouses, discovery, admission and liveness — free of DataFusion."
+
+# This crate exists for what it does NOT depend on: no datafusion, no arrow, no iceberg, no
+# parquet, no object_store. `cargo tree -p lldb-qe-control | grep -E 'datafusion|arrow|iceberg|parquet'`
+# must stay empty — see the crate docs. sqlx IS expected here: the control plane is Postgres.
+[dependencies]
+lldb-qe-types = { path = "../lldb-qe-types" }
+tokio.workspace = true
+tonic.workspace = true
+rustls.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+url.workspace = true
+clap.workspace = true
+sqlx.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+subtle.workspace = true
+hex.workspace = true
+rand.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+tempfile.workspace = true
+# `tls.rs`'s unit tests mint a self-signed certificate rather than committing a private key; see
+# the workspace manifest for that argument.
+rcgen.workspace = true

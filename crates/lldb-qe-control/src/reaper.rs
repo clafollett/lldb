@@ -8,7 +8,7 @@
 //! 1. **The coordinator dies outright.** Everything it had in flight stays `queued` or `running`
 //!    forever. Nothing in that process can clean up after it — that is *why*
 //!    [`crate::query_log`]'s rows record which coordinator wrote them.
-//! 2. **The insert-to-guard window.** [`crate::server`]'s `ActiveQuery` guard closes a row out when
+//! 2. **The insert-to-guard window.** `lldb_qe_core::server`'s `ActiveQuery` guard closes a row out when
 //!    a request is dropped, but the row is created by an `await` that commits *before* the future
 //!    is resumed with the new id, so a cancellation landing in between leaves a row with nothing
 //!    watching it. The guard's own docs name this window; it cannot be closed from there, because
@@ -77,7 +77,7 @@
 //!
 //! - **The owning coordinator writes unconditionally.** It is the authority on its own query: it
 //!   knows whether the rows were delivered, and its word is the truth even if it arrives late.
-//! - **The reaper writes a compare-and-swap** — the same idiom [`crate::dml`] commits a snapshot
+//! - **The reaper writes a compare-and-swap** — the same idiom `lldb_qe_core::dml` commits a snapshot
 //!   with and [`crate::warehouse`] transitions a warehouse with. Its `UPDATE` repeats the full
 //!   reapable predicate in its own `WHERE`, so under Postgres's `READ COMMITTED` recheck a row that
 //!   moved between the scan and the update is re-evaluated against its *new* version and skipped.
@@ -116,7 +116,7 @@
 //!
 //! # Decision 5 — one bounded sweep, out of process
 //!
-//! The sweep takes a `LIMIT`, following [`crate::result_cache`]'s prune: an unbounded `UPDATE`
+//! The sweep takes a `LIMIT`, following `lldb_qe_core::result_cache`'s prune: an unbounded `UPDATE`
 //! makes one run proportional to every stranded row a deployment has ever produced, which is the
 //! shape that turns a routine maintenance task into an incident during the first backlog. A run
 //! that fills its batch says so and can simply be run again; two reapers running concurrently is

@@ -3150,6 +3150,32 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "92daf443525c4cce67b150400bc2316076100ce0b3686209eb8cf3c31612e6f0"
 
 [[package]]
+name = "lldb-qe-control"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "clap",
+ "futures",
+ "hex",
+ "lldb-qe-types",
+ "rand 0.9.5",
+ "rcgen",
+ "rustls",
+ "sha2",
+ "sqlx",
+ "subtle",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tonic",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "lldb-qe-coordinator"
 version = "0.1.0"
 dependencies = [
@@ -3175,16 +3201,14 @@ dependencies = [
  "datafusion",
  "datafusion-proto",
  "futures",
- "hex",
  "hmac",
  "iceberg",
  "iceberg-catalog-sql",
  "iceberg-datafusion",
+ "lldb-qe-control",
  "lldb-qe-types",
  "object_store",
- "rand 0.9.5",
  "rcgen",
- "rustls",
  "serde",
  "sha2",
  "sqlx",
