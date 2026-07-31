@@ -64,6 +64,22 @@ export const FLEET_TLS_DOMAIN = `fleet.${NAMESPACE}`;
 export const DEFAULT_TLS_SECRET_PREFIX = 'lldb/fleet-tls';
 
 /**
+ * The variable carrying the shared fleet secret into every task
+ * (`lldb_qe_control::auth::FleetAuth`, and the HMAC key `lldb_qe_core::plan_assertion` derives from
+ * it). Exported so a test can assert on the name rather than re-spelling it.
+ */
+export const FLEET_TOKEN_ENV = 'LLDB_FLEET_TOKEN';
+
+/**
+ * Length of the generated fleet secret, in characters.
+ *
+ * 64 alphanumerics is ~380 bits — far past anything guessable, and past the 256-bit input the
+ * assertion's HMAC key derivation wants. Long rather than exotic: the value has to survive being an
+ * environment variable, so entropy is bought with length instead of punctuation.
+ */
+const FLEET_TOKEN_LENGTH = 64;
+
+/**
  * A virtual warehouse: a named, independently sized pool of workers.
  *
  * This is the infrastructure half of the concept whose control-plane half lives in the services
@@ -124,12 +140,17 @@ export type ServicesDbMode = 'aurora' | 'none';
 /**
  * Whether Flight traffic inside the VPC is encrypted.
  *
- * - `none` (default): every Flight port is plaintext, as it has been since this stack existed.
- *   Legal, and not a hole: the engine refuses a plaintext port only when a credential is actually
- *   checked on it, and nothing here checks one yet. Traffic is confined to the VPC by the security
- *   groups, and `LLDB_ALLOW_PLAINTEXT` is *not* set in this mode either — see below.
+ * - `none` (default): every Flight port is plaintext and **no fleet secret is created**, as it has
+ *   been since this stack existed. Legal, and not a hole: the engine refuses a plaintext port only
+ *   when a credential is actually checked on it, and in this mode nothing checks one. Traffic is
+ *   confined to the VPC by the security groups, and `LLDB_ALLOW_PLAINTEXT` is *not* set in this mode
+ *   either — see below.
  * - `fleet`: workers serve TLS and every role dials `https://`, from PEM delivered as
- *   `LLDB_TLS_*_PEM` out of three Secrets Manager secrets.
+ *   `LLDB_TLS_*_PEM` out of three Secrets Manager secrets — **and** every role gets the generated
+ *   {@link FLEET_TOKEN_ENV}, which is what turns a worker's Flight port from routable-is-enough into
+ *   a door. The two are one switch on purpose: a worker checking a credential refuses to bind a
+ *   plaintext port, so "fleet secret without certificates" is not a configuration this stack can
+ *   express rather than one it merely warns about. See the fleet-secret block in the constructor.
  *
  * **Why the material is imported rather than created here.** Fargate injects a Secrets Manager
  * value as an environment variable and by no other means, so the delivery mechanism was never in
@@ -218,6 +239,8 @@ export class LldbStack extends cdk.Stack {
   public readonly coordinatorTask: ecs.FargateTaskDefinition;
   /** The services database, when `servicesDb: 'aurora'`. */
   public readonly servicesDb?: rds.DatabaseCluster;
+  /** The generated shared fleet secret, when `tls: 'fleet'`. Never created in any other mode. */
+  public readonly fleetToken?: secretsmanager.Secret;
 
   constructor(scope: Construct, id: string, props: LldbStackProps) {
     super(scope, id, props);
@@ -477,35 +500,82 @@ export class LldbStack extends cdk.Stack {
       workerTlsSecrets.LLDB_TLS_KEY_PEM = ecs.Secret.fromSecretsManager(keySecret);
     }
 
+    // ---- Fleet secret ---------------------------------------------------------------------
+    // The credential that makes a worker's Flight port a door rather than a hole. The coordinator
+    // presents it on every call (`lldb_qe_control::auth::FleetAuth`), a worker configured with one
+    // rejects anything else as `UNAUTHENTICATED` under a constant-time compare, and
+    // `lldb_qe_core::plan_assertion` derives its HMAC key from the same value — so this one secret
+    // is what closes *both* "is the caller part of this deployment" and "did a coordinator
+    // authorize this particular plan to read these locations". Without it a worker executes any
+    // physical plan anything routable in the VPC hands it, using this task role's S3 credentials.
+    //
+    // **It exists only under `tls: 'fleet'`, and that is the whole safety argument.** A worker that
+    // checks a credential refuses to bind a plaintext port (`tls.rs`, `CredentialCheck::Enforced`),
+    // so "fleet secret + plaintext" is a deploy that dies at task start — or, worse, one an operator
+    // rescues with `LLDB_ALLOW_PLAINTEXT` and thereby ships the secret in the clear. Refusing that
+    // combination at synth was the obvious fix; not being able to *write* it is the better one, so
+    // the token is tied to the mode that satisfies the guard instead of being its own flag. Under
+    // `tls: 'none'` nothing is created, nothing is injected, no credential is checked, and the fleet
+    // is byte-for-byte what it was before this block existed.
+    //
+    // **Generated here, where the TLS material above is imported — deliberately, not by oversight.**
+    // The PEM is imported because creating it would deadlock a first deploy: CloudFormation makes an
+    // empty secret, the ECS service cannot stabilise on an empty PEM, the circuit breaker fails the
+    // stack, and the rollback deletes the secret you were about to fill. None of that applies to a
+    // token. CloudFormation generates the value as part of creating the resource, and the task
+    // definitions reference its ARN, so no task ever starts against an unfilled one — and even if
+    // one did, `FleetAuth::from_env` reads a blank value as *unset*, which is a fleet that starts
+    // open rather than a fleet that cannot start at all. So generating it costs nothing and buys the
+    // property that matters most for a symmetric secret: it exists in Secrets Manager and nowhere
+    // else — not in source, not in CDK context, not in a `cdk.out` artifact, not in a shell history.
+    //
+    // Injected with `ecs.Secret`, never `environment`: a plain environment entry is stored verbatim
+    // in the task definition and handed to anyone who can call `describe-task-definition`. That
+    // injection grants each task definition's **execution** role `secretsmanager:GetSecretValue`,
+    // which is the only role that needs it — ECS resolves the value at container start and the
+    // process reads it from its own environment. The engine carries no AWS SDK and makes no
+    // Secrets Manager call, so granting the *task* roles as well would be a permission nothing uses,
+    // on a secret the container already holds, that would additionally survive a rotation. There is
+    // a test asserting the task roles do not get it, so its absence reads as a decision.
+    const fleetSecrets: Record<string, ecs.Secret> = {};
+
+    if (tlsMode === 'fleet') {
+      const fleetToken = new secretsmanager.Secret(this, 'FleetToken', {
+        description: 'lldb shared fleet secret — worker Flight authentication and plan-assertion key',
+        generateSecretString: {
+          passwordLength: FLEET_TOKEN_LENGTH,
+          // Alphanumerics only. The value's whole life is spent as an environment variable and in
+          // the `aws ecs run-task --overrides` an operator writes while debugging, and punctuation
+          // buys entropy that {@link FLEET_TOKEN_LENGTH} already has several times over while
+          // costing a class of quoting bugs. `FleetAuth::from_env` trims, so a stray space would be
+          // silently eaten rather than compared — another reason not to generate one.
+          excludePunctuation: true,
+          includeSpace: false,
+        },
+        // Matches the warehouse bucket and the services database: a `cdk destroy` should actually
+        // destroy. Safe in a way the CA is not — the token is regenerable, and both roles read
+        // whatever this resource holds, so a fresh value is a fresh fleet rather than a broken one.
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
+      });
+      this.fleetToken = fleetToken;
+      // One entry, spread into BOTH task definitions below. Same argument as the single image tag:
+      // a fleet whose halves hold different secrets is a fleet that cannot talk to itself.
+      fleetSecrets[FLEET_TOKEN_ENV] = ecs.Secret.fromSecretsManager(fleetToken);
+    }
+
     // ---- Warehouses: one worker fleet each ----------------------------------------------
     // Each warehouse gets its own task definition, its own ECS service, and — the part that makes
     // routing work — its own Cloud Map name. `analytics.lldb.local` resolves to the analytics
     // warehouse's tasks and to nothing else, so a coordinator handed a warehouse name cannot
     // reach another warehouse's compute even by accident.
     //
-    // Transport: plaintext in the default mode, TLS under `tls: 'fleet'` — see {@link TlsMode} and
-    // the injection block above. Worth stating explicitly for whoever wires the gap below, because
-    // it is what used to block them: the moment `LLDB_FLEET_TOKEN` is set on these tasks a worker
-    // starts *checking* a credential, and it then refuses to bind a plaintext port. That refusal is
-    // now satisfiable — deploy `-c tls=fleet` and the port it binds is encrypted — instead of only
-    // being escapable with `LLDB_ALLOW_PLAINTEXT`, which would ship the fleet secret in the clear.
-    // Fleet token and TLS must therefore land together, in that order.
-    //
-    // KNOWN GAP (issue #19): `LLDB_FLEET_TOKEN` is NOT set here, so worker Flight ports on ECS are
-    // reachable by anything inside the VPC that can resolve `<warehouse>.lldb.local` — a worker
-    // will execute any physical plan it is handed, with this task role's S3 credentials. Compose
-    // sets the variable; this stack deliberately does not, because doing it properly means a
-    // generated Secrets Manager secret injected into *both* the worker and coordinator task
-    // definitions, and that is a change worth reviewing on its own rather than riding along. Until
-    // then the mitigation is the security group (workers are not internet-facing) and the loud
-    // warning every worker logs at startup. See crates/lldb-qe-core/src/auth.rs::FleetAuth.
-    //
-    // That gap now covers two checks rather than one. Issue #34 keys the per-request plan assertion
-    // (crates/lldb-qe-core/src/plan_assertion.rs) off the same secret, so a fleet without it also
-    // has no key, mints nothing and verifies nothing: a worker here still executes any plan it is
-    // handed, with this task role's S3 credentials, and nothing binds a plan to the account and
-    // locations a coordinator authorized. One secret injected into both task definitions closes
-    // both — which is the same piece of work, not a second one.
+    // Transport and authentication: plaintext and wide open in the default mode, TLS plus the
+    // shared fleet secret under `tls: 'fleet'` — see {@link TlsMode} and the two injection blocks
+    // above. The pairing is not a convenience: a worker handed a fleet secret starts *checking* a
+    // credential, and `tls.rs` then refuses to bind a plaintext port, so one without the other is a
+    // fleet that will not start. Under `tls: 'none'` these ports are still reachable by anything in
+    // the VPC that can resolve `<warehouse>.lldb.local`, and the mitigations are what they have
+    // always been: the security group, and the loud warning every worker logs at startup.
     for (const definition of warehouses) {
       const id = `Warehouse${pascalCase(definition.name)}`;
       const task = new ecs.FargateTaskDefinition(this, `${id}Task`, { cpu, memoryLimitMiB });
@@ -513,7 +583,7 @@ export class LldbStack extends cdk.Stack {
         image,
         command: ['lldb-qe-worker', '--bind', `0.0.0.0:${WORKER_PORT}`],
         environment: { ...storageEnv, ...metadataEnv, ...tlsEnv },
-        secrets: { ...metadataSecrets, ...workerTlsSecrets },
+        secrets: { ...metadataSecrets, ...workerTlsSecrets, ...fleetSecrets },
         portMappings: [{ containerPort: WORKER_PORT }],
         logging: ecs.LogDrivers.awsLogs({ streamPrefix: `worker-${definition.name}`, logGroup }),
         // `nc -z` is in the runtime image precisely so orchestrators can probe the Flight port. A
@@ -577,7 +647,10 @@ export class LldbStack extends cdk.Stack {
         // per `run-task` to send a query to a specific warehouse.
         LLDB_WAREHOUSE_ENDPOINT: warehouseEndpointTemplate(scheme),
       },
-      secrets: { ...metadataSecrets, ...clientTlsSecrets },
+      // The same fleet secret the workers check, from the same Secrets Manager resource: this is the
+      // credential the coordinator presents on every Flight call and the key it signs each request's
+      // plan assertion with.
+      secrets: { ...metadataSecrets, ...clientTlsSecrets, ...fleetSecrets },
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'coordinator', logGroup }),
     });
     this.warehouse.grantReadWrite(this.coordinatorTask.taskRole);
@@ -624,6 +697,14 @@ export class LldbStack extends cdk.Stack {
       new cdk.CfnOutput(this, 'FleetTlsDomain', {
         value: FLEET_TLS_DOMAIN,
         description: 'The name the fleet certificate is issued for, and that every client verifies',
+      });
+      // The ARN, never the value — same rule as the services-database secret. Rotating is
+      // `aws secretsmanager put-secret-value` against this ARN followed by a forced new deployment
+      // of every service *and* the next coordinator run: the engine reads the variable once per
+      // process, so a half-rotated fleet fails authentication until the restart completes.
+      new cdk.CfnOutput(this, 'FleetTokenSecretArn', {
+        value: this.fleetToken!.secretArn,
+        description: 'Secrets Manager ARN holding the generated shared fleet secret',
       });
     }
     if (this.servicesDb) {

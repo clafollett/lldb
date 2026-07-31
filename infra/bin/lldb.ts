@@ -73,6 +73,11 @@ if (servicesDb && !['aurora', 'none'].includes(servicesDb)) {
 // Manager secrets that `scripts/mint-fleet-tls.sh` fills. Run that script FIRST: the stack imports
 // the secrets rather than creating them, deliberately, so that the private key is never something
 // CDK holds and never something `cdk.out` could carry. Default `none` is today's plaintext fleet.
+//
+// This flag also decides whether worker Flight ports are *authenticated*: `fleet` generates the
+// shared fleet secret and injects it into both roles, `none` creates none. One switch, because a
+// worker checking a credential refuses to bind a plaintext port — so the insecure pairing is not
+// something you can ask this stack for.
 const tls = app.node.tryGetContext('tls') as TlsMode | undefined;
 if (tls && !['none', 'fleet'].includes(tls)) {
   throw new Error(`unknown tls mode '${tls}' (expected none | fleet)`);

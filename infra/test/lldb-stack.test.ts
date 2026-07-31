@@ -10,6 +10,7 @@ import {
   WAREHOUSE_ENDPOINT_TEMPLATE,
   warehouseEndpointTemplate,
   FLEET_TLS_DOMAIN,
+  FLEET_TOKEN_ENV,
 } from '../lib/lldb-stack';
 
 const IMAGE_TAG = '0.1.0+abcdef123456';
@@ -53,6 +54,23 @@ function containers(template: Template): any[] {
   return Object.values(template.findResources('AWS::ECS::TaskDefinition')).flatMap(
     (res: any) => res.Properties.ContainerDefinitions,
   );
+}
+
+/** A container's `Environment` as a plain object. */
+function envOf(container: any): Record<string, string> {
+  return Object.fromEntries(((container.Environment ?? []) as any[]).map((e) => [e.Name, e.Value]));
+}
+
+/**
+ * A container's `Secrets` as name → its `ValueFrom`, JSON-stringified.
+ *
+ * NOT an ARN. At synth time `ValueFrom` is an unresolved CloudFormation expression — `{"Ref":
+ * "FleetToken…"}` — and the ARN only exists after deployment. Stringifying is deliberate: it makes
+ * two roles' entries comparable with `toBe`, which is what "every role resolves the *same* secret"
+ * needs to assert. Comparing the objects directly would compare references, not contents.
+ */
+function secretsOf(container: any): Record<string, string> {
+  return Object.fromEntries(((container.Secrets ?? []) as any[]).map((s) => [s.Name, JSON.stringify(s.ValueFrom)]));
 }
 
 describe('fleet build consistency', () => {
@@ -431,15 +449,6 @@ describe('services database', () => {
 });
 
 describe('transport security', () => {
-  /** A container's `Environment` as a plain object. */
-  function envOf(container: any): Record<string, string> {
-    return Object.fromEntries((container.Environment as any[]).map((e) => [e.Name, e.Value]));
-  }
-  /** A container's `Secrets` as name → the ARN it resolves from. */
-  function secretsOf(container: any): Record<string, string> {
-    return Object.fromEntries(((container.Secrets ?? []) as any[]).map((s) => [s.Name, JSON.stringify(s.ValueFrom)]));
-  }
-
   test('the default mode configures no certificates, and fakes none', () => {
     // `tls: 'none'` is byte-for-byte the fleet this stack deployed before certificates existed.
     for (const container of containers(synth())) {
@@ -564,8 +573,13 @@ describe('transport security', () => {
     // Creating them would put CDK between an operator and a private key, and would deadlock a
     // first deploy: empty secrets, tasks that cannot start, a circuit breaker that fails the
     // stack, and a rollback that deletes the secrets you were about to fill.
-    const template = synth({ tls: 'fleet', servicesDb: 'none' });
-    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+    //
+    // The one secret this stack does create is the fleet token, and the asymmetry is the argument
+    // above read backwards: an empty token is a fleet that starts *open*, not one that cannot start,
+    // so there is no deadlock to avoid and generating it keeps the value out of every artifact. So
+    // the assertion is not "no secrets" — it is "no secret holding TLS material".
+    const created = synth({ tls: 'fleet', servicesDb: 'none' }).findResources('AWS::SecretsManager::Secret');
+    expect(Object.keys(created).map((id) => id.replace(/[0-9A-F]{8}$/, ''))).toEqual(['FleetToken']);
   });
 
   test('the secret names are configurable, and an unusable one fails at synth', () => {
@@ -574,6 +588,127 @@ describe('transport security', () => {
     );
     expect(secrets.some((arn) => arn.includes('team/lldb-prod-key'))).toBe(true);
     expect(() => synth({ tls: 'fleet', tlsSecretPrefix: 'no spaces allowed' })).toThrow(/Secrets Manager name/);
+  });
+});
+
+describe('fleet secret', () => {
+  /** Every `Environment` entry across every container in the template, flattened. */
+  function allEnvEntries(template: Template): { Name: string; Value: unknown }[] {
+    return containers(template).flatMap((c) => (c.Environment ?? []) as { Name: string; Value: unknown }[]);
+  }
+
+  /** Every `Secrets` entry across every container, keeping the raw (unstringified) `ValueFrom`. */
+  function allSecretEntries(template: Template): { Name: string; ValueFrom: unknown }[] {
+    return containers(template).flatMap((c) => (c.Secrets ?? []) as { Name: string; ValueFrom: unknown }[]);
+  }
+
+  test('tls=fleet generates exactly one secret, and CloudFormation is what generates its value', () => {
+    // `GenerateSecretString` is a recipe, not a value: Secrets Manager mints the bytes server-side
+    // at create time. That is what keeps the secret out of source, out of context, and out of
+    // `cdk.out` — the property the issue actually asks for.
+    const template = synth({ tls: 'fleet', servicesDb: 'none' });
+    template.resourceCountIs('AWS::SecretsManager::Secret', 1);
+    template.hasResourceProperties('AWS::SecretsManager::Secret', {
+      GenerateSecretString: Match.objectLike({ PasswordLength: 64, ExcludePunctuation: true }),
+    });
+  });
+
+  test('both roles get it as a SECRET, and it appears in no plain environment anywhere', () => {
+    // A plain `environment` entry is stored verbatim in the task definition, which means anyone who
+    // can call `describe-task-definition` reads the fleet's shared secret out of the control plane.
+    const template = synth({
+      tls: 'fleet',
+      warehouses: [
+        { name: 'analytics', size: 2 },
+        { name: 'etl', size: 1 },
+      ],
+    });
+    // Every worker fleet, not just the first — a warehouse whose workers check no credential is the
+    // hole the other two closed, reachable by name.
+    expect(containers(template).map((c) => c.Name).sort()).toEqual(['coordinator', 'worker', 'worker']);
+    for (const container of containers(template)) {
+      expect(secretsOf(container)[FLEET_TOKEN_ENV]).toBeDefined();
+      expect(envOf(container)[FLEET_TOKEN_ENV]).toBeUndefined();
+    }
+    expect(allEnvEntries(template).filter((e) => e.Name === FLEET_TOKEN_ENV)).toEqual([]);
+    // …and the injected value is a CloudFormation reference to the secret, never an inline string.
+    for (const entry of allSecretEntries(template).filter((s) => s.Name === FLEET_TOKEN_ENV)) {
+      expect(typeof entry.ValueFrom).not.toBe('string');
+    }
+  });
+
+  test('every role resolves the same secret — a fleet holding two tokens cannot talk to itself', () => {
+    // The same invariant as the single image tag, for the same reason: the coordinator presents this
+    // value on every Flight call and signs each plan assertion with a key derived from it, and a
+    // worker rejects anything that is not byte-identical.
+    const resolved = new Set(
+      containers(
+        synth({
+          tls: 'fleet',
+          warehouses: [
+            { name: 'analytics', size: 2 },
+            { name: 'etl', size: 1 },
+          ],
+        }),
+      ).map((c) => secretsOf(c)[FLEET_TOKEN_ENV]),
+    );
+    expect(resolved.size).toBe(1);
+  });
+
+  test('no generated secret value reaches the synthesized template', () => {
+    // The value cannot be asserted directly — it does not exist until CloudFormation creates the
+    // resource. What can be asserted is that no literal ever could: a `SecretString` property is the
+    // only way a Secrets Manager secret carries one, and nothing here has one.
+    for (const tls of ['none', 'fleet'] as const) {
+      const rendered = JSON.stringify(synth({ tls }).toJSON());
+      // Note the quote: `"GenerateSecretString"` is the recipe and must be allowed through.
+      expect(rendered).not.toContain('"SecretString"');
+      expect(rendered).not.toContain('SecretStringValue');
+    }
+    // …and the fleet secret specifically carries a recipe and nothing else — asserted on the
+    // resource rather than on the whole template, where the services database's own generated
+    // secret would satisfy a substring match without this one being checked at all.
+    const [fleetToken] = Object.entries(
+      synth({ tls: 'fleet' }).findResources('AWS::SecretsManager::Secret'),
+    ).filter(([id]) => id.startsWith('FleetToken'));
+    expect(fleetToken).toBeDefined();
+    expect(Object.keys((fleetToken[1] as any).Properties).sort()).toEqual(['Description', 'GenerateSecretString']);
+  });
+
+  test('tls=none creates no fleet secret and injects none, so the default deploy is unchanged', () => {
+    // `cargo run` and the compose demo must keep working with no configuration, and so must this
+    // stack's default mode: no token means no credential is checked, which is exactly the posture
+    // `tls.rs` lets bind a plaintext port without an opt-in.
+    const template = synth({ tls: 'none', servicesDb: 'none' });
+    template.resourceCountIs('AWS::SecretsManager::Secret', 0);
+    expect(allEnvEntries(template).filter((e) => e.Name === FLEET_TOKEN_ENV)).toEqual([]);
+    expect(allSecretEntries(template).filter((s) => s.Name === FLEET_TOKEN_ENV)).toEqual([]);
+    // The default (no `tls` at all) is the same thing by another spelling.
+    expect(allSecretEntries(synth()).filter((s) => s.Name === FLEET_TOKEN_ENV)).toEqual([]);
+  });
+
+  test('only the execution roles that inject it can read it — never the task roles', () => {
+    // The execution role resolves the value at container start; the process then reads its own
+    // environment. The engine carries no AWS SDK and makes no Secrets Manager call at all, so a task
+    // role grant would be a permission nothing uses, on a value the container already holds, that
+    // additionally outlives a rotation. Its absence is a decision, which is why it is asserted.
+    const rendered = Object.entries(synth({ tls: 'fleet' }).findResources('AWS::IAM::Policy')).map(
+      ([name, policy]) => [name, JSON.stringify((policy as any).Properties.PolicyDocument)] as const,
+    );
+
+    const execution = rendered.filter(([name]) => name.includes('ExecutionRoleDefaultPolicy'));
+    expect(execution).toHaveLength(2);
+    for (const [, doc] of execution) {
+      expect(doc).toContain('secretsmanager:GetSecretValue');
+      expect(doc).toContain('FleetToken');
+    }
+
+    const taskRoles = rendered.filter(([name]) => name.includes('TaskRoleDefaultPolicy'));
+    expect(taskRoles).toHaveLength(2);
+    for (const [, doc] of taskRoles) {
+      expect(doc).not.toContain('FleetToken');
+      expect(doc).not.toContain('secretsmanager');
+    }
   });
 });
 
