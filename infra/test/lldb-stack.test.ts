@@ -9,7 +9,7 @@ import {
   WORKER_SERVICE_NAME,
   WAREHOUSE_ENDPOINT_TEMPLATE,
   warehouseEndpointTemplate,
-  FLEET_TLS_DOMAIN,
+  DEFAULT_FLEET_TLS_DOMAIN,
   FLEET_TOKEN_ENV,
   REQUIRE_FLEET_TOKEN_ENV,
 } from '../lib/lldb-stack';
@@ -499,7 +499,7 @@ describe('transport security', () => {
         expect.arrayContaining(['LLDB_TLS_CA_PEM', 'LLDB_TLS_CERT_PEM', 'LLDB_TLS_KEY_PEM']),
       );
       expect(secrets.LLDB_TLS_KEY_PEM).toContain('lldb/fleet-tls-key');
-      expect(envOf(worker).LLDB_TLS_DOMAIN).toBe(FLEET_TLS_DOMAIN);
+      expect(envOf(worker).LLDB_TLS_DOMAIN).toBe(DEFAULT_FLEET_TLS_DOMAIN);
     }
   });
 
@@ -512,7 +512,7 @@ describe('transport security', () => {
     expect(secrets.LLDB_TLS_CA_PEM).toContain('lldb/fleet-tls-ca');
     expect(secrets.LLDB_TLS_CERT_PEM).toBeUndefined();
     expect(secrets.LLDB_TLS_KEY_PEM).toBeUndefined();
-    expect(envOf(coordinator).LLDB_TLS_DOMAIN).toBe(FLEET_TLS_DOMAIN);
+    expect(envOf(coordinator).LLDB_TLS_DOMAIN).toBe(DEFAULT_FLEET_TLS_DOMAIN);
   });
 
   test('the private key is unreadable by the coordinator task role, in IAM and not only in env', () => {
@@ -567,17 +567,103 @@ describe('transport security', () => {
     expect(env.LLDB_WAREHOUSE_ENDPOINT).toContain('{warehouse}');
   });
 
-  test('the certificate is verified under one fleet-wide name, not a per-warehouse one', () => {
-    // The SAN problem, as an assertion. `discovery.rs` expands a Cloud Map name into one URL per
-    // *task IP*, so a certificate for `analytics.lldb.local` would never be the name verified —
-    // and the dialing trust is process-global, so a coordinator spanning warehouses has exactly
-    // one name to offer. Both roles must therefore agree on the single name the leaf carries.
-    const domains = containers(
-      synth({ tls: 'fleet', warehouses: [{ name: 'analytics', size: 1 }, { name: 'etl', size: 1 }] }),
-    ).map((c) => envOf(c).LLDB_TLS_DOMAIN);
-    expect(new Set(domains)).toEqual(new Set([FLEET_TLS_DOMAIN]));
-    expect(FLEET_TLS_DOMAIN.endsWith(NAMESPACE)).toBe(true);
-    expect(FLEET_TLS_DOMAIN).not.toContain('{warehouse}');
+  test.each([
+    ['the default', undefined, DEFAULT_FLEET_TLS_DOMAIN],
+    ['a supplied one', 'fleet.example.com', 'fleet.example.com'],
+  ] as const)(
+    'the certificate is verified under one fleet-wide name (%s), not a per-warehouse one',
+    (_label, tlsDomain, expected) => {
+      // The SAN problem, as an assertion. `discovery.rs` expands a Cloud Map name into one URL per
+      // *task IP*, so a certificate for `analytics.lldb.local` would never be the name verified —
+      // and the dialing trust is process-global, so a coordinator spanning warehouses has exactly
+      // one name to offer. Both roles must therefore agree on the single name the leaf carries,
+      // whichever name that is: `tlsDomain` changes the value and must never change the *arity*.
+      const domains = containers(
+        synth({
+          tls: 'fleet',
+          ...(tlsDomain ? { tlsDomain } : {}),
+          warehouses: [{ name: 'analytics', size: 1 }, { name: 'etl', size: 1 }],
+        }),
+      ).map((c) => envOf(c).LLDB_TLS_DOMAIN);
+      expect(new Set(domains)).toEqual(new Set([expected]));
+      expect(expected).not.toContain('{warehouse}');
+    },
+  );
+
+  test('the default name is unchanged, so an existing `-c tls=fleet` deploy is byte-for-byte the same', () => {
+    // The compatibility claim, asserted against a *literal* rather than against the exported
+    // constant: `scripts/mint-fleet-tls.sh` hard-codes the same string on the other side of this
+    // setting, so a rename or a re-derivation of the constant that moved the default would silently
+    // invalidate every certificate already minted. Both spellings, so neither can drift alone.
+    expect(DEFAULT_FLEET_TLS_DOMAIN).toBe('fleet.lldb.local');
+    expect(DEFAULT_FLEET_TLS_DOMAIN.endsWith(NAMESPACE)).toBe(true);
+    for (const container of containers(synth({ tls: 'fleet' }))) {
+      expect(envOf(container).LLDB_TLS_DOMAIN).toBe('fleet.lldb.local');
+    }
+    synth({ tls: 'fleet' }).hasOutput('FleetTlsDomain', { Value: 'fleet.lldb.local' });
+  });
+
+  test('a supplied tlsDomain reaches every role that dials — both halves of the shuffle included', () => {
+    // "Every role that dials" is every container this stack deploys: the coordinator dials workers,
+    // and a worker dials its peers for the shuffle as well as serving them. A name that reached only
+    // one of them would fail worker→worker while client→coordinator looked healthy.
+    const template = synth({
+      tls: 'fleet',
+      tlsDomain: 'fleet.example.com',
+      warehouses: [{ name: 'analytics', size: 2 }, { name: 'etl', size: 1 }],
+    });
+    expect(containers(template).map((c) => c.Name).sort()).toEqual(['coordinator', 'worker', 'worker']);
+    for (const container of containers(template)) {
+      expect(envOf(container).LLDB_TLS_DOMAIN).toBe('fleet.example.com');
+    }
+    // …and the output an operator reads back to confirm what the fleet is verifying.
+    template.hasOutput('FleetTlsDomain', { Value: 'fleet.example.com' });
+  });
+
+  test('tlsDomain without tls=fleet fails synth rather than being silently discarded', () => {
+    // This is issue #86's own defect class, one flag over: `tls: 'none'` sets no LLDB_TLS_DOMAIN at
+    // all, so accepting the value here would drop it on the floor and deploy a plaintext fleet to an
+    // operator who believes they configured a certificate name. The message names the missing flag.
+    for (const props of [{ tlsDomain: 'fleet.example.com' }, { tls: 'none' as const, tlsDomain: 'fleet.example.com' }]) {
+      expect(() => synth(props)).toThrow(/tlsDomain is only meaningful with tls='fleet'/);
+    }
+    // The default mode with no tlsDomain is untouched — the guard must not make plaintext undeployable.
+    expect(() => synth({ tls: 'none' })).not.toThrow();
+  });
+
+  // A SAN list is comma-separated and a DNS name has no spaces, so either would corrupt the
+  // certificate's name rather than fail — the same check the mint script runs on `--domain`, on this
+  // side of the same setting. A wildcard is rejected because rustls matches a wildcard that is in
+  // the *certificate* against a concrete name; one here matches nothing.
+  test.each([
+    ['a space', 'fleet example com'],
+    ['a comma', 'fleet.example.com,evil.example.com'],
+    ['a wildcard', '*.example.com'],
+    ['a scheme', 'https://fleet.example.com'],
+    ['a port', 'fleet.example.com:50051'],
+    ['a trailing dot', 'fleet.example.com.'],
+    ['an empty string', ''],
+    // RFC 1035 caps a label at 63 characters, and rustls enforces it when it parses
+    // LLDB_TLS_DOMAIN into a ServerName — so without this the value is refused on a deployed
+    // fleet at client-config time, which is the failure the validator exists to move to synth.
+    ['a label over 63 characters', `${'a'.repeat(64)}.example.com`],
+    ['an over-long single label', 'a'.repeat(64)],
+  ])('refuses a tlsDomain with %s', (_label, tlsDomain) => {
+    expect(() => synth({ tls: 'fleet', tlsDomain })).toThrow(/is not a DNS name/);
+  });
+
+  test('accepts the shapes a real deployment actually uses', () => {
+    // Guard against a regex tightened into uselessness: a single label, a hyphenated one, and an
+    // ordinary public name all have to survive.
+    for (const tlsDomain of [
+      'fleet',
+      'lldb-fleet.corp.internal',
+      'fleet.example.com',
+      // Exactly at RFC 1035's label limit: the bound must reject 64, not 63.
+      `${'a'.repeat(63)}.example.com`,
+    ]) {
+      expect(() => synth({ tls: 'fleet', tlsDomain })).not.toThrow();
+    }
   });
 
   test('the stack creates no secret of its own for TLS — it imports what the operator minted', () => {

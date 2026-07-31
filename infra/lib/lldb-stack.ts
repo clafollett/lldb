@@ -44,10 +44,10 @@ export const warehouseEndpointTemplate = (scheme: 'http' | 'https'): string =>
 export const WAREHOUSE_ENDPOINT_TEMPLATE = warehouseEndpointTemplate('http');
 
 /**
- * The one name every worker's certificate is issued for, and the name every client verifies
- * against (`LLDB_TLS_DOMAIN`).
+ * The **default** name every worker's certificate is issued for, and the name every client verifies
+ * against (`LLDB_TLS_DOMAIN`). Overridden per deployment by {@link LldbStackProps.tlsDomain}.
  *
- * It is a fixed fleet-wide name rather than a per-warehouse one, and that is forced rather than
+ * Whatever the value, there is exactly **one** of it per stack, and that is forced rather than
  * chosen — twice over. `lldb_qe_core::discovery` expands a Cloud Map name into one URL **per task
  * IP**, so what a client would otherwise verify is `10.0.1.47`, an address allocated at task start
  * that changes on every replacement and every scale event; no certificate minted in advance can
@@ -55,10 +55,14 @@ export const WAREHOUSE_ENDPOINT_TEMPLATE = warehouseEndpointTemplate('http');
  * serialized into a plan and can carry nothing per-call), while one coordinator dials several
  * warehouses — so there is exactly one name available to verify against, for all of them.
  *
- * The certificate therefore carries `DNS:fleet.lldb.local`: the URL's IP connects, this name
- * verifies, and it is a SAN the leaf genuinely has rather than a mismatch papered over.
+ * The certificate therefore carries `DNS:<this name>`: the URL's IP connects, the name verifies,
+ * and it is a SAN the leaf genuinely has rather than a mismatch papered over.
+ *
+ * This value matches `scripts/mint-fleet-tls.sh`'s own default, so the two agree when neither is
+ * told otherwise. It is a name inside the stack's private Cloud Map namespace, which is why it is
+ * a safe default: nothing resolves it, and nothing has to — it is only ever a name to verify.
  */
-export const FLEET_TLS_DOMAIN = `fleet.${NAMESPACE}`;
+export const DEFAULT_FLEET_TLS_DOMAIN = `fleet.${NAMESPACE}`;
 
 /** Prefix of the three Secrets Manager secrets holding the fleet's PEM material. */
 export const DEFAULT_TLS_SECRET_PREFIX = 'lldb/fleet-tls';
@@ -245,6 +249,29 @@ export interface LldbStackProps extends cdk.StackProps {
    * different prefixes unless they are meant to be one trust domain.
    */
   readonly tlsSecretPrefix?: string;
+  /**
+   * The name every role verifies a dialed peer's certificate against (`LLDB_TLS_DOMAIN`), and
+   * therefore the name the fleet leaf must carry as a SAN. Defaults to
+   * {@link DEFAULT_FLEET_TLS_DOMAIN}.
+   *
+   * **Pass exactly what `scripts/mint-fleet-tls.sh --domain` was given.** The two are one setting
+   * split across two tools: the script puts the name in the certificate, this puts it in every
+   * client's environment, and a mismatch is not a degraded mode — it is every handshake in the
+   * fleet failing, client→coordinator and worker→worker alike, discovered at deploy time.
+   *
+   * **One value for the whole stack, not one per warehouse, and that is a constraint rather than a
+   * simplification.** `ClientTrust`'s domain is process-global in
+   * `crates/lldb-qe-control/src/tls.rs` (re-exported as `lldb_qe_core::tls`)
+   * — a `FlightReaderExec` is serialized into a plan and can carry nothing per-call, while one
+   * coordinator dials several warehouses — so a process has exactly one name it can verify with.
+   * Per-warehouse certificates are unrepresentable today; a `Record<warehouse, string>` here would
+   * synthesize fine and then fail every cross-warehouse query. See {@link DEFAULT_FLEET_TLS_DOMAIN}.
+   *
+   * Only meaningful under `tls: 'fleet'` — supplying it in any other mode is a **synth error**
+   * rather than a silently discarded setting, because a certificate name that quietly does not
+   * reach the fleet is the exact failure this prop exists to prevent.
+   */
+  readonly tlsDomain?: string;
 }
 
 /**
@@ -502,6 +529,17 @@ export class LldbStack extends cdk.Stack {
     const tlsMode: TlsMode = props.tls ?? 'none';
     const scheme = tlsMode === 'fleet' ? 'https' : 'http';
     const tlsSecretPrefix = validateSecretPrefix(props.tlsSecretPrefix ?? DEFAULT_TLS_SECRET_PREFIX);
+    // A certificate name with no certificate to name is not a harmless no-op — it is an operator who
+    // minted for their own domain, mistyped or forgot `-c tls=fleet`, and got a plaintext fleet with
+    // no complaint. `tls: 'none'` sets no `LLDB_TLS_DOMAIN` at all (see the block below), so the
+    // value would be dropped on the floor; say so at synth instead.
+    if (props.tlsDomain !== undefined && tlsMode !== 'fleet') {
+      throw new Error(
+        `tlsDomain is only meaningful with tls='fleet' (got tls=${JSON.stringify(tlsMode)}). ` +
+          'Pass `-c tls=fleet` alongside it, or drop it — in plaintext mode nothing verifies a name.',
+      );
+    }
+    const tlsDomain = validateTlsDomain(props.tlsDomain ?? DEFAULT_FLEET_TLS_DOMAIN);
 
     const tlsEnv: Record<string, string> = {};
     const workerTlsSecrets: Record<string, ecs.Secret> = {};
@@ -515,9 +553,10 @@ export class LldbStack extends cdk.Stack {
       const certSecret = secretsmanager.Secret.fromSecretNameV2(this, 'FleetTlsCert', `${tlsSecretPrefix}-cert`);
       const keySecret = secretsmanager.Secret.fromSecretNameV2(this, 'FleetTlsKey', `${tlsSecretPrefix}-key`);
 
-      // One name, every role, every warehouse. See {@link FLEET_TLS_DOMAIN}: this is what makes a
-      // fleet dialed by task IP verifiable at all.
-      tlsEnv.LLDB_TLS_DOMAIN = FLEET_TLS_DOMAIN;
+      // One name, every role, every warehouse — whichever name that is. See
+      // {@link DEFAULT_FLEET_TLS_DOMAIN}: this is what makes a fleet dialed by task IP verifiable at
+      // all, and {@link LldbStackProps.tlsDomain} for why the choice is stack-wide.
+      tlsEnv.LLDB_TLS_DOMAIN = tlsDomain;
 
       clientTlsSecrets.LLDB_TLS_CA_PEM = ecs.Secret.fromSecretsManager(caSecret);
       workerTlsSecrets.LLDB_TLS_CA_PEM = clientTlsSecrets.LLDB_TLS_CA_PEM;
@@ -739,7 +778,7 @@ export class LldbStack extends cdk.Stack {
         description: 'Secrets Manager secrets holding the fleet CA, certificate and private key',
       });
       new cdk.CfnOutput(this, 'FleetTlsDomain', {
-        value: FLEET_TLS_DOMAIN,
+        value: tlsDomain,
         description: 'The name the fleet certificate is issued for, and that every client verifies',
       });
       // The ARN, never the value — same rule as the services-database secret. Rotating is
@@ -829,6 +868,48 @@ function validateSecretPrefix(prefix: string): string {
     );
   }
   return prefix;
+}
+
+/**
+ * A DNS name: dot-separated labels of `[A-Za-z0-9-]`, none leading or trailing a `-`, and **none
+ * longer than 63 characters** — RFC 1035's limit on a label, which rustls enforces when it parses
+ * `LLDB_TLS_DOMAIN` into a `ServerName`. Without the `{0,61}` bound a 100-character label passes
+ * here and is refused there, on a deployed fleet at client-config time, which is the failure this
+ * whole function exists to move to synth.
+ *
+ * Deliberately no `*`: this is the name a client *verifies*, and rustls matches a wildcard that is
+ * in the certificate against a concrete name — a wildcard on this side matches nothing.
+ */
+const TLS_DOMAIN_LABEL = '[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?';
+const TLS_DOMAIN_RE = new RegExp(`^${TLS_DOMAIN_LABEL}(?:\\.${TLS_DOMAIN_LABEL})*$`);
+/** A DNS name's own limit, and the limit on a certificate's `DNS:` SAN with it. */
+const MAX_TLS_DOMAIN_LEN = 253;
+/** RFC 1035's limit on a single label, enforced by {@link TLS_DOMAIN_LABEL}'s `{0,61}`. */
+const MAX_TLS_LABEL_LEN = 63;
+
+/**
+ * Refuse a TLS domain that could never verify, at synth time.
+ *
+ * Guards the failure `scripts/mint-fleet-tls.sh` guards on `--domain`, on the other side of the same
+ * setting, and for the reason it gives: a name with a space or a comma in it corrupts the SAN rather
+ * than failing, and a certificate with a mangled SAN fails at handshake time on a deployed fleet —
+ * the most expensive place to find out.
+ *
+ * Stricter than that script, deliberately: a wildcard, a port or a scheme passes the script's check
+ * and is still a name webpki will never match, and this side is the one that can say so before
+ * anything is deployed. The stricter side refusing is a synth error naming the input; the looser
+ * side refusing would have been a fleet that cannot handshake.
+ */
+function validateTlsDomain(domain: string): string {
+  if (typeof domain !== 'string' || domain.length > MAX_TLS_DOMAIN_LEN || !TLS_DOMAIN_RE.test(domain)) {
+    throw new Error(
+      `tlsDomain ${JSON.stringify(domain)} is not a DNS name: up to ${MAX_TLS_DOMAIN_LEN} characters of ` +
+        `dot-separated [A-Za-z0-9-] labels, each at most ${MAX_TLS_LABEL_LEN}, no wildcard ` +
+        '(it becomes LLDB_TLS_DOMAIN, and must be a name the minted certificate carries as a SAN ' +
+        '— see scripts/mint-fleet-tls.sh --domain)',
+    );
+  }
+  return domain;
 }
 
 /** `wh-analytics` → `WhAnalytics`, for a construct id. Ids are alphanumeric by convention and

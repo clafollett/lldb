@@ -157,5 +157,8 @@ cd infra && npm ci && npm test                            # CDK assertion tests
 cd infra && npx cdk synth -c imageTag=<version+sha>       # emit CloudFormation
 ./scripts/mint-fleet-tls.sh                               # fleet CA + cert -> Secrets Manager
 cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet   # TLS fleet (mint first)
+# Non-default certificate name: pass the SAME name to both, or every handshake fails.
+./scripts/mint-fleet-tls.sh --domain fleet.example.com
+cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet -c tlsDomain=fleet.example.com
 ```
 

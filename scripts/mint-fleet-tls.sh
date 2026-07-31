@@ -13,8 +13,9 @@
 #               CA bundle and webpki refuses a trust anchor that is not marked as a CA, so
 #               "one self-signed leaf, trusted directly" fails with an opaque UnknownIssuer.
 #
-#   one leaf    shared by every worker in every warehouse, carrying `DNS:fleet.lldb.local`.
-#               Not one per warehouse, and not IP SANs, and neither is a shortcut:
+#   one leaf    shared by every worker in every warehouse, carrying `DNS:<--domain>` (default
+#               `fleet.lldb.local`). Not one per warehouse, and not IP SANs, and neither is a
+#               shortcut:
 #                 * a Fargate task's IP is allocated at task start and changes on every
 #                   replacement and every scale event — which is exactly the elasticity
 #                   `discovery.rs` exists to deliver — so no certificate minted in advance can
@@ -23,7 +24,9 @@
 #                   into a plan and can carry nothing per-call) while one coordinator dials several
 #                   warehouses, so there is exactly one name available to verify against.
 #               The stack sets LLDB_TLS_DOMAIN to that name: the URL's IP connects, the
-#               certificate's own SAN verifies.
+#               certificate's own SAN verifies. `--domain` and the stack's `-c tlsDomain` are two
+#               halves of ONE setting and must be given the same value — see the note this script
+#               prints when they would differ.
 #
 # The **CA private key is never uploaded**. It stays in the output directory so it can re-issue a
 # leaf later; keep it somewhere offline, or discard it and accept that the next mint replaces the
@@ -33,13 +36,16 @@
 #   ./scripts/mint-fleet-tls.sh                                   # default prefix, ./fleet-tls-ca
 #   ./scripts/mint-fleet-tls.sh --prefix team/lldb-prod --days 90
 #   ./scripts/mint-fleet-tls.sh --ca-dir ~/keys/lldb-ca           # re-issue from an existing CA
+#   ./scripts/mint-fleet-tls.sh --domain fleet.example.com        # then deploy with the SAME name:
+#     cd infra && npx cdk deploy -c imageTag=… -c tls=fleet -c tlsDomain=fleet.example.com
 #
 # Needs: openssl, and an AWS CLI already authenticated to the target account/region.
 
 set -euo pipefail
 
 PREFIX="lldb/fleet-tls"
-# Must match the CDK stack's FLEET_TLS_DOMAIN — that is what every client is told to verify.
+# Matches the CDK stack's DEFAULT_FLEET_TLS_DOMAIN, so the two agree when neither is told otherwise
+# — that is what every client is told to verify. Change it here and change it there (`-c tlsDomain`).
 DEFAULT_DOMAIN="fleet.lldb.local"
 DOMAIN="$DEFAULT_DOMAIN"
 DAYS=825           # the CA/Browser Forum's cap on leaf lifetime; a sane habit even privately.
@@ -51,7 +57,8 @@ while [[ $# -gt 0 ]]; do
     --domain) DOMAIN="$2"; shift 2 ;;
     --days) DAYS="$2"; shift 2 ;;
     --ca-dir) CA_DIR="$2"; shift 2 ;;
-    -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
+    # The header block, which ends at the `Needs:` line — keep this range in step with it.
+    -h|--help) sed -n '2,42p' "$0"; exit 0 ;;
     *) echo "ERROR: unknown argument '$1' (try --help)" >&2; exit 2 ;;
   esac
 done
@@ -157,7 +164,7 @@ was never uploaded. Keep it offline, or delete it and accept that the next mint 
 root (a full fleet restart, not a rolling one).
 
 Next:
-  cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet$([[ "$PREFIX" != "lldb/fleet-tls" ]] && echo " -c tlsSecretPrefix=$PREFIX")
+  cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet$([[ "$PREFIX" != "lldb/fleet-tls" ]] && echo " -c tlsSecretPrefix=$PREFIX")$([[ "$DOMAIN" != "$DEFAULT_DOMAIN" ]] && echo " -c tlsDomain=$DOMAIN")
 
 Rotating later: re-run this script, then force a new deployment so tasks pick the new material up
 (the engine reads its certificate once, at startup):
@@ -169,9 +176,13 @@ if [[ "$DOMAIN" != "$DEFAULT_DOMAIN" ]]; then
   cat >&2 <<EOF
 
 NOTE: this certificate is issued for '$DOMAIN', not the default '$DEFAULT_DOMAIN'.
-Every client verifies the name in LLDB_TLS_DOMAIN, and the CDK stack pins that to
-'$DEFAULT_DOMAIN' — so \`-c tls=fleet\` will fail EVERY handshake against this certificate.
-Use this only where you set LLDB_TLS_DOMAIN=$DOMAIN yourself (compose, or a hand-rolled task
-definition).
+Every client verifies the name in LLDB_TLS_DOMAIN, so the deploy must carry the SAME name:
+
+  -c tlsDomain=$DOMAIN
+
+Deploying \`-c tls=fleet\` WITHOUT it leaves every client verifying '$DEFAULT_DOMAIN' against this
+certificate, and every handshake in the fleet fails — coordinator to worker and worker to worker
+alike, at handshake time, on a deployed fleet. Anywhere that is not the CDK stack (compose, a
+hand-rolled task definition), set LLDB_TLS_DOMAIN=$DOMAIN yourself instead.
 EOF
 fi
