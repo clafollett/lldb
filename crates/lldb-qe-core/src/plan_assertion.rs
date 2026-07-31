@@ -66,9 +66,24 @@
 //! - **Attribution.** The account and user reach the worker, so a worker's logs can say who a stage
 //!   was run for. Nothing before this could.
 //!
-//! Asymmetric signing (coordinators hold a private key, workers only a public one) is what would
-//! make a compromised worker unable to mint. It is a key-distribution problem this deliberately does
-//! not open; the format carries a version byte, which is where that change lands.
+//! Asymmetric signing (coordinators hold a private key, workers only a public one) is what makes a
+//! compromised worker unable to mint, and **the mechanism for it now exists here**: [`SigningKey`],
+//! [`VerifyingKey`], [`KeyId`], and the format-version-2 payload that carries the key id inside the
+//! signed bytes. Read what that does and does not yet mean:
+//!
+//! - **Nothing configures it yet.** No binary reads a signing key, [`PlanAuth`] still derives from
+//!   the fleet secret, and every deployment mints and checks exactly the v1 assertion it did before.
+//!   #127 lands in three stages and this is the first; the second wires the coordinator's private
+//!   key and the worker's *set* of accepted public keys, which is where the posture rule changes.
+//! - **The ceiling moves but does not disappear.** Asymmetric signing relocates the trust boundary
+//!   from *any fleet member* to *any coordinator*. A compromised **coordinator** still mints an
+//!   assertion for any tenant naming any location. That is a large improvement — workers are the
+//!   numerous, plan-executing half — and it is not "the coordinator proved it" in a sense that
+//!   survives a compromised coordinator.
+//! - **A worker accepting signatures does not fall back to the MAC.** [`SignedAssertion::verify_signed`]
+//!   refuses a v1 payload by name rather than checking it the old way, because a verifier that can
+//!   be talked into the weaker of two schemes is a downgrade attack wearing a migration —
+//!   [`crate::tls`]'s "the scheme is the switch and there is no fallback", one layer up.
 //!
 //! # What the covering check verifies — and what it cannot
 //!
@@ -98,10 +113,13 @@
 //!   `FileScanConfig` — the one way this engine reads bytes at rest — and descends into
 //!   `FlightReaderExec::inner`, which `children()` does not report. A future node that reads storage
 //!   by another route would be invisible here and must be added to that walk.
-//! - **Rotation needs a restart.** The key is derived from `LLDB_FLEET_TOKEN`, which
-//!   [`crate::flight::ambient_fleet_auth`] reads once per process, and exactly one key is accepted.
-//!   Rotating it therefore means rotating the fleet secret and restarting every coordinator and
-//!   worker, and a rolling restart has a window in which the halves disagree. Accepting a set of
+//! - **Rotating the *symmetric* key needs a restart, and always will.** It is derived from
+//!   `LLDB_FLEET_TOKEN`, which [`crate::flight::ambient_fleet_auth`] reads once per process, and
+//!   exactly one key is accepted. That is why the asymmetric half takes a **set** of verifying keys
+//!   instead: widen the set, move the signer, narrow the set — three passes, each rolling-safe
+//!   alone, because at every moment every verifier accepts the key every signer is using. It is the
+//!   same shape as a multi-root TLS trust bundle and it is that shape for the same reason;
+//!   `infra/README.md`'s *Rotating* documents the procedure. Accepting a set of
 //!   keys (a key id in the payload, a previous-secret variable) is what would make rotation
 //!   hitless; it is not built here, and pretending the current design supports it would be worse
 //!   than saying so.
@@ -235,7 +253,7 @@ impl fmt::Debug for AssertionKey {
 // The asymmetric key pair — what a compromised worker cannot mint with (#127)
 // ---------------------------------------------------------------------------
 
-/// Names which key signed an assertion: the first [`KEY_ID_BYTES`] of `SHA-256(public key)`.
+/// Names which key signed an assertion: the first four bytes of `SHA-256(public key)`.
 ///
 /// **Derived, never registered.** A registry would be one more thing to keep in sync across a
 /// fleet, and the whole point of rotation being three passes is that a worker's accepted set is the
