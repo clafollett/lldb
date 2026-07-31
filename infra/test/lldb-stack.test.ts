@@ -11,6 +11,7 @@ import {
   warehouseEndpointTemplate,
   FLEET_TLS_DOMAIN,
   FLEET_TOKEN_ENV,
+  REQUIRE_FLEET_TOKEN_ENV,
 } from '../lib/lldb-stack';
 
 const IMAGE_TAG = '0.1.0+abcdef123456';
@@ -683,6 +684,41 @@ describe('fleet secret', () => {
     ).filter(([id]) => id.startsWith('FleetToken'));
     expect(fleetToken).toBeDefined();
     expect(Object.keys((fleetToken[1] as any).Properties).sort()).toEqual(['Description', 'GenerateSecretString']);
+  });
+
+  test('tls=fleet asserts the closed posture on every role, in plain environment', () => {
+    // The token alone was not tamper-evident: `FleetAuth::from_env` reads blank as unset and ECS
+    // injects `FOO=` for an emptied secret, so one console edit opened the fleet at the next task
+    // replacement. This entry is what turns that into a refusal to start.
+    //
+    // `Environment` and NOT `Secrets`, which is the inverse of the rule the token lives under one
+    // block up — deliberately. It carries no secret; it is a claim *about* the secret, and being
+    // readable in the task definition is the mechanism rather than a leak. Asserting the mechanism
+    // and not just the name is the point of splitting these two expectations.
+    const template = synth({
+      tls: 'fleet',
+      warehouses: [
+        { name: 'analytics', size: 2 },
+        { name: 'etl', size: 1 },
+      ],
+    });
+    expect(containers(template).map((c) => c.Name).sort()).toEqual(['coordinator', 'worker', 'worker']);
+    for (const container of containers(template)) {
+      expect(envOf(container)[REQUIRE_FLEET_TOKEN_ENV]).toBeDefined();
+      expect(secretsOf(container)[REQUIRE_FLEET_TOKEN_ENV]).toBeUndefined();
+    }
+    expect(allSecretEntries(template).filter((s) => s.Name === REQUIRE_FLEET_TOKEN_ENV)).toEqual([]);
+  });
+
+  test('tls=none asserts nothing, so the default deploy and every single-node path are untouched', () => {
+    // The whole reason the assertion is opt-in rather than the default: `cargo run`, the compose
+    // demo and this stack's default mode must need no configuration at all. A stack that shipped
+    // this variable in both modes would make `tls: 'none'` undeployable.
+    for (const props of [{ tls: 'none' as const, servicesDb: 'none' as const }, {}]) {
+      const template = synth(props);
+      expect(allEnvEntries(template).filter((e) => e.Name === REQUIRE_FLEET_TOKEN_ENV)).toEqual([]);
+      expect(allSecretEntries(template).filter((s) => s.Name === REQUIRE_FLEET_TOKEN_ENV)).toEqual([]);
+    }
   });
 
   test('tls=none creates no fleet secret and injects none, so the default deploy is unchanged', () => {

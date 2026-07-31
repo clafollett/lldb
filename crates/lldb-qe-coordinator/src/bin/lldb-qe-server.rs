@@ -64,7 +64,10 @@
 //! One thing this still does not do, and a deployment must: set `LLDB_FLEET_TOKEN` to the same
 //! value here and on every worker, so the workers this server dispatches to refuse plans from
 //! anyone else. TLS does not make that redundant — it protects the secret in transit; it does not
-//! prove who is presenting one.
+//! prove who is presenting one. A deployment that has done it can also *assert* it, with
+//! `LLDB_REQUIRE_FLEET_TOKEN`: present in the environment, a blank or missing fleet secret refuses
+//! to start here instead of quietly dispatching to an open fleet. See
+//! [`lldb_qe_core::auth::REQUIRE_FLEET_TOKEN_ENV`].
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -73,6 +76,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use lldb_qe_core::auth::check_fleet_posture_from_env;
 use lldb_qe_core::engine::TenantSessions;
 use lldb_qe_core::fleet_admission::FleetAdmission;
 use lldb_qe_core::liveness::{
@@ -207,6 +211,13 @@ async fn main() -> Result<()> {
         version = lldb_qe_core::BUILD_VERSION,
         "starting lldb-qe-server"
     );
+
+    // First, and before the database connection below, let alone the bind: if this deployment
+    // asserted that its fleet is closed, a blank `LLDB_FLEET_TOKEN` stops the process rather than
+    // producing a front door that authenticates its callers and then dispatches their plans to an
+    // open fleet. `lldb_qe_core::auth::REQUIRE_FLEET_TOKEN_ENV` holds the argument for presence
+    // rather than a value, and for this being a startup check rather than a fallible `from_env`.
+    check_fleet_posture_from_env()?;
 
     let config = cli.storage.to_config()?;
     // Same guard as the one-shot coordinator: an in-memory object store is invisible to a worker

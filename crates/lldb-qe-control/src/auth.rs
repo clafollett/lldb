@@ -110,6 +110,10 @@
 //! Unset, a worker accepts everything and logs a loud startup warning naming the variable — because
 //! `cargo run -p lldb-qe-worker` and the compose demo must keep working with no configuration,
 //! while an insecure posture must be impossible to hold *by accident*.
+//!
+//! A warning is not enough for a *deployment*, though, and [`REQUIRE_FLEET_TOKEN_ENV`] is where
+//! that is argued: a deployment can assert that its fleet is closed, and then a blank secret is a
+//! refusal to start rather than a log line.
 
 use std::fmt;
 
@@ -960,12 +964,24 @@ pub enum FleetAuth {
 
 impl FleetAuth {
     /// Read the ambient configuration from [`FLEET_TOKEN_ENV`].
+    pub fn from_env() -> Self {
+        Self::from_value(std::env::var(FLEET_TOKEN_ENV).ok().as_deref())
+    }
+
+    /// [`Self::from_env`]'s rule, without the read.
     ///
     /// A blank or whitespace-only value reads as unset, for the same reason it does in
     /// [`crate::services`]: compose and ECS both cheerfully inject `FOO=` for an unset variable.
-    pub fn from_env() -> Self {
-        match std::env::var(FLEET_TOKEN_ENV) {
-            Ok(token) if !token.trim().is_empty() => Self::Required(token.trim().to_string()),
+    ///
+    /// Split out so that [`check_fleet_posture`] can ask *this* what "set" means rather than
+    /// re-deriving it — a guard that disagreed with the thing it guards about which values count
+    /// would refuse a fleet that would have worked, or pass one that would not.
+    ///
+    /// Deliberately not `pub`: its only caller is that guard, in this module. A crate every other
+    /// crate re-exports should not widen its API for a seam that never crosses it.
+    fn from_value(token: Option<&str>) -> Self {
+        match token {
+            Some(token) if !token.trim().is_empty() => Self::Required(token.trim().to_string()),
             _ => Self::Open,
         }
     }
@@ -1030,6 +1046,113 @@ impl fmt::Debug for FleetAuth {
             FleetAuth::Required(_) => f.write_str("FleetAuth::Required(****)"),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// A deployment asserting the closed posture
+// ---------------------------------------------------------------------------
+
+/// Environment variable by which a **deployment** asserts that its worker fleet is closed.
+///
+/// **Presence is the assertion; the value is never read.** Absent, nothing changes and
+/// [`FleetAuth::from_env`]'s permissive default stands — which is what keeps `cargo run`, the
+/// compose demo and every single-node path working with no configuration at all. Present with *any*
+/// value, including the empty string, and a blank or missing [`FLEET_TOKEN_ENV`] becomes a refusal
+/// to start ([`check_fleet_posture`]).
+///
+/// # The defect this closes
+///
+/// [`FleetAuth::from_env`] reads blank as unset, and ECS injects `FOO=` for an emptied secret. So
+/// emptying the fleet secret opened the whole fleet at the next restart, and the only signal was a
+/// `warn` — which is precisely the signal nobody is watching at the moment it matters. The posture
+/// was tamper-*logged* rather than tamper-*evident*.
+///
+/// # Why presence and not `=1`
+///
+/// Issue #101 sketched `LLDB_REQUIRE_FLEET_TOKEN=1`. Implemented literally, the guard is defeated
+/// by *the same edit it exists to catch*: emptying this variable would turn the check off, and
+/// emptying [`FLEET_TOKEN_ENV`] would then open the fleet — two console edits instead of one, and
+/// the guard has reproduced the defect it was added to close. With presence as the assertion,
+/// blanking **either** variable leaves the strict posture in force, and weakening it means
+/// *deleting* the variable from the task definition: a structural diff the next `cdk deploy`
+/// reverts, and one that shows up in the task-definition revision history rather than in a log line.
+///
+/// Do not "improve" this into a parsed `1`/`true`/`yes`. Parsing the value is the bug.
+///
+/// # Why the inversion is not a mistake to fix either
+///
+/// Every other switch in this repo is opt-in to the *insecure* thing — `--allow-plaintext`,
+/// `--allow-anonymous` (see [`crate::tls`]). This one is opt-in to the *secure* thing, which is
+/// backwards by this codebase's idiom and is forced rather than chosen: making a blank token an
+/// error unconditionally would make `cargo run` require a fleet secret, which CLAUDE.md forbids in
+/// the same breath it forbids `cargo run` requiring Postgres. A deployment opting in is the only
+/// shape left that leaves the laptop path untouched.
+pub const REQUIRE_FLEET_TOKEN_ENV: &str = "LLDB_REQUIRE_FLEET_TOKEN";
+
+/// The [`REQUIRE_FLEET_TOKEN_ENV`] policy, as a pure function of the two variables.
+///
+/// `required` is `Some` when [`REQUIRE_FLEET_TOKEN_ENV`] is **present**, whatever it holds — the
+/// argument's contents are deliberately never inspected. `token` is [`FLEET_TOKEN_ENV`]'s raw value.
+///
+/// Pure, and that is a testability requirement rather than a style preference: the environment is
+/// process-global, `std::env::set_var` is `unsafe` in edition 2024, and
+/// `crates/lldb-qe-core/tests/integration/main.rs` makes "no test in this binary mutates the
+/// environment" a standing rule that the ambient fleet auth's `OnceLock` depends on. A policy
+/// reachable only through `std::env` would be a policy nothing could test.
+pub fn check_fleet_posture(required: Option<&str>, token: Option<&str>) -> Result<()> {
+    if required.is_none() {
+        return Ok(());
+    }
+    // Asked of `FleetAuth` rather than re-derived: a token this says is `Open` is exactly a token a
+    // worker would not check, which is the condition being refused.
+    if FleetAuth::from_value(token).is_required() {
+        return Ok(());
+    }
+    // Which of the two it is, because they have different fixes and the wrong guess costs an
+    // outage's worth of debugging. Never the value — a *rejected* token is still a secret, and the
+    // rejected ones are blank or absent anyway.
+    let observed = match token {
+        Some(_) => "present but blank",
+        None => "not set",
+    };
+    bail!(
+        "{REQUIRE_FLEET_TOKEN_ENV} is set, so this deployment asserts that its worker fleet is \
+         closed — but {FLEET_TOKEN_ENV} is {observed}, which would leave every worker Flight port \
+         executing any physical plan anything routable can hand it. Refusing to start. Fix it by \
+         setting {FLEET_TOKEN_ENV} to the same non-empty value on every coordinator and every \
+         worker. If this deployment is genuinely meant to run open, DELETE \
+         {REQUIRE_FLEET_TOKEN_ENV} from it — emptying that variable changes nothing, because its \
+         presence is the assertion."
+    )
+}
+
+/// [`check_fleet_posture`] against this process's own environment. Call it from `main`.
+///
+/// # Why a startup function and not a fallible `FleetAuth::from_env`
+///
+/// `from_env` initializes a `OnceLock` (`lldb_qe_core::flight::ambient_fleet_auth`), and a
+/// `OnceLock` initializer cannot fail. Its callers are `WorkerFlightService::new` and
+/// `fetch_stream` — a port that is already bound and a request that is already in flight. "Refuse
+/// to start" is not an outcome available at either. Threading a `Result` through both would cost
+/// two public signatures and still leave the refusal happening *after* the bind, which is the one
+/// property this has to have. So it is a separate check, called from `main` before anything binds,
+/// beside [`crate::tls::TlsArgs::resolve_server`] — which is refused in the same place, at the same
+/// moment, for the same reason.
+///
+/// It reads the environment rather than inspecting a [`FleetAuth`] for a related reason:
+/// [`REQUIRE_FLEET_TOKEN_ENV`] is not part of that type and must not become part of it, because
+/// `FleetAuth` is the *runtime* posture (open or closed) while this is a *deployment's claim about*
+/// that posture, and a value that folded them together could not express "closed was asserted and
+/// is not the case".
+pub fn check_fleet_posture_from_env() -> Result<()> {
+    // `var_os` for the assertion, `var` for the token, and the asymmetry is load-bearing:
+    // `std::env::var` reports a non-UTF-8 value as *absent*, which would hand back exactly the
+    // "edit the value to disarm the guard" hole this whole mechanism exists to remove.
+    // `to_string_lossy` cannot lose presence.
+    let required =
+        std::env::var_os(REQUIRE_FLEET_TOKEN_ENV).map(|value| value.to_string_lossy().into_owned());
+    let token = std::env::var(FLEET_TOKEN_ENV).ok();
+    check_fleet_posture(required.as_deref(), token.as_deref())
 }
 
 #[cfg(test)]
@@ -1223,5 +1346,71 @@ mod tests {
         );
         assert!(AuthError::Revoked.to_string().contains("revoked"));
         assert!(AuthError::Expired.to_string().contains("expired"));
+    }
+
+    /// The whole `REQUIRE_FLEET_TOKEN_ENV` × `FLEET_TOKEN_ENV` matrix, in one table.
+    ///
+    /// Both axes carry the cases that are *not* the obvious ones and are the point of the design:
+    /// an assertion variable that is present and **empty** must still assert (that is the ECS
+    /// `FOO=` shape), and a token that is present and blank must still be a refusal (that is the
+    /// same shape, one variable over). Nothing here touches `std::env` — see
+    /// [`check_fleet_posture`] on why the policy is a pure function.
+    #[test]
+    fn the_assertion_is_the_variables_presence_and_never_its_value() {
+        // `required` absent: unchanged behaviour, whatever the token is. This row is `cargo run`,
+        // the compose demo and `tls: 'none'`, and it must never fail.
+        for token in [None, Some(""), Some("   "), Some("s3cret")] {
+            check_fleet_posture(None, token).unwrap_or_else(|e| {
+                panic!("no assertion must never refuse (token {token:?}): {e}")
+            });
+        }
+
+        // `required` present: every spelling asserts identically, including the empty string an
+        // emptied ECS variable arrives as, and including a value that reads like a disabling one.
+        for required in [Some(""), Some(" "), Some("1"), Some("0"), Some("false")] {
+            check_fleet_posture(required, Some("s3cret"))
+                .unwrap_or_else(|e| panic!("a real token must satisfy {required:?}: {e}"));
+            // Leading/trailing space is what `FleetAuth::from_value` trims *into* a real token, so
+            // the guard must agree that this one is set rather than refusing a working fleet.
+            check_fleet_posture(required, Some(" s3cret "))
+                .unwrap_or_else(|e| panic!("a padded token must satisfy {required:?}: {e}"));
+
+            for blank in [None, Some(""), Some("   "), Some("\t\n")] {
+                assert!(
+                    check_fleet_posture(required, blank).is_err(),
+                    "{required:?} + a blank token ({blank:?}) must refuse to start"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_refusal_names_both_variables_the_operator_has_to_touch() {
+        // A refusal nobody can act on is a warning with extra steps. Both names, because the fix is
+        // "set one" *or* "delete the other" and the message is the only place that is written down.
+        for (token, expected) in [(None, "not set"), (Some("   "), "present but blank")] {
+            let message = check_fleet_posture(Some(""), token)
+                .expect_err("a blank token under an assertion must refuse")
+                .to_string();
+            assert!(message.contains(REQUIRE_FLEET_TOKEN_ENV), "{message}");
+            assert!(message.contains(FLEET_TOKEN_ENV), "{message}");
+            assert!(message.contains(expected), "{message}");
+        }
+    }
+
+    #[test]
+    fn the_refusal_does_not_vary_with_either_variables_value() {
+        // Standing rule: a credential is never logged, and an error message is a log line. Asserted
+        // as *invariance* rather than as a substring search, because the only tokens that can reach
+        // a refusal are blank ones and "the message does not contain whitespace" proves nothing.
+        // Two refusals whose inputs differ only in bytes must be byte-identical messages, which is
+        // false the moment anyone interpolates either value.
+        let refuse = |required, token| {
+            check_fleet_posture(required, token)
+                .expect_err("an assertion over a blank token refuses")
+                .to_string()
+        };
+        assert_eq!(refuse(Some(""), Some("   ")), refuse(Some("1"), Some("\t")));
+        assert_eq!(refuse(Some("please"), None), refuse(Some(""), None));
     }
 }

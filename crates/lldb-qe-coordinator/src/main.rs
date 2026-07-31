@@ -103,6 +103,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use datafusion::arrow::util::pretty::pretty_format_batches;
+use lldb_qe_core::auth::check_fleet_posture_from_env;
 use lldb_qe_core::lakehouse::Lakehouse;
 use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{
@@ -193,6 +194,15 @@ async fn main() -> Result<()> {
         version = lldb_qe_core::BUILD_VERSION,
         "starting lldb-qe-coordinator"
     );
+
+    // Hold the deployment to its own assertion before anything is dialed. This binary binds no
+    // port, but it is the other half of the same secret: with a blank `LLDB_FLEET_TOKEN` it
+    // presents no credential and mints no plan assertion, so a fleet blanked on both sides runs
+    // wide open and answers queries while doing it. Refusing here is what makes the whole fleet's
+    // posture tamper-evident rather than only the workers'. See
+    // `lldb_qe_core::auth::REQUIRE_FLEET_TOKEN_ENV`; with the variable absent this is a no-op, so a
+    // checkout is untouched.
+    check_fleet_posture_from_env()?;
 
     // What this process trusts when it dials a worker. Installed before anything dials, once, from
     // this invocation's own flags — a worker dial is issued from inside a serialized plan and so
