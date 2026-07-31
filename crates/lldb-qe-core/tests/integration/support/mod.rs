@@ -174,8 +174,28 @@ fn start_container() -> Result<Target> {
 
     let deadline = Instant::now() + READY_TIMEOUT;
     loop {
+        // `-h 127.0.0.1` is load bearing: probe the **same transport the caller will use**.
+        //
+        // Without it `pg_isready` uses the container's unix socket, and the official postgres
+        // entrypoint runs a *temporary* server on that socket — `listen_addresses` empty, so no
+        // TCP at all — while it runs initdb and the init scripts. The socket therefore goes green
+        // before the real server exists: 227 ms of window, measured on this image. Inside it this
+        // function would hand back a `postgres://127.0.0.1:<port>` URL pointing at a docker-proxy
+        // with nothing behind it, the caller's connect would be closed at once, and sqlx would
+        // report `expected to read 5 bytes, got 0 bytes at EOF` — which reads as a database bug,
+        // lands on whichever tests happen to start under load, and moves between runs.
         let probe = Command::new("docker")
-            .args(["exec", &name, "pg_isready", "-U", "lldb", "-d", "lldb"])
+            .args([
+                "exec",
+                &name,
+                "pg_isready",
+                "-h",
+                "127.0.0.1",
+                "-U",
+                "lldb",
+                "-d",
+                "lldb",
+            ])
             .output()
             .context("probing the container with pg_isready")?;
         if probe.status.success() {
