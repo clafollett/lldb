@@ -94,7 +94,8 @@
 //! - **Which fleet member you are.** This is *server-authenticated* TLS: a client verifies the
 //!   server's certificate; the server does not verify the client's. Whether a client certificate
 //!   should *replace* [`crate::auth::FleetAuth`]'s shared secret was **decided in #106: no, and not
-//!   before #83 and #127.** `infra/` mints one *shared* fleet leaf — it has to, because a Fargate
+//!   before certificate reload and #127** — and #83 then decided against reload for now, which is
+//!   the last bullet here. `infra/` mints one *shared* fleet leaf — it has to, because a Fargate
 //!   task's IP is allocated at task start — and a shared client certificate authenticates the fleet
 //!   rather than the member, which is precisely what the secret already does. Per-member
 //!   certificates would say more, but not the thing that matters: what authorizes a request is
@@ -111,6 +112,16 @@
 //!   fails a plaintext client's handshake rather than answering it — but it does mean the operator
 //!   who turns on certificates must also change the `--workers` URLs to `https://`, and a
 //!   half-converted fleet fails loudly rather than quietly falling back.
+//! - **Rotation without a restart.** [`ServerTls::configure`] hands rustls the acceptor once and
+//!   each binary calls [`install_client_trust`] once from its parsed flags, so replaced material
+//!   takes effect when the process is replaced — the same property [`crate::auth`]'s fleet secret
+//!   has, and **#83 decided to document rather than close**: a restart is already this fleet's
+//!   operating model (its members must run the identical build, and that secret is read once per
+//!   process), so reloading here would make one restart trigger of three hitless. Replacing the
+//!   **CA** is the sharp edge, because in one pass it fails every handshake between the halves for
+//!   the length of the rollout. A trust bundle may carry more than one root — every PEM block in
+//!   `--tls-ca` becomes an anchor — so a CA transition trusts both for a window and costs three
+//!   restarts instead of one outage. `infra/README.md`'s *Rotating* has the steps.
 //!
 //! # Three details worth keeping straight
 //!

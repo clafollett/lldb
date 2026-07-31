@@ -314,8 +314,8 @@ back per peer. Neither exists, and the second is a *downgrade attack* wearing a 
 `tls.rs` states that the scheme is the switch and that a TLS server refuses a plaintext client
 rather than obliging it. #83 is the related constraint: the engine builds its TLS acceptor once at
 startup and never re-reads its material, so there is no certificate-reload path a task could use to
-change posture without being replaced. Until that changes, the flip costs a window, and the honest
-thing to do is schedule it.
+change posture without being replaced — and #83 decided against adding one, for the reasons under
+*Rotating* below. So the flip costs a window, and the honest thing to do is schedule it.
 
 ### Why the PEM is an environment variable and not a file
 
@@ -358,12 +358,18 @@ that its peer holds the fleet's key, not which worker it is. That is already the
 this engine's TLS — it is server-authenticated, and per-member identity is `LLDB_FLEET_TOKEN`'s
 claim. **#106 decided not to change that**: a shared client certificate would authenticate the fleet
 exactly as the secret already does, and per-member certificates buy revocation granularity that the
-absence of a reload path (#83) cannot deliver. Revisit after #83 and #127.
+absence of a reload path cannot deliver — which #83 then decided to keep absent (see *Rotating*).
+Revisit only if that changes, and after #127.
 
 ### Rotating
 
-The engine reads its certificate once, at startup. So rotation is: re-run the mint script (it reuses
-the CA in `./fleet-tls-ca` unless you delete it), then force a new deployment.
+The engine reads its TLS material **once, at startup** — no file watch, no reload signal — so every
+rotation is a restart. That is a decision and not an oversight; `crates/lldb-qe-core/CLAUDE.md`'s TLS
+section argues it under #83. The fleet secret above and a new `imageTag` are restarts for the same
+reason, so when more than one is due, do them in **one** restart rather than three.
+
+**A leaf near expiry, same CA — one rolling restart, no query outage.** Every task trusts the same
+root before and after, so a half-replaced fleet still handshakes. This is the common case.
 
 ```bash
 ./scripts/mint-fleet-tls.sh                    # …and --domain again, if the fleet uses one
@@ -371,13 +377,82 @@ aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices
   --force-new-deployment
 ```
 
+Nothing to do for the coordinator — it is a one-shot `run-task`, so the next run reads whatever the
+secrets then hold. Check **both** expiries, not just the leaf's: the script mints a leaf for 825 days
+and its CA for twice that, so a CA covers roughly two leaf generations and then becomes the deadline
+itself — and a leaf signed by an expired root fails every handshake exactly as an expired leaf does.
+
+```bash
+for part in ca cert; do
+  aws secretsmanager get-secret-value --secret-id "lldb/fleet-tls-$part" \
+    --query SecretString --output text | openssl x509 -noout -subject -enddate
+done
+```
+
 **Re-pass `--domain` when rotating a fleet that uses one.** The script defaults to
 `fleet.lldb.local` on every run, so a rotation that forgets it replaces a working certificate with
 one the deployed `LLDB_TLS_DOMAIN` does not match — and the fleet fails every handshake as the
 forced deployment rolls, without the stack having changed at all.
 
-Replacing the **CA** rather than the leaf is not rolling — every role has to restart together, since
-half a fleet trusting a root the other half does not sign under fails every handshake between them.
+#### Replacing the CA is three restarts, or one outage — pick deliberately
+
+Doing it in one pass is neither: mid-roll, half the fleet trusts a root the other half does not sign
+under, so **every** handshake between the halves fails — worker to worker as much as coordinator to
+worker — for the length of the rollout, while looking like an ordinary deployment. Losing
+`./fleet-tls-ca` and re-minting against a live fleet is exactly that pass, which is why the script
+says so on its way out.
+
+**The cheap way, when a window is acceptable.** Drain, swap, scale back up:
+
+```bash
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> --desired-count 0
+mv ./fleet-tls-ca ./fleet-tls-ca-old            # moved, not deleted: the way back if the deploy fails
+./scripts/mint-fleet-tls.sh                     # a brand-new root, leaf and key
+aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> --desired-count <size>
+```
+
+One legible outage ("no workers") instead of a mixture of handshake failures nobody can tell apart
+from a bad certificate — the same argument as the `tls=none` → `tls=fleet` flip above. For a POC
+stack nobody is querying, this is the right answer.
+
+**The no-outage way: trust both roots for a window.** `LLDB_TLS_CA_PEM` is a *bundle* — every PEM
+block in it becomes a trust anchor — so the old and the new root can both be live while the leaves
+move across. `mint-fleet-tls.sh` will not do this for you: it uploads the single CA it just signed
+with, so the CA secret is written by hand in passes 1 and 3.
+
+```bash
+# Pass 1 — both roots trusted, old leaf still served. This run exists to mint the new root: the
+# three secrets it writes under the throwaway prefix are read by nothing. (--domain, in both runs
+# below, if the fleet uses one: the rule from the leaf case applies to every mint.)
+./scripts/mint-fleet-tls.sh --ca-dir ./fleet-tls-ca-new --prefix lldb/fleet-tls-unused
+cat ./fleet-tls-ca/ca.crt ./fleet-tls-ca-new/ca.crt > ./both-roots.pem
+aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca --secret-string file://./both-roots.pem
+aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment   # wait for it
+
+# Pass 2 — leaves re-issued under the new root, both roots still trusted. The two commands go back
+# to back: the script overwrites the CA secret with the new root alone, and a task that happens to
+# start in that gap cannot dial a peer still serving the old leaf.
+./scripts/mint-fleet-tls.sh --ca-dir ./fleet-tls-ca-new
+aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca --secret-string file://./both-roots.pem
+aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment   # wait for it
+
+# Pass 3 — old root retired.
+aws secretsmanager put-secret-value --secret-id lldb/fleet-tls-ca \
+  --secret-string file://./fleet-tls-ca-new/ca.crt
+aws ecs update-service --cluster <ClusterName> --service <each> --force-new-deployment
+```
+
+Each pass is rolling-safe on its own, because at every moment every task trusts the root that signed
+every leaf being served. Let each deployment finish before starting the next — passes that overlap
+are the one-pass swap by another route. Then clean up: keep `./fleet-tls-ca-new/ca.key` offline,
+discard the old CA directory, and delete the three secrets pass 1 left behind.
+
+```bash
+for part in ca cert key; do
+  aws secretsmanager delete-secret --secret-id "lldb/fleet-tls-unused-$part" \
+    --force-delete-without-recovery
+done
+```
 
 ## Tests
 

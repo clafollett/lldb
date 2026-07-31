@@ -29,8 +29,8 @@
 #               prints when they would differ.
 #
 # The **CA private key is never uploaded**. It stays in the output directory so it can re-issue a
-# leaf later; keep it somewhere offline, or discard it and accept that the next mint replaces the
-# whole trust root (which needs every task restarted, not just the workers).
+# leaf later; keep it offline. Discard it and the next mint replaces the trust root — which is a
+# phased rotation or a query outage, never a plain roll: see "Rotating" in infra/README.md.
 #
 # Usage:
 #   ./scripts/mint-fleet-tls.sh                                   # default prefix, ./fleet-tls-ca
@@ -161,13 +161,15 @@ cat <<EOF
 Done. The fleet's private key was deleted from this machine after upload — it now exists only in
 Secrets Manager. The CA private key is a separate thing and IS still here, in $CA_DIR/ca.key: it
 was never uploaded. Keep it offline, or delete it and accept that the next mint replaces the trust
-root (a full fleet restart, not a rolling one).
+root — which is a phased rotation or a query outage, never a plain roll. See "Rotating" in
+infra/README.md before you do that.
 
 Next:
   cd infra && npx cdk deploy -c imageTag=<version+sha> -c tls=fleet$([[ "$PREFIX" != "lldb/fleet-tls" ]] && echo " -c tlsSecretPrefix=$PREFIX")$([[ "$DOMAIN" != "$DEFAULT_DOMAIN" ]] && echo " -c tlsDomain=$DOMAIN")
 
-Rotating later: re-run this script, then force a new deployment so tasks pick the new material up
-(the engine reads its certificate once, at startup):
+Rotating the leaf later — same CA, because this script reuses $CA_DIR: re-run it, then force a new
+deployment so tasks pick the new material up (the engine reads its certificate once, at startup).
+That roll is safe on its own; every task trusts the same root throughout.
   aws ecs update-service --cluster <ClusterName> --service <each WarehouseServices entry> \\
     --force-new-deployment
 EOF

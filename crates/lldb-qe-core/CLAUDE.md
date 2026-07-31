@@ -216,10 +216,11 @@ door would encrypt one hop of a mesh. Certificates are **supplied, never minted*
    authentication: a client verifies the server, never the reverse. Which fleet member is calling is
    still the shared secret's claim alone, and mTLS at the worker boundary was **decided against in
    #106** — a shared client leaf proves fleet membership, which is what the secret already proves,
-   and per-member leaves buy revocation granularity that #83 (no reload path) cannot deliver yet.
-   Revisit only after #83 and #127. Say so rather than letting "we have TLS now" imply more than it
-   does. What a request *is* — the per-request half — is `plan_assertion.rs`'s job, not TLS's; the
-   two are complementary and the next section covers it.
+   and per-member leaves buy revocation granularity that no certificate-reload path can deliver,
+   and #83 decided against building one (below). Revisit only if that changes, and after #127. Say
+   so rather than letting "we have TLS now" imply more than it does. What a request *is* — the
+   per-request half — is `plan_assertion.rs`'s job, not TLS's; the two are complementary and the
+   next section covers it.
 4. **The scheme is the switch, and there is no fallback.** `https://` dials TLS, `http://` does not,
    and a TLS server refuses a plaintext client rather than obliging it — so turning certificates on
    means changing the `--workers` URLs too, and a half-converted fleet fails loudly. Note the trap
@@ -256,6 +257,38 @@ up — which is the guard working. `infra/` is no longer a gap: `-c tls=fleet` i
 three Secrets Manager secrets that `scripts/mint-fleet-tls.sh` fills, and the stack **imports** them
 rather than creating them so that a private key is never something CDK holds. It still does not set
 `LLDB_ALLOW_PLAINTEXT`, in either mode, and a CDK test asserts that in both.
+
+### Rotation is a restart — the same property as the assertion key's, not a second surprise
+
+`ServerTls::configure` hands rustls the acceptor once at startup, and each binary calls
+`install_client_trust` once from its own parsed flags. Nothing watches a file and nothing reloads on
+a signal, so replaced material takes effect when the **process** is replaced and not before. That is
+the previous section's 6 in different material — every secret this fleet holds is read once per
+process — and it is why #73 rejected AWS Private CA: automatic renewal renews something nothing
+re-reads.
+
+The two shapes cost differently, and the difference is the whole operational story:
+
+- **A new leaf under the same CA is one rolling restart with no window.** Every task trusts the same
+  root throughout, so a half-replaced fleet still handshakes.
+- **A new CA is three restarts.** Swap the root and the leaf in one pass and mid-roll half the fleet
+  trusts a root the other half does not sign under: every handshake between the halves fails,
+  worker-to-worker included, which is the mesh this section exists to encrypt end to end. The way
+  through is a window in which both roots are trusted, and *that* much is expressible — `--tls-ca` /
+  `--tls-ca-pem` is a **bundle**, and every PEM block in it becomes a trust anchor. So: add the new
+  root beside the old and restart; re-issue the leaves under the new CA and restart; drop the old
+  root and restart. Each pass is rolling-safe alone, running them as one pass is the outage, and
+  `infra/README.md`'s *Rotating* holds the commands.
+
+**Do not build the reload path yet, and the reason is not that it is hard.** A stop-the-world restart
+is already this system's operating model, twice over: the version wall means a coordinator and its
+workers must run the *identical* build, so the fleet cannot roll across engine versions either, and
+`LLDB_FLEET_TOKEN` is one accepted key read once per process. A reloadable `ServerConfig` behind
+rustls's `ResolvesServerCert` plus a swappable trust store would therefore make **one of three**
+restart triggers hitless and leave the other two — the fleet would still not be hitless, and there
+would be a reload path to keep correct forever. What changes the answer is a deployment that cannot
+take a full restart. None exists: the fleet is stateless by design, a warehouse can be drained, and
+**#9, the first real AWS deploy, has not run.**
 
 ## A catalog per tenant — the boundary the grant check no longer carries alone
 
