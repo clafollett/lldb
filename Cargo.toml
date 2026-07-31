@@ -118,6 +118,13 @@ hex = "0.4"        # render the digest for storage
 rand = "0.9"       # 32 bytes of CSPRNG per token
 base64 = "0.22"    # URL-safe token encoding
 
+# Ed25519 for the plan assertion's asymmetric half (#127), and deliberately NOT a new crypto stack:
+# `ring` is already in this tree via `object_store` and rustls, at one version, and it is the
+# provider `tls.rs` *installs* rather than infers — precisely so a future dependency pulling
+# `aws-lc-rs` cannot panic the process. Signing with the provider already chosen keeps that argument
+# intact; `ed25519-dalek` would be a second implementation of the same primitive for no gain.
+ring = "0.17"
+
 # --- Errors, logging, small utils ---
 anyhow = "1"
 thiserror = "2"

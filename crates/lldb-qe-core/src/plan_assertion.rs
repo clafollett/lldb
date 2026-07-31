@@ -116,7 +116,8 @@ use base64::Engine as _;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use ring::signature::{ED25519, Ed25519KeyPair, KeyPair as _, UnparsedPublicKey};
+use sha2::{Digest as _, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::auth::FleetAuth;
@@ -143,6 +144,28 @@ const KEY_DOMAIN: &[u8] = b"lldb/plan-assertion/v1/key";
 
 /// Domain separator prefixed to every MAC input, for the same reason.
 const MAC_DOMAIN: &[u8] = b"lldb/plan-assertion/v1/mac";
+
+/// Payload format version for the **signed** assertion: Ed25519 rather than HMAC (#127).
+///
+/// A v2 payload is `2 || key_id[4] || <the same body a v1 payload carries>`. The body is byte-for-
+/// byte identical on purpose — what changes between the versions is who can produce the signature,
+/// not what is being asserted, and keeping the body one shape is what lets [`PlanAssertion::decode`]
+/// dispatch on the leading byte and then run one parser.
+const FORMAT_VERSION_SIGNED: u8 = 2;
+
+/// Domain separator prefixed to every signature input.
+///
+/// Distinct from [`MAC_DOMAIN`] so that no byte string is ever both a valid v1 MAC input and a valid
+/// v2 signature input, even if some future deployment held both a fleet secret and a signing key.
+const SIGN_DOMAIN: &[u8] = b"lldb/plan-assertion/v2/sign";
+
+/// Bytes of `SHA-256(public key)` that name a key.
+///
+/// Four, because a key id is a *lookup* into a set an operator configured, not a security boundary:
+/// the signature is what authorizes, and a collision here costs one extra verification attempt
+/// rather than an accepted forgery. Four bytes keep the header small while making an accidental
+/// collision between two keys a fleet actually holds vanishingly unlikely.
+const KEY_ID_BYTES: usize = 4;
 
 /// How long a minted assertion is good for.
 ///
@@ -205,6 +228,148 @@ impl fmt::Debug for AssertionKey {
     /// structs that binaries log at startup — the same rule [`crate::auth::FleetAuth`] follows.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("AssertionKey(****)")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The asymmetric key pair — what a compromised worker cannot mint with (#127)
+// ---------------------------------------------------------------------------
+
+/// Names which key signed an assertion: the first [`KEY_ID_BYTES`] of `SHA-256(public key)`.
+///
+/// **Derived, never registered.** A registry would be one more thing to keep in sync across a
+/// fleet, and the whole point of rotation being three passes is that a worker's accepted set is the
+/// only state that has to change. Deriving the id from the key means adding a key to that set is
+/// self-describing: nothing has to agree in advance on what to call it.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub struct KeyId([u8; KEY_ID_BYTES]);
+
+impl KeyId {
+    /// The id of an Ed25519 public key.
+    pub fn of_public_key(public_key: &[u8]) -> Self {
+        let digest = Sha256::digest(public_key);
+        let mut id = [0u8; KEY_ID_BYTES];
+        id.copy_from_slice(&digest[..KEY_ID_BYTES]);
+        Self(id)
+    }
+}
+
+impl fmt::Debug for KeyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KeyId({self})")
+    }
+}
+
+impl fmt::Display for KeyId {
+    /// Hex, because a key id is the one part of this module that belongs in a log line: an operator
+    /// diagnosing a refused assertion needs to see *which* key was named and compare it to the set
+    /// they configured. It identifies a public key, so it is not a secret.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for byte in self.0 {
+            write!(f, "{byte:02x}")?;
+        }
+        Ok(())
+    }
+}
+
+/// The private half: what a **coordinator** holds, and what a worker must not.
+///
+/// This is the whole of #127 in one type. With [`AssertionKey`] a worker could mint as well as
+/// verify, so an assertion proved only *"someone in this fleet authorized this"*; a worker that
+/// holds no `SigningKey` cannot produce one at all.
+///
+/// Not `Clone`, because `ring`'s key pair is not, and that is a property worth keeping rather than
+/// working around: one process, one signing key, no copies to lose track of.
+pub struct SigningKey {
+    pair: Ed25519KeyPair,
+    id: KeyId,
+}
+
+impl SigningKey {
+    /// Load a key from its PKCS#8 v2 document — the format `ring` itself generates.
+    ///
+    /// PKCS#8 rather than a bare 32-byte seed because it carries the public key alongside the
+    /// private one, so `ring` verifies on load that the two halves agree. A bare seed cannot be
+    /// checked against anything, and the failure it hides is a fleet configured with a key whose id
+    /// nobody accepts — which surfaces as every query being refused, far from the mistake.
+    pub fn from_pkcs8(pkcs8: &[u8]) -> Result<Self, AssertionError> {
+        let pair = Ed25519KeyPair::from_pkcs8(pkcs8).map_err(|e| {
+            AssertionError::Malformed(format!("signing key is not a PKCS#8 Ed25519 document: {e}"))
+        })?;
+        let id = KeyId::of_public_key(pair.public_key().as_ref());
+        Ok(Self { pair, id })
+    }
+
+    /// This key's id, which every assertion it signs carries.
+    pub fn id(&self) -> KeyId {
+        self.id
+    }
+
+    /// The public half, to hand a worker.
+    pub fn verifying_key(&self) -> VerifyingKey {
+        VerifyingKey::from_public_key(self.pair.public_key().as_ref().to_vec())
+    }
+
+    fn sign(&self, payload: &[u8]) -> [u8; 64] {
+        let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + payload.len());
+        input.extend_from_slice(SIGN_DOMAIN);
+        input.extend_from_slice(payload);
+        let signature = self.pair.sign(&input);
+        let mut out = [0u8; 64];
+        out.copy_from_slice(signature.as_ref());
+        out
+    }
+}
+
+impl fmt::Debug for SigningKey {
+    /// Never prints the key material. The id is safe and is the useful half — it is what an operator
+    /// matches against a worker's accepted set.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SigningKey(**** id={})", self.id)
+    }
+}
+
+/// The public half: what a **worker** holds, one per key it accepts.
+///
+/// A worker holds a *set* of these, and that is what makes rotation hitless — widen the set, move
+/// the coordinator to the new key, narrow the set, each pass rolling-safe on its own. It is the same
+/// shape as a multi-root TLS trust bundle, for the same reason, and `infra/README.md`'s *Rotating*
+/// documents that shape already.
+#[derive(Clone, PartialEq, Eq)]
+pub struct VerifyingKey {
+    public_key: Vec<u8>,
+    id: KeyId,
+}
+
+impl VerifyingKey {
+    /// Wrap a raw 32-byte Ed25519 public key.
+    ///
+    /// Nothing is validated here beyond the id derivation, because `ring` validates the point during
+    /// verification and a public key is not secret — a malformed one costs a refused assertion
+    /// naming its id, which is exactly the diagnosis an operator needs.
+    pub fn from_public_key(public_key: Vec<u8>) -> Self {
+        let id = KeyId::of_public_key(&public_key);
+        Self { public_key, id }
+    }
+
+    /// This key's id, which is how an assertion names it.
+    pub fn id(&self) -> KeyId {
+        self.id
+    }
+
+    fn verify(&self, payload: &[u8], signature: &[u8]) -> bool {
+        let mut input = Vec::with_capacity(SIGN_DOMAIN.len() + payload.len());
+        input.extend_from_slice(SIGN_DOMAIN);
+        input.extend_from_slice(payload);
+        UnparsedPublicKey::new(&ED25519, &self.public_key)
+            .verify(&input, signature)
+            .is_ok()
+    }
+}
+
+impl fmt::Debug for VerifyingKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "VerifyingKey(id={})", self.id)
     }
 }
 
@@ -375,12 +540,41 @@ impl PlanAssertion {
         }
     }
 
-    /// Sign this payload, producing the header value.
+    /// Sign this payload with the fleet secret's symmetric key, producing the header value.
+    ///
+    /// Unchanged by #127, deliberately: a v1 assertion means exactly what it always meant, and the
+    /// existing tests are the assertion that this held.
     pub fn sign(&self, key: &AssertionKey) -> Result<SignedAssertion> {
         let payload = self.encode();
         let mac = key.mac(&payload);
+        self.assemble(&payload, &mac)
+    }
+
+    /// Sign this payload with a coordinator's **private** key (#127).
+    ///
+    /// The difference that matters is not the algorithm, it is who can produce the result: a worker
+    /// holding only the public half can verify this and cannot mint it, so an assertion stops
+    /// proving *"someone in this fleet authorized this"* and starts proving *"a holder of this
+    /// signing key did"*.
+    ///
+    /// The key's id goes **inside** the signed payload rather than beside it, so it cannot be
+    /// rewritten to point a verifier at a different key than the one that actually signed.
+    pub fn sign_with(&self, key: &SigningKey) -> Result<SignedAssertion> {
+        let payload = self.encode_as(Some(key.id()));
+        let signature = key.sign(&payload);
+        self.assemble(&payload, &signature)
+    }
+
+    /// `base64(payload).base64(signature)`, bounded.
+    ///
+    /// Shared by both signing paths so the bound cannot be enforced on one and forgotten on the
+    /// other — and it is checked against the **assembled header**, not estimated from the payload,
+    /// which is what makes it correct for either signature size. An Ed25519 signature is 64 bytes
+    /// where a MAC is 32, so a v2 header is about 48 characters longer for the same plan; measuring
+    /// the real string means that difference needs no arithmetic here to stay right.
+    fn assemble(&self, payload: &[u8], signature: &[u8]) -> Result<SignedAssertion> {
         let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let header = format!("{}.{}", b64.encode(&payload), b64.encode(mac));
+        let header = format!("{}.{}", b64.encode(payload), b64.encode(signature));
         if header.len() > MAX_ASSERTION_HEADER_BYTES {
             bail!(
                 "this query's plan reads {} distinct location(s), which does not fit in a {}-byte \
@@ -423,8 +617,25 @@ impl PlanAssertion {
     /// [`crate::server`]'s are: the shape is small, the format is readable at a glance, and a
     /// serialization dependency here would have to be canonical to be safe to MAC.
     fn encode(&self) -> Vec<u8> {
+        self.encode_as(None)
+    }
+
+    /// [`Self::encode`], but naming the key that will sign it.
+    ///
+    /// `Some(id)` produces a v2 payload — `2 || key_id[4] || body` — and `None` the v1 payload,
+    /// byte-for-byte what this module has always produced. The **body is identical either way**:
+    /// the version changes who can produce the signature over these bytes, not what they assert. The
+    /// key id lives inside the signed payload rather than beside it precisely so it cannot be
+    /// rewritten to point a verifier at a different key.
+    fn encode_as(&self, key_id: Option<KeyId>) -> Vec<u8> {
         let mut buf = Vec::new();
-        buf.push(FORMAT_VERSION);
+        match key_id {
+            None => buf.push(FORMAT_VERSION),
+            Some(id) => {
+                buf.push(FORMAT_VERSION_SIGNED);
+                buf.extend_from_slice(&id.0);
+            }
+        }
         // `0` and `""` are the "absent" spellings rather than a flags byte: an account id is a
         // Postgres identity column and a user name is non-empty by `validate_identifier`, so neither
         // value is representable and the encoding stays one shape.
@@ -437,15 +648,35 @@ impl PlanAssertion {
         buf
     }
 
-    /// Inverse of [`Self::encode`].
+    /// Inverse of [`Self::encode`], for either version.
     fn decode(buf: &[u8]) -> Result<Self, AssertionError> {
+        Ok(Self::decode_versioned(buf)?.0)
+    }
+
+    /// [`Self::decode`], also reporting which key the payload named.
+    ///
+    /// `None` is a v1 payload, which names no key because an HMAC has only one. Callers that must
+    /// *find* a key before they can verify need this; callers that already have one do not.
+    fn decode_versioned(buf: &[u8]) -> Result<(Self, Option<KeyId>), AssertionError> {
         let (version, rest) = take_u8(buf)?;
-        if version != FORMAT_VERSION {
-            return Err(AssertionError::Malformed(format!(
-                "plan assertion format version {version}, but this build speaks {FORMAT_VERSION} \
-                 (every coordinator and worker must run the identical build)"
-            )));
-        }
+        let (key_id, rest) = match version {
+            FORMAT_VERSION => (None, rest),
+            FORMAT_VERSION_SIGNED => {
+                if rest.len() < KEY_ID_BYTES {
+                    return Err(truncated("key id", KEY_ID_BYTES, rest.len()));
+                }
+                let mut id = [0u8; KEY_ID_BYTES];
+                id.copy_from_slice(&rest[..KEY_ID_BYTES]);
+                (Some(KeyId(id)), &rest[KEY_ID_BYTES..])
+            }
+            other => {
+                return Err(AssertionError::Malformed(format!(
+                    "plan assertion format version {other}, but this build speaks \
+                     {FORMAT_VERSION} and {FORMAT_VERSION_SIGNED} (every coordinator and worker \
+                     must run the identical build)"
+                )));
+            }
+        };
         let (account_id, rest) = take_i64(rest)?;
         let (user, rest) = take_str(rest)?;
         let (issued_at, rest) = take_i64(rest)?;
@@ -458,14 +689,17 @@ impl PlanAssertion {
                 rest.len()
             )));
         }
-        Ok(Self {
-            account_id: (account_id != 0).then_some(account_id),
-            user: (!user.is_empty()).then_some(user),
-            issued_at,
-            expires_at,
-            prefixes,
-            objects,
-        })
+        Ok((
+            Self {
+                account_id: (account_id != 0).then_some(account_id),
+                user: (!user.is_empty()).then_some(user),
+                issued_at,
+                expires_at,
+                prefixes,
+                objects,
+            },
+            key_id,
+        ))
     }
 }
 
@@ -508,17 +742,7 @@ impl SignedAssertion {
         key: &AssertionKey,
         now: SystemTime,
     ) -> Result<PlanAssertion, AssertionError> {
-        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
-        let (payload_b64, mac_b64) = self
-            .0
-            .split_once('.')
-            .ok_or_else(|| AssertionError::Malformed("expected `<payload>.<mac>`".to_string()))?;
-        let payload = b64
-            .decode(payload_b64)
-            .map_err(|e| AssertionError::Malformed(format!("payload is not base64url: {e}")))?;
-        let presented_mac = b64
-            .decode(mac_b64)
-            .map_err(|e| AssertionError::Malformed(format!("mac is not base64url: {e}")))?;
+        let (payload, presented_mac) = self.split()?;
 
         // Constant-time, following [`crate::auth::verify_token`]'s precedent exactly: a byte-at-a-time
         // comparison tells a forger how many leading bytes of their guess were right, which is what
@@ -529,6 +753,81 @@ impl SignedAssertion {
         }
 
         let assertion = PlanAssertion::decode(&payload)?;
+        Self::check_expiry(assertion, now)
+    }
+
+    /// Verify an **Ed25519** signature against a set of accepted keys, yielding the payload (#127).
+    ///
+    /// `accepted` is a set rather than a value, and that is the whole rotation story: widen it to
+    /// both keys, move the coordinator to the new one, narrow it again — three passes, each
+    /// rolling-safe on its own, because at every moment every verifier accepts the key every signer
+    /// is using. It is the same shape as a multi-root TLS trust bundle and it is that shape for the
+    /// same reason; `infra/README.md`'s *Rotating* documents the procedure.
+    ///
+    /// Order matters exactly as it does above: **nothing in the payload is trusted until the
+    /// signature verifies**, including its own expiry. The key id is the one exception and it is not
+    /// an exception to that rule — it is read only to *choose* a key, and choosing the wrong one can
+    /// only make verification fail.
+    pub fn verify_signed(
+        &self,
+        accepted: &[VerifyingKey],
+        now: SystemTime,
+    ) -> Result<PlanAssertion, AssertionError> {
+        let (payload, signature) = self.split()?;
+        let (assertion, key_id) = PlanAssertion::decode_versioned(&payload)?;
+        let Some(key_id) = key_id else {
+            // A v1 payload carries no key id because an HMAC has only one key. Reaching here means
+            // a caller expecting signatures was handed a MAC'd assertion, which is a *downgrade*
+            // and is refused rather than quietly checked the old way.
+            return Err(AssertionError::Malformed(
+                "this assertion is MAC'd (format version 1), but this boundary accepts only                  signed assertions (format version 2). A worker configured with signing keys does                  not fall back to the fleet secret — see the rotation procedure for how to move a                  fleet across."
+                    .to_string(),
+            ));
+        };
+        let Some(key) = accepted.iter().find(|key| key.id() == key_id) else {
+            // Naming the id is the whole diagnosis: it tells an operator whether they are missing a
+            // key from this worker's set or the coordinator is signing with one nobody was told
+            // about. It identifies a public key, so it is safe to say out loud.
+            return Err(AssertionError::Malformed(format!(
+                "assertion names signing key {key_id}, which is not in this boundary's accepted                  set ({}). Either this worker's accepted keys are stale, or the coordinator signed                  with a key that was never distributed.",
+                if accepted.is_empty() {
+                    "empty".to_string()
+                } else {
+                    accepted
+                        .iter()
+                        .map(|key| key.id().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                }
+            )));
+        };
+        if !key.verify(&payload, &signature) {
+            return Err(AssertionError::BadSignature);
+        }
+        Self::check_expiry(assertion, now)
+    }
+
+    /// `<payload>.<signature>`, both base64url-decoded.
+    fn split(&self) -> Result<(Vec<u8>, Vec<u8>), AssertionError> {
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let (payload_b64, sig_b64) = self
+            .0
+            .split_once('.')
+            .ok_or_else(|| AssertionError::Malformed("expected `<payload>.<mac>`".to_string()))?;
+        let payload = b64
+            .decode(payload_b64)
+            .map_err(|e| AssertionError::Malformed(format!("payload is not base64url: {e}")))?;
+        let signature = b64
+            .decode(sig_b64)
+            .map_err(|e| AssertionError::Malformed(format!("mac is not base64url: {e}")))?;
+        Ok((payload, signature))
+    }
+
+    /// The one expiry rule, shared by both verification paths so they cannot drift apart.
+    fn check_expiry(
+        assertion: PlanAssertion,
+        now: SystemTime,
+    ) -> Result<PlanAssertion, AssertionError> {
         let now = unix_seconds(now);
         if now > assertion.expires_at + CLOCK_SKEW_ALLOWANCE.as_secs() as i64 {
             return Err(AssertionError::Expired {
@@ -802,6 +1101,160 @@ mod tests {
             prefixes: vec!["file:///wh/acct_7__lldb/sales/orders/data/".to_string()],
             objects: vec!["SELECT on table lldb.sales.orders".to_string()],
         }
+    }
+
+    /// A deterministic-per-call Ed25519 key pair. `ring` generates PKCS#8, which is what
+    /// `SigningKey::from_pkcs8` takes and what an operator will actually be handed.
+    fn signing_key() -> SigningKey {
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).expect("generate");
+        SigningKey::from_pkcs8(pkcs8.as_ref()).expect("load the key just generated")
+    }
+
+    /// **The property #127 exists for**: a holder of the public half can verify, and cannot mint.
+    ///
+    /// Expressed as a round trip plus the key-set lookup, because those are the two things a worker
+    /// actually does — and asserting the payload survives intact is what makes the signature check
+    /// meaningful rather than a bare boolean.
+    #[test]
+    fn a_signed_assertion_verifies_against_the_public_half_alone() {
+        let now = SystemTime::now();
+        let key = signing_key();
+        let signed = sample(now).sign_with(&key).expect("sign");
+
+        let public = key.verifying_key();
+        // A worker holds only this: 32 bytes of public key and the id derived from them.
+        let verified = signed
+            .verify_signed(std::slice::from_ref(&public), now)
+            .expect("the public half must verify what the private half signed");
+        assert_eq!(verified, sample(now));
+        // The id is derived identically on both sides, so no registry has to agree in advance.
+        assert_eq!(public.id(), key.id());
+    }
+
+    /// A key that did not sign it must not verify it — otherwise the test above passes for a
+    /// verifier that checks nothing.
+    #[test]
+    fn another_key_does_not_verify_it_and_the_refusal_names_the_id_it_wanted() {
+        let now = SystemTime::now();
+        let signer = signing_key();
+        let stranger = signing_key();
+        let signed = sample(now).sign_with(&signer).expect("sign");
+
+        let error = signed
+            .verify_signed(&[stranger.verifying_key()], now)
+            .expect_err("a key that signed nothing must not verify it");
+        let rendered = error.to_string();
+        // The id it *wanted* and the ids it *has* — the whole diagnosis for an operator staring at
+        // a stale accepted set.
+        assert!(rendered.contains(&signer.id().to_string()), "{rendered}");
+        assert!(rendered.contains(&stranger.id().to_string()), "{rendered}");
+
+        // An empty set is the same refusal, not a pass. This is the fail-closed case.
+        assert!(signed.verify_signed(&[], now).is_err());
+    }
+
+    /// A **set**, because that is what makes rotation three rolling-safe passes rather than an
+    /// outage: during the window both keys are accepted, and an assertion signed by either verifies.
+    #[test]
+    fn a_key_set_accepts_every_key_in_it_which_is_what_makes_rotation_rolling() {
+        let now = SystemTime::now();
+        let old = signing_key();
+        let new = signing_key();
+        let during_rotation = [old.verifying_key(), new.verifying_key()];
+
+        for key in [&old, &new] {
+            let signed = sample(now).sign_with(key).expect("sign");
+            signed
+                .verify_signed(&during_rotation, now)
+                .unwrap_or_else(|e| panic!("key {} must verify during the window: {e}", key.id()));
+        }
+
+        // …and narrowing the set is what retires a key: pass 3 of the procedure.
+        let after = [new.verifying_key()];
+        let by_old = sample(now).sign_with(&old).expect("sign");
+        assert!(
+            by_old.verify_signed(&after, now).is_err(),
+            "a retired key must stop verifying once it leaves the set"
+        );
+    }
+
+    /// **No downgrade.** A boundary that accepts signatures must not fall back to the MAC, and the
+    /// converse: a v1 verifier must not be talked into accepting a v2 payload it cannot check.
+    #[test]
+    fn the_two_formats_do_not_verify_each_other() {
+        let now = SystemTime::now();
+        let signing = signing_key();
+        let macd = sample(now).sign(&key()).expect("mac");
+        let signed = sample(now).sign_with(&signing).expect("sign");
+
+        // A MAC'd assertion presented where signatures are required: refused, and the message says
+        // why rather than leaving an operator to guess.
+        let error = macd
+            .verify_signed(&[signing.verifying_key()], now)
+            .expect_err("a MAC must not satisfy a signature check");
+        assert!(error.to_string().contains("format version 1"), "{error}");
+
+        // And the signed one presented to the symmetric verifier: also refused. The MAC is computed
+        // over the whole payload, so the v2 version byte and key id are inside what it covers.
+        assert!(
+            signed.verify(&key(), now).is_err(),
+            "a signature must not satisfy a MAC check"
+        );
+    }
+
+    /// The signature covers the key id, so it cannot be rewritten to point a verifier elsewhere.
+    #[test]
+    fn tampering_with_the_key_id_invalidates_the_signature() {
+        let now = SystemTime::now();
+        let key = signing_key();
+        let signed = sample(now).sign_with(&key).expect("sign");
+        let (mut payload, signature) = signed.split().expect("split");
+
+        // Flip a bit in the key id — byte 1, immediately after the version byte.
+        payload[1] ^= 0x01;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let forged = SignedAssertion(format!(
+            "{}.{}",
+            b64.encode(&payload),
+            b64.encode(&signature)
+        ));
+
+        // It now names a key nobody has, so it is refused at the lookup…
+        assert!(forged.verify_signed(&[key.verifying_key()], now).is_err());
+
+        // …and even if that id happened to be in the set, the signature is over the id too. Prove
+        // that directly rather than relying on the lookup: verify the tampered payload against the
+        // real key, which is what the lookup would have selected.
+        assert!(
+            !key.verifying_key().verify(&payload, &signature),
+            "the signature must cover the key id, not merely sit beside it"
+        );
+    }
+
+    /// Expiry is checked **after** the signature, for both formats — a forged payload must never
+    /// influence a decision, including its own.
+    #[test]
+    fn a_signed_assertion_expires_like_a_macd_one() {
+        let now = SystemTime::now();
+        let key = signing_key();
+        let signed = sample(now).sign_with(&key).expect("sign");
+        let long_after = now + DEFAULT_TTL + CLOCK_SKEW_ALLOWANCE + Duration::from_secs(1);
+        assert!(matches!(
+            signed.verify_signed(&[key.verifying_key()], long_after),
+            Err(AssertionError::Expired { .. })
+        ));
+    }
+
+    /// Neither key type may print its material, because both end up inside config a binary logs.
+    #[test]
+    fn a_signing_key_never_renders_its_material() {
+        let key = signing_key();
+        let rendered = format!("{key:?}");
+        assert!(!rendered.contains("SigningKey(ed"), "{rendered}");
+        assert!(rendered.contains("****"), "{rendered}");
+        // The id is safe and is the useful half — it is what an operator matches against a set.
+        assert!(rendered.contains(&key.id().to_string()), "{rendered}");
     }
 
     #[test]

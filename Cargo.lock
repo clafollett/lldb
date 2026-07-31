@@ -3221,6 +3221,7 @@ dependencies = [
  "lldb-qe-types",
  "object_store",
  "rcgen",
+ "ring",
  "serde",
  "sha2",
  "sqlx",
