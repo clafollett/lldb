@@ -26,16 +26,30 @@ feature branch → pull request → review → green CI → squash-merge to main
 
 New checkout? Run `./scripts/bootstrap.sh` first — it installs the TPC-H data generator and generates the benchmark data the test suite needs.
 
-Run `cargo fmt --all` to *fix* formatting as you work. Before you push, run the three gates — these
-are verbatim what CI runs, and all three must pass:
+Run `cargo fmt --all` to *fix* formatting as you work. Before you push, run the gates — these are
+verbatim what CI runs, and all of them must pass:
 
 ```sh
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings
 cargo test --workspace
+./scripts/check-path-refs.sh
+./scripts/check-dep-dupes.sh
 ```
 
-Three things that surprise people:
+The last two are cheap and catch things review reliably misses. `check-path-refs.sh` asserts that
+every `crates/<pkg>/…` path mentioned in a tracked file actually exists — module docs carry this
+project's design rationale, and `git mv` renames files without rewriting the strings pointing at
+them, so a crate split silently rots every reference into it (#90). It runs on **every** PR, not
+just Rust ones, because those references live in `.md`, `.yml`, `.toml` and `.sql`. A path that is
+deliberately historical — `docs/build-performance.md` records commands run at a named commit — opts
+out with `path-refs-allow: <that path>` somewhere in the same file.
+
+`check-dep-dupes.sh` asserts zero duplicate versions of `arrow`, `datafusion`, `object_store` and
+`iceberg`. That is the constraint `CLAUDE.md` actually imposes; it replaced a hand-maintained
+duplicate *total* that had gone stale and could not express the rule anyway (#78).
+
+Four things that surprise people:
 
 - **The benches are behind a feature, and the clippy gate is what keeps them compiling.** Both
   `[[bench]]` targets carry `required-features = ["benches"]`, so a default build no longer links
@@ -52,6 +66,20 @@ Three things that surprise people:
   `Cargo.toml` already sets `debug = 0` and `incremental = false`; passing `CARGO_PROFILE_DEV_DEBUG`
   or `CARGO_INCREMENTAL` yourself invalidates the whole target directory and forces a full rebuild.
   See [`docs/build-performance.md`](docs/build-performance.md).
+
+- **If you use git worktrees, sweep them.** Each one is a full checkout with **its own `target/`**,
+  which is the point of the isolation and also why they run 3–7 GB apiece. Nothing removes them when
+  the PR merges, and eight left behind had accumulated **36 GB** (#107) — more than the whole disk
+  budget the build-size work was optimising against.
+
+  ```sh
+  ./scripts/sweep-worktrees.sh          # dry run: what would go, and how much it frees
+  ./scripts/sweep-worktrees.sh --apply
+  ```
+
+  It removes a worktree only when its branch has a **merged PR** and the tree is clean, and never
+  one that is `locked`. Merged-ness comes from `gh pr list`, not `git branch --merged` — branches
+  here land by squash merge, which `git branch --merged` reports as *unmerged*.
 
 ## Dependencies
 
