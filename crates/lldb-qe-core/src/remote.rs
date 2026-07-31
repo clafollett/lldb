@@ -63,7 +63,6 @@ use std::sync::Arc;
 
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::execution::TaskContext;
-use datafusion::physical_expr::EquivalenceProperties;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
@@ -84,7 +83,49 @@ use crate::retry::RetryPolicy;
 /// plan does not run here. Optimizer passes therefore leave the remote stage alone, which is
 /// what we want — it was already planned by whoever built it.
 ///
+/// # What it claims about its output: everything its sub-plan claims
+///
+/// The leaf's `eq_properties` are [`inner`](Self::inner)'s, cloned. A remote read hands back the
+/// producer's partition batch-for-batch, in order — Flight is a stream, not a set — so this node is
+/// a row-preserving, order-preserving projection of **exactly one** input partition onto **exactly
+/// one** output partition, and its schema *is* the sub-plan's, so every `Column` index stays valid
+/// with no `project` and no `with_new_schema`. Component by component, against DataFusion 53.1's
+/// `EquivalenceProperties`:
+///
+/// | Component | Claims | Survives "one whole partition, in order" because |
+/// | - | - | - |
+/// | `eq_group` classes | expressions equal **per row** | our rows are a subset of the sub-plan's |
+/// | constants, `Uniform(v)` | that value in **every** partition | our partitions are a subset of the sub-plan's |
+/// | constants, `Heterogeneous` | constant **within each** partition | our one output partition *is* one of those partitions |
+/// | `constraints` | no two rows agree on a key | a subset of a unique set is unique |
+/// | `oeq_class` orderings | per-partition sort order | the stream arrives in the order it was produced |
+///
+/// Nothing is *strengthened* by the copy, which is the only direction that could be wrong — a
+/// widened claim that is false is a wrong answer with no error. `FilterExec` clones its input's
+/// properties wholesale for the same row-subsetting reason. Carrying the ordering alone, which is
+/// what this used to do, was that argument applied to the last row of the table and dropped for the
+/// other four: an inconsistency rather than a policy.
+///
+/// The tempting alternative is to imitate `CoalescePartitionsExec` and call
+/// `clear_per_partition_constants()` after the clone. That call belongs to a node that *merges*
+/// partitions; this one exposes one input partition rather than merging, so clearing would discard
+/// a `Heterogeneous` constant that genuinely holds of the rows delivered. Every node that does fuse
+/// partitions — `CoalescePartitionsExec`, `SortPreservingMergeExec`, `RepartitionExec` — makes that
+/// call itself, so the responsibility already sits where the fusing happens. The related objection,
+/// that an output ordering does not survive repartitioning, is the same fact about the same three
+/// nodes; this leaf repartitions nothing.
+///
+/// Be honest about what it buys **today: nothing at runtime.** Nothing re-optimizes across the hop
+/// — `engine::run_on_fleet` stages an already-optimized plan, and a worker's `do_get` is
+/// [`deserialize_plan`] then `collect_partitioned` with no optimizer pass of its own — so what
+/// visibly changes is `EXPLAIN` output and the properties a parent recomputes when it is rebuilt
+/// through [`with_new_children`]. The reason to carry the rest anyway is the argument above: this
+/// leaf already commits to being indistinguishable from the sub-plan it replaces, for schema and
+/// for ordering, and every claim it silently drops is one that becomes wrong — silently — the day
+/// something does re-optimize.
+///
 /// [`children`]: ExecutionPlan::children
+/// [`with_new_children`]: ExecutionPlan::with_new_children
 #[derive(Debug, Clone)]
 pub struct FlightReaderExec {
     /// Worker to pull from first, e.g. `http://worker-1:50051`.
@@ -139,19 +180,11 @@ impl FlightReaderExec {
                  in whatever staged this plan"
             )));
         }
-        let schema = inner.schema();
-        // A remote read hands back the producer's partition batch-for-batch, in order — Flight is a
-        // stream, not a set — so whatever ordering the remote plan guarantees *within* a partition
-        // survives the hop. Carrying that ordering across keeps a consumer like
-        // `SortPreservingMergeExec` honest about what it is merging: without it a distributed sort
-        // would report its output as unordered even though every input stream is sorted. Only the
-        // ordering is carried, not partitioning — see below.
-        let eq = match inner.properties().output_ordering() {
-            Some(ordering) => {
-                EquivalenceProperties::new_with_orderings(schema, [ordering.iter().cloned()])
-            }
-            None => EquivalenceProperties::new(schema),
-        };
+        // The sub-plan's claims about its own output, whole — see the type doc for the
+        // component-by-component argument, and for why half-carrying them (clearing per-partition
+        // constants in imitation of `CoalescePartitionsExec`) is the worst of the three options.
+        // Partitioning is the one thing *not* taken across, and it is set below.
+        let eq = inner.properties().eq_properties.clone();
         // We surface exactly one partition: the single remote partition we were asked to read.
         // The remote stream is finite, and — see `execute` — this node buffers it in full before
         // emitting, so downstream sees one complete batch set rather than an incremental trickle.
@@ -825,7 +858,10 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::catalog::TableProvider;
+    use datafusion::common::ScalarValue;
     use datafusion::datasource::MemTable;
+    use datafusion::physical_expr::expressions::Column;
+    use datafusion::physical_expr::{AcrossPartitions, EquivalenceProperties, PhysicalExpr};
     use datafusion::prelude::SessionContext;
 
     /// A well-formed payload header — magic then version — for tests that hand-build the rest.
@@ -930,6 +966,89 @@ mod tests {
             reader.properties().output_ordering(),
             Some(&expected),
             "the reader must advertise the producer's ordering"
+        );
+    }
+
+    /// A three-column stand-in whose filter gives the leaf something to claim: `a = b` is an
+    /// equivalence class and `c = 5` a `Uniform` constant, the two components the ordering-only
+    /// carry used to drop.
+    async fn constrained_plan(ctx: &SessionContext) -> Arc<dyn ExecutionPlan> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])),
+                Arc::new(Int64Array::from(vec![1, 9, 3, 9])),
+                Arc::new(Int64Array::from(vec![5, 5, 7, 7])),
+            ],
+        )
+        .unwrap();
+        let table = MemTable::try_new(schema, vec![vec![batch]]).unwrap();
+        ctx.register_table("abc", Arc::new(table)).unwrap();
+        ctx.sql("SELECT a, b, c FROM abc WHERE a = b AND c = 5")
+            .await
+            .unwrap()
+            .create_physical_plan()
+            .await
+            .unwrap()
+    }
+
+    /// The rest of `eq_properties`, not just the ordering. A leaf that kept the ordering and dropped
+    /// the classes and constants claims *less* than it delivers, and the loss goes silent the day
+    /// anything re-optimizes across the hop.
+    ///
+    /// This is the localizing unit test. The one that matters is
+    /// `tests/integration/remote_eq_properties.rs`, which checks each of these claims against the
+    /// rows a real worker hands back — because a claim compared only with the claim it was copied
+    /// from proves that `clone` works and nothing else.
+    #[tokio::test]
+    async fn a_remote_read_carries_the_inner_plans_equivalence_classes_and_constants() {
+        let ctx = SessionContext::new();
+        let inner = constrained_plan(&ctx).await;
+        let col =
+            |name: &str, idx: usize| Arc::new(Column::new(name, idx)) as Arc<dyn PhysicalExpr>;
+        let (a, b, c) = (col("a", 0), col("b", 1), col("c", 2));
+
+        let inner_eq = &inner.properties().eq_properties;
+        assert!(
+            inner_eq
+                .eq_group()
+                .get_equivalence_class(&a)
+                .is_some_and(|cls| cls.contains(&b)),
+            "test setup: `WHERE a = b` must put a and b in one equivalence class"
+        );
+        assert_eq!(
+            inner_eq.is_expr_constant(&c),
+            Some(AcrossPartitions::Uniform(Some(ScalarValue::Int64(Some(5))))),
+            "test setup: `WHERE c = 5` must make c a uniform constant"
+        );
+
+        let reader = FlightReaderExec::new("http://w:50051", 0, Arc::clone(&inner)).unwrap();
+        let eq = &reader.properties().eq_properties;
+        assert!(
+            eq.eq_group()
+                .get_equivalence_class(&a)
+                .is_some_and(|cls| cls.contains(&b)),
+            "the leaf must carry the class, not only the ordering"
+        );
+        assert_eq!(
+            eq.is_expr_constant(&c),
+            Some(AcrossPartitions::Uniform(Some(ScalarValue::Int64(Some(5))))),
+            "…and the constant, with its value"
+        );
+        assert_eq!(
+            eq.constraints(),
+            inner_eq.constraints(),
+            "…and the constraints: a subset of a unique set is unique"
+        );
+        assert_eq!(
+            eq.schema(),
+            &inner.schema(),
+            "every Column index in those claims is only valid against the sub-plan's schema"
         );
     }
 
