@@ -976,7 +976,10 @@ impl FleetAuth {
     /// Split out so that [`check_fleet_posture`] can ask *this* what "set" means rather than
     /// re-deriving it — a guard that disagreed with the thing it guards about which values count
     /// would refuse a fleet that would have worked, or pass one that would not.
-    pub fn from_value(token: Option<&str>) -> Self {
+    ///
+    /// Deliberately not `pub`: its only caller is that guard, in this module. A crate every other
+    /// crate re-exports should not widen its API for a seam that never crosses it.
+    fn from_value(token: Option<&str>) -> Self {
         match token {
             Some(token) if !token.trim().is_empty() => Self::Required(token.trim().to_string()),
             _ => Self::Open,
