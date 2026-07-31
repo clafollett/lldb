@@ -240,3 +240,119 @@ crate compiled twice because `#[cfg(test)]` changes the crate. Splitting `lldb-q
 smaller crates would parallelize that — and would also be a far larger change than a build tweak,
 with real consequences for the plan-codec boundary, so it belongs to its own issue and its own
 argument rather than to this one.
+
+That split was then done, as issue #72. Its results are below, and **the headline is a negative
+result**.
+
+# Splitting `lldb-qe-core`, and moving the one-shots out of `lldb-qe-coordinator` (#72)
+
+Two extractions, not one, and they came from different packages:
+
+- **`lldb-qe-core` became three crates** — `lldb-qe-types` ← `lldb-qe-control` ← `lldb-qe-core`
+  (#76, #85).
+- **The four operator one-shots** (`lldb-qe-migrate`, `lldb-qe-warehouse`, `lldb-qe-auth`,
+  `lldb-qe-reap`) moved out of **`lldb-qe-coordinator`** into a new `lldb-qe-admin` (#95). They were
+  never in `lldb-qe-core`; they were `src/bin/` targets of the coordinator package, which is
+  precisely why they compiled DataFusion — Cargo resolves dependencies per package, not per binary.
+
+The workspace went from four crates to six.
+
+## Read this before comparing to anything above
+
+**These numbers came from a 14-core box (10 performance cores). Every figure earlier in this file
+came from a 4-core box.** Nothing here may be compared with anything above it. The series below is
+internally consistent — same machine, same session, same protocol — and that is the only comparison
+it supports.
+
+Protocol unchanged: `cargo clean`, then `cargo build --workspace --all-targets`, cargo run plainly,
+no profile environment variables.
+
+## The series
+
+| | pre-split (`770d1dd`) | after types+control (`e90111a`) | after admin (`703077f`) |
+| - | - | - | - |
+| Cold `cargo build --workspace --all-targets` | 107 s¹ | 101 s | 109 s |
+| `du -sh target` | 5.4 GB | **5.4 GB** | **5.4 GB** |
+
+¹ that run carried `--timings`, which adds overhead — so even the 107→101 movement is not real.
+
+**The split bought nothing on cold build or on disk.** Run-to-run spread on a cold build was already
+measured at ~11% earlier in this file; 101–109 s sits inside it. Disk did not move at all, to three
+significant figures, across three measurements.
+
+This is not surprising in hindsight and is worth stating plainly so nobody re-derives it: *the same
+code still compiles, and the same seven binaries still statically link the same dependency graph.*
+Moving code between crates changes **who depends on what**, not **how much there is**.
+
+## What it did buy: scoped rebuilds
+
+| Edit → test | Wall |
+| - | - |
+| `touch types/rbac.rs` → `cargo test -p lldb-qe-types --lib` | **1.5 s** |
+| `touch control/auth.rs` → `cargo test -p lldb-qe-control --lib` | **9.0 s** |
+| `touch core/catalog.rs` → `cargo test -p lldb-qe-core --lib` | 20.5 s |
+
+Before the split every one of those 33 modules cost the 20 s loop. Thirteen of them now cost 9 s,
+and the rbac/storage vocabulary costs 1.5 s.
+
+And the operator one-shots stopped paying for the query engine at all:
+
+| After `touch crates/lldb-qe-core/src/staging.rs` | Wall | `lldb-qe-core` compiled |
+| - | - | - |
+| `cargo build -p lldb-qe-admin --bin lldb-qe-migrate` | **4.4 s** | **0 times** |
+| `cargo build -p lldb-qe-coordinator --bin lldb-qe-server` | 16.9 s | yes |
+
+The second row is the control: it proves the touch was live, so the first row is a real result and
+not a stale-cache artifact. Before #95 both cost the 17 s.
+
+Note what this corrects. #72 originally justified this on the one-shots being ~50 MB binaries. That
+figure was measuring the wrong thing: `nm` on `lldb-qe-migrate` finds exactly **one** datafusion-named
+symbol, from `datafusion_doc`, a proc-macro helper — `--gc-sections` was already stripping the engine
+from the artifact. Disk was never the cost. Compiling and linking a graph the binary then discards
+was.
+
+## Where the 5.4 GB actually is
+
+| | |
+| - | - |
+| executables (51) | 2.53 GB |
+| rlibs (467) | 1.20 GB |
+
+Seven executables are 2.36 GB of that 2.53 GB:
+
+| Artifact | Size |
+| - | - |
+| `integration` | 373 MB |
+| `lldb_qe_server` | 359 MB |
+| `lldb_qe_core` (unit tests) | 353 MB |
+| `lldb_qe_coordinator` | 352 MB |
+| `distributed` (bench) | 323 MB |
+| `tpch` (bench) | 306 MB |
+| `lldb_qe_worker` | 296 MB |
+
+Identical before and after the split, as the disk figure implies.
+
+## The conclusion, and what it means for the next attempt
+
+**Disk is not addressable by crate structure.** It is a function of how many artifacts statically
+link the whole dependency graph, and the split did not change that count. Anyone reaching for
+another restructure to fix a disk ceiling should read this section first.
+
+The remaining disk levers are about *artifacts*, not modules — the two criterion benches alone are
+629 MB, 27% of executable bytes, tracked as #97. Note that #44's rejection of gating them was
+argued on **time** and remains correct on time; #97 revisits it on **disk**, which was never argued.
+
+**The sibling / port-trait inversion was not built, and nothing measured justifies building it.** The
+stacked design needs zero port traits and delivered the entire scoped-rebuild win. Inverting it would
+buy parallel compilation of the two halves — worth having only if cold build were the constraint, and
+the table above says it is not.
+
+## One prerequisite that had to be fixed first, and would have invalidated all of this
+
+`build.rs` emitted `cargo:rerun-if-changed=../../.git/HEAD`. In a git worktree `.git` is a **file**,
+so that path does not exist, and Cargo treats a missing `rerun-if-changed` target as permanently
+stale — every no-op build recompiled everything downstream (18.65 s → 0.21 s once fixed, #87/#94).
+
+**Any build measurement taken in a git worktree before that fix was contaminated**, and parallel
+work happens in worktrees. Take measurements in a normal clone, or confirm the fingerprint resolves
+before trusting a number.
