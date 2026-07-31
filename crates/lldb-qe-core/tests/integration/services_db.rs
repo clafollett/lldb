@@ -15,9 +15,13 @@
 //!   LLDB_TEST_POSTGRES_URL=postgres://lldb@localhost/lldb cargo test -p lldb-qe-core --test integration services_db
 //!   LLDB_DOCKER=1 cargo test -p lldb-qe-core --test integration services_db -- --nocapture
 
+use crate::support::gates;
 use crate::support::{DbCleanup, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use lldb_qe_core::services::ServicesDb;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "services_db";
 
 /// A name no other run — or concurrent copy of this run — will pick.
 fn unique_account_name(tag: &str) -> String {
@@ -28,10 +32,7 @@ fn unique_account_name(tag: &str) -> String {
 async fn services_database_migrates_and_scopes_a_warehouse() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise the services database"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 

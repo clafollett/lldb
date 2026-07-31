@@ -5,9 +5,16 @@ description: Runnable commands for the lldb query engine — generating TPC-H da
 
 # lldb — commands
 
-Every gated suite below skips silently without its prerequisite, so a green run does not by itself
-mean a suite ran. The integration binary takes roughly 20s with a database versus under 2s without
-— that timing is the tell for whether the database-gated tests actually executed.
+Every gated suite below skips without its prerequisite, and says so: a skip prints
+`lldb-test: SKIPPED <suite> — wants …` on the real stderr, which survives a green run. To make a
+services-DB skip a **failure** instead, put `LLDB_TEST_REQUIRE_GATED` in the environment — presence
+is the assertion, any value including empty:
+
+```
+LLDB_TEST_REQUIRE_GATED= cargo test
+```
+
+It does not cover the TPC-H-data or cross-container suites; those report but never fail.
 
 
 ```

@@ -58,10 +58,22 @@ Five things that surprise people:
   a bench that stops compiling goes unnoticed. See
   [`docs/build-performance.md`](docs/build-performance.md).
 
-- **A green `cargo test` does not mean everything ran.** Suites that need a service — a Postgres
-  services database, Docker — skip *silently* without it. The tell is timing: the `integration`
-  binary takes ~20 s with a database and under 2 s without. The prerequisites for each gated suite
-  are listed in `.claude/skills/lldb-commands/SKILL.md`.
+- **A green `cargo test` does not mean everything ran** — but it now says so. Suites that need a
+  service (a Postgres services database, Docker) still skip without it, and each one prints
+  `lldb-test: SKIPPED <suite> — wants …` naming what it wanted. That line goes to the process's real
+  stderr rather than through `eprintln!`, because libtest's output capture discards a *passing*
+  test's output — which is why, before #112, timing was the only tell. The prerequisites for each
+  gated suite are listed in `.claude/skills/lldb-commands/SKILL.md`.
+
+  ```sh
+  LLDB_TEST_REQUIRE_GATED= cargo test   # any value, even empty: a services-DB skip now FAILS
+  ```
+
+  Presence is the assertion and the value is never read, exactly as `LLDB_REQUIRE_FLEET_TOKEN`
+  works — emptying it does not disarm it, deleting it does. CI's `check` job sets it, so "the
+  database tests really ran" is enforced rather than hoped for. It covers only the services-DB
+  prerequisite: the TPC-H-data and cross-container suites report their skips but are never made
+  fatal by it, because the job that sets it has neither SF1 data nor a built image.
 - **Do not override the build profile on the command line.** `[profile.dev]` in the root
   `Cargo.toml` already sets `debug = 0` and `incremental = false`; passing `CARGO_PROFILE_DEV_DEBUG`
   or `CARGO_INCREMENTAL` yourself invalidates the whole target directory and forces a full rebuild.

@@ -193,9 +193,21 @@ Both `[[bench]]` targets carry `required-features = ["benches"]`: plain `--all-t
 compile them and plain `cargo bench` runs nothing. CI's clippy passes
 `--features lldb-qe-core/benches` — run it that way after changing a bench, or nothing checks it.
 
-A gated suite **skips silently** without its prerequisite, so a green `cargo test` does not mean
-the database-gated tests ran. The tell is timing: the `integration` binary takes ~20s with a
-database and under 2s without.
+A gated suite still **skips** without its prerequisite, but no longer silently: every skip prints a
+`lldb-test: SKIPPED <suite> — wants …` line naming the suite and what it wanted. That line is
+written to the process's real stderr rather than through `eprintln!`, because libtest's output
+capture discards a passing test's output — which is why a green `cargo test` used to hide it and
+timing was the only tell.
+
+```
+LLDB_TEST_REQUIRE_GATED= cargo test        # any value, even empty: a services-DB skip now FAILS
+```
+
+Presence is the assertion and the value is never read, exactly as `LLDB_REQUIRE_FLEET_TOKEN` works
+(`crates/lldb-qe-control/src/auth.rs`) — emptying it does not disarm it; deleting it does. CI's
+`check` job sets it, so "the database tests really ran" is enforced rather than argued. It is scoped
+to the services-DB prerequisite: the TPC-H-data and cross-container suites report their skips but
+are never made fatal by it, because the job that sets it has neither SF1 data nor a built image.
 
 ## Testing bar
 

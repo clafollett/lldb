@@ -59,6 +59,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::gates;
 use crate::support::{self, Cleanup, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::{Int64Array, StringArray};
@@ -84,6 +85,8 @@ use lldb_qe_core::services::ServicesDb;
 use lldb_qe_core::warehouse::{Warehouse, WarehouseState};
 use lldb_qe_core::{DEFAULT_WAREHOUSE_ENDPOINT, flight};
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "query_scheduler";
 /// Queries submitted at once.
 const SUBMISSIONS: usize = 12;
 /// Workers behind the warehouse — and therefore, since the limit is sized from the warehouse's
@@ -91,14 +94,11 @@ const SUBMISSIONS: usize = 12;
 const WAREHOUSE_SIZE: i32 = 2;
 
 /// Skip-or-connect, shared by every test in this file. Returns `None` when there is no database,
-/// having already printed why.
-async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+/// having already reported it (`support::gates`).
+async fn db_or_skip() -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP ({what}): set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with \
-             a Docker daemon, to exercise the query scheduler"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;
@@ -447,7 +447,7 @@ fn rows_of(batches: &[RecordBatch]) -> Result<Vec<GroupCount>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_queries_are_bounded_queued_drained_and_recorded() -> Result<()> {
-    let Some((db, target)) = db_or_skip("scheduling").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -640,7 +640,7 @@ fn assert_timings_are_sane(record: &QueryRecord) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failing_query_is_recorded_and_does_not_wedge_the_queue() -> Result<()> {
-    let Some((db, target)) = db_or_skip("failure handling").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -760,7 +760,7 @@ async fn failure_body(harness: &Harness) -> Result<()> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutting_down_refuses_new_work_instead_of_stranding_it() -> Result<()> {
-    let Some((db, target)) = db_or_skip("shutdown").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -817,7 +817,7 @@ async fn shutdown_body(harness: &Harness) -> Result<()> {
 /// Clients disconnecting is ordinary rather than exceptional, so this is a routine path.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_abandoned_by_its_client_is_closed_out_rather_than_left_active() -> Result<()> {
-    let Some((db, target)) = db_or_skip("abandonment").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -992,7 +992,7 @@ const FLEET_COORDINATORS: usize = 2;
 ///    process's semaphore — which is the one thing a per-process bound could never produce.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_coordinators_on_one_warehouse_admit_k_total_not_2k() -> Result<()> {
-    let Some((db, target)) = db_or_skip("fleet-wide admission").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -1150,7 +1150,7 @@ async fn fleet_admission_body(harness: &Harness) -> Result<()> {
 /// test that has to outlive one must really take that long.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_coordinator_that_dies_holding_slots_does_not_consume_them_forever() -> Result<()> {
-    let Some((db, target)) = db_or_skip("fleet-wide slot expiry").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target

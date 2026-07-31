@@ -9,6 +9,11 @@ use std::path::PathBuf;
 use datafusion::prelude::SessionContext;
 use lldb_qe_core::{StorageConfig, build_session, register_tpch_parquet, tpch};
 
+use crate::support::gates;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "tpch_baseline";
+
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
 }
@@ -16,7 +21,7 @@ fn data_dir() -> PathBuf {
 /// A session with the 8 TPC-H tables registered, or `None` if the data isn't generated yet.
 async fn session_with_tpch() -> anyhow::Result<Option<SessionContext>> {
     if !data_dir().join("sf1/lineitem.parquet").exists() {
-        eprintln!("SKIP: no data — run ./scripts/bootstrap.sh");
+        gates::skip(SUITE, &gates::TPCH_DATA);
         return Ok(None);
     }
     let (ctx, storage) = build_session(StorageConfig::Local(data_dir())).await?;

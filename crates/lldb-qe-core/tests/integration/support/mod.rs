@@ -1,10 +1,17 @@
 //! What a test in this binary borrows, and who gives it back.
 //!
-//! Three things live here. The database resolution described below; the teardown guards
+//! Four things live here. The database resolution described below; the teardown guards
 //! ([`Servers`], [`DbCleanup`]) that hand back the servers and rows a test owns however the test
-//! ended; and [`certs`], the one throwaway certificate authority the TLS tests share. They belong
-//! together because they answer the same question from different ends: a test in a *single* binary
-//! borrows from a process that outlives it, so everything it takes it must give back.
+//! ended; [`certs`], the one throwaway certificate authority the TLS tests share; and [`gates`],
+//! which reports the suites that did not run at all. The first three belong together because they
+//! answer the same question from different ends: a test in a *single* binary borrows from a process
+//! that outlives it, so everything it takes it must give back.
+//!
+//! [`gates`] is here because it is the other side of the resolution below — every `Skipped` this
+//! module hands back is a suite that will not run, and until issue #112 that fact was written with
+//! `eprintln!`, which libtest's output capture discards for a *passing* test. It is the one file
+//! here that is **also compiled into `distributed_cluster`** (by `#[path]`), because that target
+//! skips silently for want of Docker in exactly the same way.
 //!
 //! Most database-gated integration tests resolve their database through this module — `services_db`
 //! (migrations, accounts, the foreign keys), `warehouse_lifecycle` (the warehouse API and its
@@ -26,8 +33,10 @@
 //!    `postgres:18.4-alpine` service container) and the path for anyone with a local server.
 //! 2. **`LLDB_DOCKER=1`** — start a throwaway `postgres:18.4-alpine` on an ephemeral host port,
 //!    wait for `pg_isready`, and remove it afterwards no matter how the test ends.
-//! 3. **Neither** — the caller prints why and passes. `cargo test` on a laptop with no Postgres
-//!    and no Docker must stay green, the same bargain `distributed_cluster.rs` strikes.
+//! 3. **Neither** — the caller reports the skip through [`gates::skip`] and passes. `cargo test` on
+//!    a laptop with no Postgres and no Docker must stay green, the same bargain
+//!    `distributed_cluster.rs` strikes — unless [`gates::REQUIRE_GATED_ENV`] is set, which is the
+//!    opt-in that turns that skip into a failure.
 //!
 //! Every test using this must be safe to run repeatedly against the same database *and*
 //! concurrently with another copy of itself — the URL it is handed may well be someone's dev
@@ -42,6 +51,7 @@
 //! unused helper — is gone. Do not put it back to silence a warning; delete the helper instead.
 
 pub mod certs;
+pub mod gates;
 
 use std::future::Future;
 use std::process::Command;
@@ -58,7 +68,7 @@ const READY_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// How the test got its database — and, for the container case, what to tear down.
 pub enum Target {
-    /// Nothing available; the test prints a skip and passes.
+    /// Nothing available; the caller reports a skip through `support::gates` and passes.
     Skipped,
     /// A URL supplied by the environment. Not ours, so we touch only our own rows.
     Provided(String),

@@ -63,7 +63,11 @@ use tokio::sync::watch;
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::support::gates;
 use crate::support::{self, DbCleanup, Servers, resolve_target, unique_name};
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "query_cancel";
 
 /// One slot, so "the queue advanced" is a fact about one permit rather than a statistic.
 const WAREHOUSE_SIZE: i32 = 1;
@@ -81,13 +85,10 @@ const PATIENCE: Duration = Duration::from_secs(60);
 /// The [`support::Target`] comes back with the connection rather than being dropped here: under
 /// `LLDB_DOCKER=1` it *owns* the throwaway container, so dropping it would remove the database the
 /// caller is about to use. Its URL is also what a caller's [`DbCleanup`] connects with.
-async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+async fn db_or_skip() -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP ({what}): set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with \
-             a Docker daemon, to exercise query cancellation"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;
@@ -454,7 +455,7 @@ fn cloud_map(authority: String, addrs: Vec<SocketAddr>) -> BoxResolver {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_a_running_query_returns_its_slot_and_the_queue_advances() -> Result<()> {
-    let Some((db, target)) = db_or_skip("cancellation").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -647,7 +648,7 @@ async fn cancellation_body(harness: &Harness) -> Result<()> {
 /// neither the other account nor its user.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_caller_cannot_cancel_another_accounts_query() -> Result<()> {
-    let Some((db, target)) = db_or_skip("cross-account cancellation").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -724,7 +725,7 @@ async fn cross_account_body(victim: &Harness, attacker: &Harness) -> Result<()> 
 /// has already proven which tenant they are and naming the missing grant leaks nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cancelling_needs_the_cancel_grant_and_usage_is_not_enough() -> Result<()> {
-    let Some((db, target)) = db_or_skip("the cancel grant").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -813,7 +814,7 @@ async fn grant_body(harness: &Harness) -> Result<()> {
 /// settles deterministically.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_query_is_never_reaped() -> Result<()> {
-    let Some((db, target)) = db_or_skip("the reaper interaction").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target
@@ -875,7 +876,7 @@ async fn reaper_body(db: &ServicesDb, account_id: i64) -> Result<()> {
 /// this repository.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_coordinator_advertises_the_cancel_action() -> Result<()> {
-    let Some((db, target)) = db_or_skip("action discovery").await? else {
+    let Some((db, target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = target

@@ -9,9 +9,9 @@
 //!
 //! 1. **`LLDB_TEST_POSTGRES_URL`** — use it as-is (CI's service container, or a local server).
 //! 2. **`LLDB_DOCKER=1`** — start a throwaway `postgres:18.4-alpine`, remove it afterwards.
-//! 3. **Neither** — print why and pass. `cargo test --workspace` with no Postgres and no Docker
-//!    stays green; the parse/rewrite/snapshot-assembly logic is unit-tested in `dml.rs` without
-//!    one.
+//! 3. **Neither** — report the skip (`support::gates`) and pass. `cargo test --workspace` with no
+//!    Postgres and no Docker stays green; the parse/rewrite/snapshot-assembly logic is unit-tested
+//!    in `dml.rs` without one.
 //!
 //! The concurrency test is the load-bearing one, and it is written so that the *absence of an
 //! error* cannot pass it. Four writers each run `UPDATE ... SET qty = qty + 1` against the same
@@ -46,8 +46,11 @@ use lldb_qe_core::tenancy::TenantScope;
 use lldb_qe_core::{StorageConfig, apply_manifest, build_session};
 use tokio::sync::Barrier;
 
+use crate::support::gates;
 use crate::support::{Cleanup, DbCleanup};
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "dml_snapshots";
 /// Same image compose and CI run, so a local pass and a CI pass mean the same thing.
 const POSTGRES_IMAGE: &str = "postgres:18.4-alpine";
 /// How long to wait for a fresh container to accept connections before giving up.
@@ -310,10 +313,7 @@ async fn assert_catalog_columns_unchanged(url: &str) -> Result<()> {
 async fn delete_and_update_commit_snapshots_a_later_read_sees() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP: set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a Docker \
-             daemon, to exercise Iceberg DML"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 
@@ -444,7 +444,7 @@ async fn delete_and_update_commit_snapshots_a_later_read_sees() -> Result<()> {
 async fn concurrent_writers_neither_lose_nor_double_apply() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!("SKIP: no Postgres available for the concurrent-writer test");
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 
@@ -546,7 +546,7 @@ async fn concurrent_writers_neither_lose_nor_double_apply() -> Result<()> {
 async fn concurrent_deletes_of_different_rows_both_land() -> Result<()> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!("SKIP: no Postgres available for the concurrent-delete test");
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(());
     };
 

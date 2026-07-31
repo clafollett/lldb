@@ -47,6 +47,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use crate::support::gates;
 use crate::support::{self, Cleanup, DbCleanup, Servers, resolve_target, unique_name};
 use anyhow::{Context, Result};
 use datafusion::arrow::array::Int64Array;
@@ -64,6 +65,9 @@ use lldb_qe_core::{
     CatalogSource, StorageConfig, apply_manifest, build_session, flight, manifest::Manifest,
 };
 
+/// How this suite names itself in the skip report.
+const SUITE: &str = "tenant_catalogs";
+
 /// The catalog every tenant's manifest declares. Both accounts materialize *this* name, which is
 /// the whole point: a query is portable between tenants, the rows behind it are not.
 const CATALOG: &str = "lldb";
@@ -76,13 +80,10 @@ const ROWS_A: i64 = 3;
 const ROWS_B: i64 = 7;
 
 /// Skip-or-connect, matching `auth_rbac.rs`.
-async fn db_or_skip(what: &str) -> Result<Option<(ServicesDb, support::Target)>> {
+async fn db_or_skip() -> Result<Option<(ServicesDb, support::Target)>> {
     let target = resolve_target()?;
     let Some(url) = target.url() else {
-        eprintln!(
-            "SKIP ({what}): set LLDB_TEST_POSTGRES_URL to a Postgres URL, or LLDB_DOCKER=1 with a \
-             Docker daemon, to exercise per-tenant catalogs"
-        );
+        gates::skip(SUITE, &gates::SERVICES_DB);
         return Ok(None);
     };
     let db = ServicesDb::connect(url).await?;
@@ -223,7 +224,7 @@ async fn count_as(server: &str, tenant: &Tenant) -> Result<i64> {
 #[tokio::test]
 async fn two_accounts_own_the_same_table_name_and_a_catalog_wide_grant_stays_inside_one()
 -> Result<()> {
-    let Some((db, _target)) = db_or_skip("per-tenant catalogs").await? else {
+    let Some((db, _target)) = db_or_skip().await? else {
         return Ok(());
     };
     let url = _target.url().expect("a target with a url").to_string();

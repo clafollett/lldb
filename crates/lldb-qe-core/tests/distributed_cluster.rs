@@ -25,6 +25,22 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard};
 
+/// The skip report, shared with the `integration` binary by `#[path]` rather than by a second copy.
+///
+/// This target is separate for the reasons `tests/integration/main.rs` gives, and none of them is
+/// "it gates differently" — it skips silently for want of Docker exactly as the database-gated
+/// suites skip for want of Postgres, and issue #112 is about both. Sharing the file is what keeps
+/// the two reports one format and the strict switch one rule; a copy here is precisely the second
+/// mechanism that would drift.
+///
+/// One process is one report, so this binary keeps its own `REPORTED` set and prints its own
+/// header — which is right, because cargo runs the two binaries as two processes.
+#[path = "integration/support/gates.rs"]
+mod gates;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "distributed_cluster";
+
 /// Every binary the compose cluster (and the CDK stack) invokes by name, and therefore every
 /// binary the runtime image must contain. Keep in step with `Dockerfile`'s `COPY` list and with the
 /// binary targets of the three packages it builds — `lldb-qe-coordinator` (`src/main.rs` +
@@ -85,9 +101,9 @@ fn prebuilt() -> bool {
 }
 
 /// Skip unless a daemon is expected. Returns the exclusivity guard when the test should proceed.
-fn docker_or_skip(what: &str) -> Option<MutexGuard<'static, ()>> {
+fn docker_or_skip() -> Option<MutexGuard<'static, ()>> {
     if std::env::var("LLDB_DOCKER").ok().as_deref() != Some("1") {
-        eprintln!("SKIP: set LLDB_DOCKER=1 (and have a Docker daemon) to run {what}");
+        gates::skip(SUITE, &gates::DOCKER_CLUSTER);
         return None;
     }
     Some(exclusive())
@@ -118,7 +134,7 @@ fn diagnostics() -> String {
 
 #[test]
 fn cluster_ships_a_query_across_containers() {
-    let Some(_exclusive) = docker_or_skip("the cluster test") else {
+    let Some(_exclusive) = docker_or_skip() else {
         return;
     };
     let _teardown = Teardown;
@@ -171,7 +187,7 @@ fn cluster_ships_a_query_across_containers() {
 ///    already pays for anyway via `coordinator`.
 #[test]
 fn image_contains_every_binary_the_cluster_invokes() {
-    let Some(_exclusive) = docker_or_skip("the image-contents test") else {
+    let Some(_exclusive) = docker_or_skip() else {
         return;
     };
     let _teardown = Teardown;

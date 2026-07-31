@@ -25,7 +25,10 @@
 //! binary, and Cargo already ran the binaries one after another, so the number of tests — and
 //! therefore the number of throwaway Postgres containers — that can be in flight at once is what
 //! it always was. Environment gating is untouched: `LLDB_TEST_POSTGRES_URL` / `LLDB_DOCKER` are
-//! read exactly where they were, and a machine with neither still prints the skips and passes.
+//! read exactly where they were, and a machine with neither still reports the skips and passes —
+//! *reports* rather than *prints* since issue #112, because libtest's output capture threw the
+//! printing away for every test that passed. [`support::gates`] is that fix and
+//! `LLDB_TEST_REQUIRE_GATED` is the switch that turns those skips into failures instead.
 //!
 //! ## Why `distributed_cluster` is still its own binary
 //!
@@ -84,6 +87,20 @@
 //!   than assuming it. All TLS tests share one CA (`support::certs::shared`), so concurrent installs
 //!   agree on a value and the race has no losing side. A test that installed a *different* trust
 //!   would reintroduce one.
+//!
+//! Issue #112 added the sixth, and it is the one whose whole purpose is to be process-wide:
+//!
+//! - **[`support::gates`]'s `REPORTED` set**, which makes the skip report one report per *run*
+//!   rather than one per test. A `Mutex<BTreeSet<String>>` is exactly the mutable global the rule
+//!   above is suspicious of, so: it is **append-only**, keyed by the exact line, read by nothing but
+//!   the duplicate check, and asserted on by no test. What it ends up holding is a pure function of
+//!   which prerequisites are absent — and those are read from the environment, which nothing in this
+//!   binary mutates, so a prerequisite absent for one test is absent for all of them. Test order
+//!   therefore permutes the *order* of the report's lines and nothing else about it, which is why
+//!   this one is safe in a way a counter would not be. The switch beside it
+//!   ([`support::gates::REQUIRE_GATED_ENV`]) is **read** and never written, so it lives under the
+//!   first bullet's rule rather than breaking it; the policy it feeds is a pure function precisely
+//!   so that testing it needs no `set_var` ([`support::gates::is_fatal`]).
 //!
 //! Everything else these tests touch is per-instance: sessions, catalogs, stage caches and
 //! warehouses are constructed per test, every server binds `127.0.0.1:0`, and every file that

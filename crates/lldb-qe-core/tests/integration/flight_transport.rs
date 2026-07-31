@@ -13,6 +13,10 @@ use lldb_qe_core::{StorageConfig, build_session, flight, register_tpch_parquet};
 use tokio::net::TcpListener;
 
 use crate::support::Servers;
+use crate::support::gates;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "flight_transport";
 
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -21,7 +25,7 @@ fn data_dir() -> PathBuf {
 #[tokio::test]
 async fn scan_round_trips_through_a_worker() -> anyhow::Result<()> {
     if !data_dir().join("sf1/nation.parquet").exists() {
-        eprintln!("SKIP: no data — run ./scripts/bootstrap.sh");
+        gates::skip(SUITE, &gates::TPCH_DATA);
         return Ok(());
     }
 

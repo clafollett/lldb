@@ -10,6 +10,11 @@ use std::path::PathBuf;
 
 use lldb_qe_core::{StorageConfig, build_session, register_tpch_parquet};
 
+use crate::support::gates;
+
+/// How this suite names itself in the skip report.
+const SUITE: &str = "first_light";
+
 /// Absolute path to the workspace `data/` dir (tests run with CWD = crate dir).
 fn data_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data")
@@ -19,11 +24,7 @@ fn data_dir() -> PathBuf {
 async fn first_light_group_by_over_lineitem() -> anyhow::Result<()> {
     let lineitem = data_dir().join("sf1/lineitem.parquet");
     if !lineitem.exists() {
-        eprintln!(
-            "SKIP first_light: no data at {}.\n  Generate it with: \
-             tpchgen-cli -s 1 --format=parquet --output-dir data/sf1",
-            lineitem.display()
-        );
+        gates::skip(SUITE, &gates::TPCH_DATA);
         return Ok(());
     }
 
