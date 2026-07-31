@@ -244,10 +244,18 @@ argument rather than to this one.
 That split was then done, as issue #72. Its results are below, and **the headline is a negative
 result**.
 
-# Splitting `lldb-qe-core` into five crates (#72)
+# Splitting `lldb-qe-core`, and moving the one-shots out of `lldb-qe-coordinator` (#72)
 
-`lldb-qe-core` became `lldb-qe-types` ← `lldb-qe-control` ← `lldb-qe-core`, plus `lldb-qe-admin`
-holding the four operator one-shots. Three PRs: #76, #85, #95.
+Two extractions, not one, and they came from different packages:
+
+- **`lldb-qe-core` became three crates** — `lldb-qe-types` ← `lldb-qe-control` ← `lldb-qe-core`
+  (#76, #85).
+- **The four operator one-shots** (`lldb-qe-migrate`, `lldb-qe-warehouse`, `lldb-qe-auth`,
+  `lldb-qe-reap`) moved out of **`lldb-qe-coordinator`** into a new `lldb-qe-admin` (#95). They were
+  never in `lldb-qe-core`; they were `src/bin/` targets of the coordinator package, which is
+  precisely why they compiled DataFusion — Cargo resolves dependencies per package, not per binary.
+
+The workspace went from four crates to six.
 
 ## Read this before comparing to anything above
 
