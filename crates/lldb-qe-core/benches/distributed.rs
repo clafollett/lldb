@@ -5,7 +5,9 @@
 //! cost more than a query that already fits in one machine's cache. That's the lesson:
 //! distribution is a tax you pay to break the single-machine memory/IO wall, not a free win.
 //!
-//! Run with `cargo bench -p lldb-qe-core --bench distributed` (needs `./scripts/bootstrap.sh`).
+//! Run with `cargo bench -p lldb-qe-core --features benches --bench distributed` — this target
+//! carries `required-features = ["benches"]`, so without the flag it is not built and not run
+//! (needs `./scripts/bootstrap.sh`).
 
 use std::path::PathBuf;
 

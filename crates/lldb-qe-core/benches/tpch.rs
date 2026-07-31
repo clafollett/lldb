@@ -4,7 +4,9 @@
 //! distributed engine (Phases 3–5) is measured against — the whole point of the project is
 //! knowing when shipping work to workers actually beats one fast local node.
 //!
-//! Run with `cargo bench -p lldb-qe-core`. Requires generated data (`./scripts/bootstrap.sh`).
+//! Run with `cargo bench -p lldb-qe-core --features benches` — this target carries
+//! `required-features = ["benches"]`, so without the flag it is not built and not run. Requires
+//! generated data (`./scripts/bootstrap.sh`).
 
 use std::path::PathBuf;
 

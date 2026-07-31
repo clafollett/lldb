@@ -1,6 +1,11 @@
 # Benchmarks
 
-Reproducible with `cargo bench` after `./scripts/bootstrap.sh`. Numbers below are from an
+Reproducible with `cargo bench -p lldb-qe-core --features benches` after `./scripts/bootstrap.sh`.
+**The `--features benches` flag is required** — both bench targets carry
+`required-features = ["benches"]`, so a default build does not produce their 629 MB of binaries
+(issue #97; the numbers are in [`docs/build-performance.md`](docs/build-performance.md)). Forgetting
+it is quiet rather than loud: `cargo bench -p lldb-qe-core` still spends a full release build, then
+selects neither bench target, prints no measurement, and exits 0. Numbers below are from an
 Apple Silicon (`arm64`) laptop — the same ISA family as the Graviton production target — on
 Rust 1.97.1, TPC-H scale factor 1, criterion's optimized `bench` profile.
 
@@ -10,7 +15,7 @@ point.
 ## Single-node TPC-H baseline
 
 The pure DataFusion baseline every distributed result is measured against
-(`cargo bench --bench tpch`).
+(`cargo bench -p lldb-qe-core --features benches --bench tpch`).
 
 | Query | Time | Shape |
 | - | - | - |
@@ -20,7 +25,7 @@ The pure DataFusion baseline every distributed result is measured against
 ## Distributed vs single-node
 
 Grouped `COUNT(*)` over `orders` (1.5M rows), single-node vs the map → hash-shuffle → reduce
-path across two workers (`cargo bench --bench distributed`).
+path across two workers (`cargo bench -p lldb-qe-core --features benches --bench distributed`).
 
 | Path | Time | vs single-node |
 | - | - | - |

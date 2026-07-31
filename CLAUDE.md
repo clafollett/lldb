@@ -186,7 +186,12 @@ The two that come up constantly:
 ```
 cargo test                                                # unit + integration (gated suites skip)
 cargo fmt --all && cargo clippy --all-targets
+cargo bench -p lldb-qe-core --features benches            # benches are feature-gated; #97
 ```
+
+Both `[[bench]]` targets carry `required-features = ["benches"]`: plain `--all-targets` does not
+compile them and plain `cargo bench` runs nothing. CI's clippy passes
+`--features lldb-qe-core/benches` — run it that way after changing a bench, or nothing checks it.
 
 A gated suite **skips silently** without its prerequisite, so a green `cargo test` does not mean
 the database-gated tests ran. The tell is timing: the `integration` binary takes ~20s with a

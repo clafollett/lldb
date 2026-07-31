@@ -31,11 +31,18 @@ are verbatim what CI runs, and all three must pass:
 
 ```sh
 cargo fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --features lldb-qe-core/benches -- -D warnings
 cargo test --workspace
 ```
 
-Two things that surprise people:
+Three things that surprise people:
+
+- **The benches are behind a feature, and the clippy gate is what keeps them compiling.** Both
+  `[[bench]]` targets carry `required-features = ["benches"]`, so a default build no longer links
+  their 629 MB of binaries — `cargo bench` needs `-p lldb-qe-core --features benches` or it builds
+  nothing and reports nothing. `--features lldb-qe-core/benches` above is not optional: drop it and
+  a bench that stops compiling goes unnoticed. See
+  [`docs/build-performance.md`](docs/build-performance.md).
 
 - **A green `cargo test` does not mean everything ran.** Suites that need a service — a Postgres
   services database, Docker — skip *silently* without it. The tell is timing: the `integration`
