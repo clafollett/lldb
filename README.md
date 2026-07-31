@@ -141,7 +141,8 @@ resume command rather than silently running somewhere else.
 the CDK stack (one ECS service per warehouse) or `aws ecs update-service --desired-count` — or
 `docker compose up --scale` locally — makes the compute match. The engine deliberately carries no
 orchestrator SDK, so the same rows can drive ECS, compose, or whatever runs workers next; every
-mutation prints the exact apply command. Without a services database configured, none of this is
+mutation prints the apply command to run next, with the desired count filled in and the cluster and
+service names left as placeholders. Without a services database configured, none of this is
 in the way: `--workers` behaves exactly as it always has.
 
 ## Serving many queries

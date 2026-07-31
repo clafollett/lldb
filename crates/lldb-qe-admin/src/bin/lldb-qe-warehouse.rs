@@ -38,6 +38,11 @@ use lldb_qe_control::{Account, ServicesArgs, ServicesDb, init_tracing, redact_ur
 #[command(
     name = "lldb-qe-warehouse",
     about = "Manage virtual warehouses: named, resizable, suspendable compute pools",
+    long_about = "Writes DESIRED state to the services database. Something else makes it real — a CDK deploy, \
+`aws ecs update-service --desired-count`, or `docker compose up --scale`. The engine carries no \
+orchestrator SDK on purpose, so the same rows can drive any of them. Every mutation prints the \
+apply command to run next, with the desired count filled in and the cluster and service names left \
+as placeholders — the engine does not know them.",
     version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {

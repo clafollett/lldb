@@ -49,6 +49,10 @@ use lldb_qe_control::{ServicesArgs, init_tracing, redact_url};
 #[command(
     name = "lldb-qe-reap",
     about = "Resolve query-history rows stranded by a coordinator that is no longer live",
+    long_about = "A one-shot, like lldb-qe-migrate: schedule it (cron, or an ECS scheduled task) at whatever \
+interval you want stranded rows resolved within.\n\n\
+Idempotent, bounded by --limit, and --dry-run shows what it would take without writing. Only \
+rows whose coordinator's liveness lease has actually expired are touched.",
     version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {

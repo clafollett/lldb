@@ -50,6 +50,9 @@ use lldb_qe_types::rbac::{ObjectRef, ObjectType, Privilege};
 #[command(
     name = "lldb-qe-auth",
     about = "Manage accounts' users, API keys, roles and grants",
+    long_about = "Its credential IS the Postgres password, so treat that as the deployment's root credential.\n\n\
+The token `key create` prints is shown exactly once and stored nowhere — only its SHA-256 hash \
+is written.",
     version = lldb_qe_control::BUILD_VERSION
 )]
 struct Cli {

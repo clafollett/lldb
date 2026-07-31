@@ -92,6 +92,10 @@ use tokio::net::TcpListener;
 #[command(
     name = "lldb-qe-server",
     about = "Long-running lldb coordinator: concurrent queries, admission control, query history",
+    long_about = "The only binary that authenticates. Accepts concurrent submissions over Arrow Flight, admits a \
+bounded number per warehouse and queues the rest, and records every query.\n\n\
+Admission is FLEET-WIDE when a services database is configured: two servers on one warehouse \
+admit K between them, not K each.",
     version = lldb_qe_core::BUILD_VERSION
 )]
 struct Cli {
