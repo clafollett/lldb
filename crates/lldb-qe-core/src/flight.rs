@@ -436,6 +436,22 @@ impl FlightService for WorkerFlightService {
 
     /// Materialize the ticket's producer stage (once, via the cache) and stream the requested
     /// partition's batches back.
+    ///
+    /// **The partition range test below is necessarily post-materialization.** It compares against
+    /// the materialized stage's partition count, and on a cache hit nothing here deserializes the
+    /// plan at all — so testing any earlier means deserializing on every request, which is the cost
+    /// the [`StageCache`] exists to remove. A ticket naming a partition its stage does not have
+    /// therefore spends a connect, a plan deserialize and a *full* materialization before it is
+    /// refused, and it is refused with `InvalidArgument`, which [`crate::retry`] classifies fatal:
+    /// no failover, and the query dies having paid for the whole stage.
+    ///
+    /// The cheap check is [`FlightReaderExec::with_fallbacks`][fr] in `remote.rs`, which range-checks
+    /// `remote_partition` against the sub-plan the leaf is built around, on the coordinator, before
+    /// anything is dialled. That is what keeps the path above rare, and the reading to reject is the
+    /// reverse one: this test is the last line for a ticket this process did not build, not a reason
+    /// the coordinator's can go.
+    ///
+    /// [fr]: crate::remote::FlightReaderExec::with_fallbacks
     async fn do_get(
         &self,
         request: Request<Ticket>,
