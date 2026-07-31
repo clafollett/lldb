@@ -637,3 +637,132 @@ enough. Silencing it would remove a signal that tracks the thing being measured.
 
 **Decision: leave it, documented as expected on macOS.** Nothing to fix, and the honest statement is
 that linker warnings are unobserved rather than that they are clean.
+
+# What the doc-links gate costs, on CI *and* locally (#77, #131)
+
+The section above is a class of warning no gate sees. This one is a class of warning that had
+accumulated for the life of the repo and now has a gate: `.github/workflows/ci.yml` runs
+`RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps` as a **step of the `check` job**, after
+Clippy and before Test. #77 priced it before choosing that placement — but the numbers went into
+that PR's body and a `ci.yml` comment, so the file that calls itself the baseline did not have them.
+
+They are re-measured here rather than transcribed, and they carry the column the original never had.
+**Both environments, side by side, because the gap between them is the point:** a contributor
+deciding whether a change that adds ten seconds locally is affordable needs to know what those ten
+seconds become on the runner, and a single-environment number is the kind that quietly turns into a
+lie.
+
+## Read this before comparing to anything above
+
+| | |
+| - | - |
+| CI | GitHub-hosted `ubuntu-latest` — 4 vCPU / 16 GB (public-repo tier), `Swatinem/rust-cache@v2` |
+| local | Apple M3 Max, 14 cores (10 performance), 36 GB, macOS 26.5.2, toolchain 1.97.1 |
+
+The local box is the same shape as the one #72 and #97 were taken on, and it reproduces #97's warm
+clippy — 21.6, 21.8, 22.2 s here against 20.7–20.8 s there — so a local figure below may be read
+beside those two sections and beside **nothing earlier in this file**, all of which came from a
+4-core box.
+
+Protocol as everywhere else here: cargo run plainly, no profile environment variables. `RUSTDOCFLAGS`
+is set exactly as CI sets it; it reaches rustdoc only and forks no rustc fingerprint. Measured at
+36aa506, in a linked worktree — so the check the top of this file demands was run with it: an
+immediately repeated `cargo doc --workspace --no-deps` cost **0.24, 0.29, 0.70 and 0.71 s** across
+four trials and documented nothing, and #87's build-script staleness is therefore not inside these
+numbers.
+
+**The local box was not idle**, unlike the baseline's. Other agents were building on it. Every timed
+run recorded the competing `cargo`/`rustc` count at its start and the load average; the doc runs all
+started with none, and the one obviously contended run is called out below rather than averaged away.
+
+## The two columns
+
+CI is the `Doc links` step of the last 15 successful `check` jobs, `completed_at - started_at` from
+the Actions API. Local is `cargo doc --workspace --no-deps` run immediately after the Clippy line CI
+runs, three repeats, each preceded by `cargo clean`.
+
+| | CI (4 vCPU) | local (M3 Max) |
+| - | - | - |
+| **the doc gate, as the job runs it** | **25 s** median — 18, 21, 23, 24, 24, 25, 25, 25, 26, 26, 26, 27, 27, 27, 27 | **15.4 s** median — 16.3, 15.0, 15.4 |
+| the same, after a `touch crates/lldb-qe-core/src/lib.rs` edit cycle | not observable — every run starts from a cache restore | 13.4, 14.2, 14.1 |
+| Clippy, the step before it | 40 s median | 21.6, 21.8, 22.2 warm; 70.9, 72.2 cold |
+| Test, the step after it | 75 s median | — |
+| the whole `check` job | 223–227 s | — |
+
+The doc gate is **~11% of the `check` job** — its fourth-largest step, behind Test (75 s), the cache
+restore (50 s) and Clippy (41 s). Nothing else in the job reaches 13 s.
+
+The two Clippy rows are not each other's analogue and are here only for scale: CI's cache restores
+the *dependency* artifacts but not the workspace's, so its Clippy step is neither of the local
+columns. The doc row **is** an analogue — in both environments the dependencies are present and the
+six workspace crates are checked and documented from scratch.
+
+Two cross-checks on the CI number, since a step duration is GitHub's accounting rather than cargo's.
+Cargo's own `Finished ... in Ns` line inside that step reads 21.14, 24.11, 24.74, 25.05, 26.97 and
+27.31 s across six of those runs — the same figures, so the step is cargo and not step overhead. And
+the run that reads 18 s reads 28 s for Clippy and 62 s for Test as well: **the spread is the runner,
+not the gate.** Every one of the fifteen lands between 0.57 and 0.67 of its own Clippy step.
+
+## Why it is a step and not a job — the number that decided it
+
+`--no-deps` reuses the dependency artifacts Clippy just built. Cargo checks dependencies identically
+under both, so only the workspace members are re-checked and then documented:
+
+| `cargo doc --workspace --no-deps`, locally | |
+| - | - |
+| after the Clippy step, into the same target directory | 15.0–16.3 s |
+| against an **empty** target directory (`cargo clean` first) | **62.5 s** |
+
+**Four times.** A separate job pays that 62.5 s — or, with a cache of its own, the `Run
+Swatinem/rust-cache@v2` step, which is **40–82 s (49 s median) across those same 15 runs** — plus its
+checkout and toolchain install, all to re-derive artifacts the `check` job is already holding. Hence
+the placement: after Clippy for the reuse, before Test so a doc break is not queued behind the
+longest step in the job.
+
+The reuse is about *dependencies* specifically. The doc step also re-checks the six workspace members
+under plain rustc — the `Checking` lines in the step log — because clippy fingerprints its own
+workspace artifacts separately. That is not the cost: those checks run concurrently with the
+documenting.
+
+## The gate is essentially one rustdoc process, which is why the CI/local gap is small
+
+Timestamping cargo's output says where the seconds go. On CI, in run 30630481166, `Documenting
+lldb-qe-core` spans 19.8 s of the 25.05 s. Locally, same command, same conditions: 12.2 s of 14.6 s.
+**About 80% of the gate is one crate's rustdoc invocation, in both environments.**
+
+- **Core count barely helps.** 4 vCPU against 10 performance cores is 1.6x here (25 s / 15.4 s),
+  against 3x or more on anything that parallelises. The contended local run makes the same point from
+  the other side: at load 19 the *cold Clippy* in that phase inflated 30% — 93.1 s against 70.9 and
+  72.2 — while the doc gate in the same phase moved not at all, 15.4 s, inside the other two runs'
+  spread. A nearly-serial step is insensitive to a busy box, which is also why three samples from a
+  shared machine are worth quoting.
+- **`lldb-qe-core` is where this gate's time is.** In the local run its rustdoc spans 1.37 s to
+  13.52 s of a 14.59 s build; the other five crates fit in the ~2.4 s left over, and the coordinator
+  and worker cannot even start until core's check finishes. Doc comments added anywhere else are
+  close to free — the same lever as everywhere else in this file.
+
+## What the seconds buy, and what they do not
+
+`cargo doc` documents **libs and bins**. Doc comments in `tests/` and `benches/` targets are outside
+the gate entirely — a broken intra-doc link under `crates/lldb-qe-core/tests/integration/` fails
+nothing. That bounds what 25 s buys, which is why it belongs with the price and not only in
+`CONTRIBUTING.md` and the `ci.yml` comment.
+
+Disk, unusually for this file, is a non-issue: `target/doc` is **22 MB**, and the whole target
+directory after Clippy and the doc gate is **802 MB**. The gate links nothing, exactly as Clippy
+links nothing.
+
+## Against the numbers #77 recorded
+
+| | #77, in the `ci.yml` comment and PR body | re-measured here (#131) |
+| - | - | - |
+| the doc gate, after Clippy | ~14 s "cold" | 15.0–16.3 s |
+| the doc gate, repeated after an edit cycle | ~13 s "warm" | 13.4–14.2 s |
+| against an empty target directory | ~66 s | 62.5 s |
+| on a CI runner | ~26 s | **25 s median, 18–27 over 15 runs** |
+
+Nothing is overturned; the shape reproduces and the step-vs-job argument survives intact. Two small
+corrections are worth having anyway. The local "cold" figure is **1–2 s higher** than #77 recorded,
+on a workspace that has grown since. And **~26 s was one number where the honest one is a
+distribution**: 25 s is the median, 18 s is a fast runner and 27 s a slow one, and the difference
+between those two is the runner rather than anything in this repository.
