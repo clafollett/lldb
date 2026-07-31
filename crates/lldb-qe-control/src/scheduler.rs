@@ -967,7 +967,23 @@ mod tests {
 
     /// Fairness: waiters are admitted in the order they arrived, so a long queue of cheap queries
     /// cannot starve the expensive one at the front.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    ///
+    /// **`current_thread`, and that is load-bearing rather than tidiness** (#120). The barrier below
+    /// establishes arrival order by watching `snapshot().queued`, but that counter is incremented by
+    /// `reserve_queue_slot`, which runs *before* `acquire_owned().await` registers the task in the
+    /// semaphore's wait queue. On a multi-threaded runtime a task can sit in that window on one
+    /// worker while the spawner, on another, already sees `queued > i` and releases task `i + 1` to
+    /// reach the semaphore first — so the test could observe two adjacent waiters swapped
+    /// (`[0, 1, 2, 4, 3, 5, 6, 7]` was seen once) while tokio's semaphore behaved perfectly.
+    /// Single-threaded, a spawned task runs to its first pending await — which for a queued waiter
+    /// *is* that registration, since nothing before it awaits — before the spawner is polled again,
+    /// so arrival order into the semaphore is the spawn order by construction.
+    ///
+    /// Loosening the assertion instead would have been the wrong repair: the flake was the test
+    /// measuring the wrong event, not the property being weaker than claimed. The assertion still
+    /// bites — replacing the FIFO wait with a `try_acquire` spin makes this fail with
+    /// `[7, 5, 3, 1, 0, 2, 4, 6]`.
+    #[tokio::test(flavor = "current_thread")]
     async fn waiters_are_admitted_in_arrival_order() {
         let admission = Admission::new("wh", limits(1, 16));
         let order = Arc::new(Mutex::new(Vec::new()));
