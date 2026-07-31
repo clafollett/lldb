@@ -214,10 +214,12 @@ door would encrypt one hop of a mesh. Certificates are **supplied, never minted*
    A single-node checkout has no credential to leak and needs no flag and no certificate.
 3. **`LLDB_FLEET_TOKEN` is untouched, and TLS does not make it redundant.** This is *server*
    authentication: a client verifies the server, never the reverse. Which fleet member is calling is
-   still the shared secret's claim alone, and mTLS at the worker boundary is a separate decision
-   (#106, still open). Say so rather than letting "we have TLS now" imply more than it does. What a
-   request *is* — the per-request half — is `plan_assertion.rs`'s job, not TLS's; the two are
-   complementary and the next section covers it.
+   still the shared secret's claim alone, and mTLS at the worker boundary was **decided against in
+   #106** — a shared client leaf proves fleet membership, which is what the secret already proves,
+   and per-member leaves buy revocation granularity that #83 (no reload path) cannot deliver yet.
+   Revisit only after #83 and #127. Say so rather than letting "we have TLS now" imply more than it
+   does. What a request *is* — the per-request half — is `plan_assertion.rs`'s job, not TLS's; the
+   two are complementary and the next section covers it.
 4. **The scheme is the switch, and there is no fallback.** `https://` dials TLS, `http://` does not,
    and a TLS server refuses a plaintext client rather than obliging it — so turning certificates on
    means changing the `--workers` URLs too, and a half-converted fleet fails loudly. Note the trap
